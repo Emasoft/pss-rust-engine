@@ -6017,6 +6017,175 @@ fn synonym_matches_in_text(synonym: &str, text: &str, words: &[&str]) -> bool {
     }
 }
 
+/// Shared domain taxonomy: each domain is a group of synonyms meaning the same thing.
+/// Used by both find_matches() (runtime prompt inference) and the enrichment pipeline
+/// (index-time skill domain tagging). Must be kept in sync.
+const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
+    ("programming", &[
+        "programming", "coding", "software development", "computer science",
+        "software engineering", "programm", "coder",
+    ]),
+    ("video-production", &[
+        "video editing", "video production", "video processing",
+        "film editing", "film production", "filmmaking",
+        "video editor", "video edit",
+    ]),
+    ("audio-production", &[
+        "music production", "audio editing", "audio production",
+        "sound design", "sound editing", "music composition",
+        "audio editor", "audio edit", "music producer",
+    ]),
+    ("photography", &[
+        "photo editing", "photography", "image editing",
+        "photo retouching", "photo manipulation",
+        "photograph", "photo editor", "photo edit",
+    ]),
+    ("graphic-design", &[
+        "graphic design", "visual design", "illustration",
+        "digital illustration", "graphic designer", "illustrat",
+    ]),
+    ("3d-graphics", &[
+        "3d modeling", "3d rendering", "3d animation",
+        "3d design", "3d modelling",
+    ]),
+    ("motion-graphics", &[
+        "motion graphics", "motion design", "visual effects",
+    ]),
+    ("copywriting", &[
+        "copywriting", "content writing", "blog writing",
+        "article writing", "copywriter", "content writer", "blog writer",
+    ]),
+    ("creative-writing", &[
+        "creative writing", "fiction writing", "screenplay",
+        "screenwriting", "novel writing", "ghostwriting",
+        "fiction writer", "novelist", "screenwriter", "ghostwriter",
+    ]),
+    ("poetry", &["poetry writing", "poem writing", "poetic composition"]),
+    ("journalism", &[
+        "journalism", "news writing", "investigative reporting",
+        "journalist", "news reporter",
+    ]),
+    ("translation", &["translation", "language translation", "translating", "translator"]),
+    ("marketing", &[
+        "digital marketing", "social media marketing",
+        "email marketing", "marketing strategy",
+        "marketer", "marketing campaign",
+    ]),
+    ("advertising", &["advertising", "ad campaign", "ad copy", "advertiser"]),
+    ("branding", &["branding", "brand identity", "brand strategy"]),
+    ("seo", &["search engine optimization"]),
+    ("education", &[
+        "lesson plan", "curriculum design", "e-learning",
+        "course creation", "educational content",
+        "lesson planning", "curriculum development",
+    ]),
+    ("tutoring", &["tutoring", "private tutoring", "academic tutoring", "tutor"]),
+    ("chemistry", &["chemical analysis", "chemical reaction", "chemist"]),
+    ("biology", &["biological research", "microbiology", "biologist"]),
+    ("physics", &["quantum mechanics", "astrophysics", "particle physics", "physicist"]),
+    ("geology", &["geological survey", "mineralogy", "geologist"]),
+    ("astronomy", &["astrophotography", "astronomical observation", "astronomer"]),
+    ("medicine", &[
+        "medical research", "clinical trial", "pharmaceutical",
+        "clinical research", "medical diagnosis",
+        "physician", "clinician", "pharmacist",
+    ]),
+    ("genomics", &["genomics", "proteomics", "bioinformatics", "gene sequencing"]),
+    ("legal", &[
+        "legal writing", "contract drafting", "patent writing",
+        "legal research", "legal analysis",
+        "lawyer", "attorney", "paralegal",
+    ]),
+    ("accounting", &[
+        "bookkeeping", "tax preparation", "financial accounting",
+        "accountant", "bookkeeper",
+    ]),
+    ("cooking", &["cooking", "culinary", "chef", "cookbook"]),
+    ("nutrition", &["nutrition", "dietetics", "meal planning", "nutritionist", "dietitian"]),
+    ("fitness", &["fitness training", "workout routine", "exercise program", "personal trainer"]),
+    ("real-estate", &["real estate", "property management", "realtor"]),
+    ("interior-design", &["interior design", "space planning", "interior designer"]),
+    ("architecture", &[
+        "architecture design", "architectural design", "building design", "architect",
+    ]),
+    ("event-planning", &["event planning", "event management", "event planner", "event organizer"]),
+    ("geography", &["geography", "cartography", "geographic analysis", "geographer", "cartographer"]),
+    ("linguistics", &[
+        "linguistics", "linguistic analysis", "phonetics",
+        "morphology analysis", "linguist", "phonetician",
+    ]),
+    ("music-theory", &["music theory", "harmony theory", "counterpoint", "music theorist"]),
+    ("fine-art", &["fine art", "art history", "art historian"]),
+    ("painting", &[
+        "painting technique", "oil painting", "watercolor painting",
+        "acrylic painting", "painter",
+    ]),
+    ("sculpture", &["sculpture", "sculpting", "ceramics", "sculptor"]),
+    // --- Software sub-domains (programming-specific) ---
+    ("security", &[
+        "security", "vulnerability", "penetration testing", "pentest",
+        "owasp", "cve", "exploit", "hardening", "threat model",
+        "security audit", "security scan", "secret detection",
+        "authentication", "authorization", "encryption",
+    ]),
+    ("testing", &[
+        "testing", "test automation", "unit test", "integration test",
+        "end-to-end test", "e2e test", "test driven", "tdd",
+        "test coverage", "test suite", "test runner",
+    ]),
+    ("devops", &[
+        "devops", "ci/cd", "continuous integration", "continuous deployment",
+        "infrastructure as code", "terraform", "ansible", "kubernetes",
+        "docker", "containerization", "deployment pipeline",
+    ]),
+    ("frontend", &[
+        "frontend", "front-end", "ui component", "user interface",
+        "css", "html", "dom", "responsive design", "web design",
+    ]),
+    ("backend", &[
+        "backend", "back-end", "server-side", "api development",
+        "rest api", "graphql api", "microservice", "database",
+    ]),
+    ("mobile", &[
+        "mobile development", "mobile app", "ios development",
+        "android development", "react native", "flutter",
+        "mobile ui", "app store",
+    ]),
+    ("data-ml", &[
+        "machine learning", "deep learning", "data science",
+        "neural network", "model training", "data analysis",
+        "data pipeline", "data engineering", "nlp",
+        "natural language processing", "computer vision",
+    ]),
+    ("cloud", &[
+        "cloud computing", "cloud infrastructure", "serverless",
+        "cloud function", "cloud deployment", "iaas", "paas",
+    ]),
+    ("blockchain", &[
+        "blockchain", "smart contract", "solidity", "ethereum",
+        "web3", "defi", "nft", "cryptocurrency",
+    ]),
+    ("game-dev", &[
+        "game development", "game engine", "unity", "unreal",
+        "game design", "game programming", "sprite", "physics engine",
+    ]),
+];
+
+/// Infer domain tags from text using the shared taxonomy.
+/// Scans the text against each domain's synonym group.
+/// Returns the list of detected domain names (e.g., ["security", "backend"]).
+fn infer_domains_from_text(text: &str) -> Vec<String> {
+    let text_lower = text.to_lowercase();
+    let words: Vec<&str> = text_lower.split_whitespace().collect();
+    let mut domains = Vec::new();
+    for &(domain_name, synonyms) in DOMAIN_TAXONOMY {
+        if synonyms.iter().any(|syn| synonym_matches_in_text(syn, &text_lower, &words)) {
+            domains.push(domain_name.to_string());
+        }
+    }
+    domains
+}
+
 /// Locate the pss-nlp binary for NLP-based negation detection.
 /// Search order: same directory as pss binary, CLAUDE_PLUGIN_ROOT/bin/, PATH.
 fn find_pss_nlp_binary() -> Option<std::path::PathBuf> {
@@ -6368,218 +6537,8 @@ fn find_matches(
     // "programming" is the default fallback. If a skill has no detectable
     // non-programming domain, it passes through. If it has one, the prompt
     // must mention that domain or the skill is excluded.
-    let domain_taxonomy: &[(&str, &[&str])] = &[
-        // Programming — the default fallback domain
-        ("programming", &[
-            "programming", "coding", "software development", "computer science",
-            "software engineering",
-            // stems
-            "programm", "coder",
-        ]),
-        // --- Non-programming domains ---
-        ("video-production", &[
-            "video editing", "video production", "video processing",
-            "film editing", "film production", "filmmaking",
-            // stems
-            "video editor", "video edit",
-        ]),
-        ("audio-production", &[
-            "music production", "audio editing", "audio production",
-            "sound design", "sound editing", "music composition",
-            // stems
-            "audio editor", "audio edit", "music producer",
-        ]),
-        ("photography", &[
-            "photo editing", "photography", "image editing",
-            "photo retouching", "photo manipulation",
-            // stems
-            "photograph", "photo editor", "photo edit",
-        ]),
-        ("graphic-design", &[
-            "graphic design", "visual design", "illustration",
-            "digital illustration",
-            // stems
-            "graphic designer", "illustrat",
-        ]),
-        ("3d-graphics", &[
-            "3d modeling", "3d rendering", "3d animation",
-            "3d design", "3d modelling",
-        ]),
-        ("motion-graphics", &[
-            "motion graphics", "motion design", "visual effects",
-            // stems (vfx is an acronym, not a stem — exact match only)
-        ]),
-        ("copywriting", &[
-            "copywriting", "content writing", "blog writing",
-            "article writing",
-            // stems
-            "copywriter", "content writer", "blog writer",
-        ]),
-        ("creative-writing", &[
-            "creative writing", "fiction writing", "screenplay",
-            "screenwriting", "novel writing",
-            "ghostwriting",
-            // stems
-            "fiction writer", "novelist", "screenwriter", "ghostwriter",
-        ]),
-        ("poetry", &[
-            // stems
-            "poetry writing", "poem writing", "poetic composition",
-        ]),
-        ("journalism", &[
-            "journalism", "news writing", "investigative reporting",
-            // stems
-            "journalist", "news reporter",
-        ]),
-        ("translation", &[
-            "translation", "language translation",
-            // stems
-            "translating", "translator",
-        ]),
-        ("marketing", &[
-            "digital marketing", "social media marketing",
-            "email marketing", "marketing strategy",
-            // stems
-            "marketer", "marketing campaign",
-        ]),
-        ("advertising", &[
-            "advertising", "ad campaign", "ad copy",
-            // stems
-            "advertiser",
-        ]),
-        ("branding", &[
-            "branding", "brand identity", "brand strategy",
-        ]),
-        ("seo", &[
-            "search engine optimization",
-            // stems (seo is an acronym — 3 letters, needs word-boundary)
-        ]),
-        ("education", &[
-            "lesson plan", "curriculum design", "e-learning",
-            "course creation", "educational content",
-            // stems
-            "lesson planning", "curriculum development",
-        ]),
-        ("tutoring", &[
-            "tutoring", "private tutoring", "academic tutoring",
-            // stems
-            "tutor",
-        ]),
-        ("chemistry", &[
-            "chemical analysis", "chemical reaction",
-            // stems
-            "chemist",
-        ]),
-        ("biology", &[
-            "biological research", "microbiology",
-            // stems
-            "biologist",
-        ]),
-        ("physics", &[
-            "quantum mechanics", "astrophysics", "particle physics",
-            // stems
-            "physicist",
-        ]),
-        ("geology", &[
-            "geological survey", "mineralogy",
-            // stems
-            "geologist",
-        ]),
-        ("astronomy", &[
-            "astrophotography", "astronomical observation",
-            // stems
-            "astronomer",
-        ]),
-        ("medicine", &[
-            "medical research", "clinical trial", "pharmaceutical",
-            "clinical research", "medical diagnosis",
-            // stems
-            "physician", "clinician", "pharmacist",
-        ]),
-        ("genomics", &[
-            "genomics", "proteomics", "bioinformatics",
-            "gene sequencing",
-        ]),
-        ("legal", &[
-            "legal writing", "contract drafting", "patent writing",
-            "legal research", "legal analysis",
-            // stems
-            "lawyer", "attorney", "paralegal",
-        ]),
-        ("accounting", &[
-            "bookkeeping", "tax preparation", "financial accounting",
-            // stems
-            "accountant", "bookkeeper",
-        ]),
-        ("cooking", &[
-            "cooking", "culinary",
-            // stems
-            "chef", "cookbook",
-        ]),
-        ("nutrition", &[
-            "nutrition", "dietetics", "meal planning",
-            // stems
-            "nutritionist", "dietitian",
-        ]),
-        ("fitness", &[
-            "fitness training", "workout routine", "exercise program",
-            // stems
-            "personal trainer",
-        ]),
-        ("real-estate", &[
-            "real estate", "property management",
-            // stems
-            "realtor",
-        ]),
-        ("interior-design", &[
-            "interior design", "space planning",
-            // stems
-            "interior designer",
-        ]),
-        ("architecture", &[
-            "architecture design", "architectural design",
-            "building design",
-            // stems
-            "architect",
-        ]),
-        ("event-planning", &[
-            "event planning", "event management",
-            // stems
-            "event planner", "event organizer",
-        ]),
-        ("geography", &[
-            "geography", "cartography", "geographic analysis",
-            // stems
-            "geographer", "cartographer",
-        ]),
-        ("linguistics", &[
-            "linguistics", "linguistic analysis", "phonetics",
-            "morphology analysis",
-            // stems
-            "linguist", "phonetician",
-        ]),
-        ("music-theory", &[
-            "music theory", "harmony theory", "counterpoint",
-            // stems
-            "music theorist",
-        ]),
-        ("fine-art", &[
-            "fine art", "art history",
-            // stems
-            "art historian",
-        ]),
-        ("painting", &[
-            "painting technique", "oil painting", "watercolor painting",
-            "acrylic painting",
-            // stems
-            "painter",
-        ]),
-        ("sculpture", &[
-            "sculpture", "sculpting", "ceramics",
-            // stems
-            "sculptor",
-        ]),
-    ];
+    // Use the shared DOMAIN_TAXONOMY constant (defined near synonym_matches_in_text)
+    let domain_taxonomy = DOMAIN_TAXONOMY;
 
     // synonym_matches_in_text is defined as a top-level fn (below find_matches)
     // to work with rayon's par_iter which requires Send+Sync closures.
@@ -11231,33 +11190,8 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
             );
         }
 
-        // Derive high-level domain from category for the domains field
-        let domains: Vec<String> = {
-            let mut d = Vec::new();
-            let cat_lower = category.to_lowercase();
-            // Map activity categories to domain tags
-            if cat_lower.contains("security") { d.push("security".to_string()); }
-            if cat_lower.contains("test") { d.push("testing".to_string()); }
-            if cat_lower.contains("devops") || cat_lower.contains("deploy") || cat_lower.contains("ci-cd") {
-                d.push("devops".to_string());
-            }
-            if cat_lower.contains("frontend") || cat_lower.contains("ui-") || cat_lower.contains("css") {
-                d.push("frontend".to_string());
-            }
-            if cat_lower.contains("backend") || cat_lower.contains("api-") || cat_lower.contains("database") {
-                d.push("backend".to_string());
-            }
-            if cat_lower.contains("mobile") || cat_lower.contains("ios") || cat_lower.contains("android") {
-                d.push("mobile".to_string());
-            }
-            if cat_lower.contains("data") || cat_lower.contains("ml") || cat_lower.contains("ai") {
-                d.push("data-ml".to_string());
-            }
-            if cat_lower.contains("cloud") || cat_lower.contains("infra") {
-                d.push("cloud".to_string());
-            }
-            d
-        };
+        // Infer domains from name + description using the shared synonym taxonomy
+        let domains = infer_domains_from_text(&format!("{} {} {}", name, description, use_context));
 
         // Build enriched output object
         let output = serde_json::json!({
@@ -11500,31 +11434,8 @@ fn run_index_file(path: &str) -> Result<(), SuggesterError> {
         domain_gates.insert("framework".to_string(), serde_json::json!(frameworks));
     }
 
-    let domains: Vec<String> = {
-        let mut d = Vec::new();
-        let cat_lower = category.to_lowercase();
-        if cat_lower.contains("security") { d.push("security".to_string()); }
-        if cat_lower.contains("test") { d.push("testing".to_string()); }
-        if cat_lower.contains("devops") || cat_lower.contains("deploy") || cat_lower.contains("ci-cd") {
-            d.push("devops".to_string());
-        }
-        if cat_lower.contains("frontend") || cat_lower.contains("ui-") || cat_lower.contains("css") {
-            d.push("frontend".to_string());
-        }
-        if cat_lower.contains("backend") || cat_lower.contains("api-") || cat_lower.contains("database") {
-            d.push("backend".to_string());
-        }
-        if cat_lower.contains("mobile") || cat_lower.contains("ios") || cat_lower.contains("android") {
-            d.push("mobile".to_string());
-        }
-        if cat_lower.contains("data") || cat_lower.contains("ml") || cat_lower.contains("ai") {
-            d.push("data-ml".to_string());
-        }
-        if cat_lower.contains("cloud") || cat_lower.contains("infra") {
-            d.push("cloud".to_string());
-        }
-        d
-    };
+    // Infer domains from name + description using the shared synonym taxonomy
+    let domains = infer_domains_from_text(&format!("{} {} {}", name, description, use_context));
 
     // (j) Build enriched output JSON (same fields as run_pass1_batch)
     let output = serde_json::json!({
