@@ -6064,6 +6064,7 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
     // =========================================================================
 
     // LOC: Computer security + Penetration testing + Intrusion detection + Malware
+    // ACM CCS: Security and privacy (79 concepts)
     ("security", &[
         "security", "vulnerability", "penetration testing", "pentest",
         "owasp", "cve", "exploit", "hardening", "threat model",
@@ -6074,12 +6075,20 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         "firewalls", "public key infrastructure", "cyber intelligence",
         "behavioral cybersecurity", "group signatures",
         "data encryption", "privacy-preserving",
-        // LOC: Software security (from software search)
+        // LOC: Software security
         "malware", "computer virus", "rootkit", "ransomware", "spyware",
         "software protection", "access control",
+        // ACM CCS: Security and privacy
+        "key management", "digital signatures", "cryptanalysis",
+        "multi-factor authentication", "digital rights management",
+        "social engineering attacks", "spoofing", "phishing",
+        "denial-of-service", "vulnerability scanner",
+        "browser security", "web application security",
+        "software reverse engineering", "software security engineering",
     ]),
 
     // LOC: Software testing + Debugging + Formal verification + Quality control
+    // ACM CCS: Software testing and debugging, Software verification and validation
     ("testing", &[
         "testing", "test automation", "unit test", "integration test",
         "end-to-end test", "e2e test", "test driven", "tdd",
@@ -6087,10 +6096,15 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         // LOC terms
         "debugging", "structured walkthrough", "formal verification",
         "self-stabilization", "software testing",
-        // LOC: Software quality (from software search)
+        // LOC: Software quality
         "software verification", "software validation",
         "quality control", "software reliability",
         "capability maturity model",
+        // ACM CCS: Software testing and debugging
+        "acceptance testing", "fault tree analysis",
+        "software defect analysis", "process validation",
+        "automated static analysis", "dynamic analysis",
+        "model checking", "pair programming",
     ]),
 
     // DevOps (LOC: Software container technologies + Software-defined networking)
@@ -6125,6 +6139,7 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
     ]),
 
     // LOC: Database management + Database design + Querying
+    // ACM CCS: Information systems → Data management systems (291 concepts)
     ("database", &[
         "database", "database management", "database design",
         "database security", "database searching", "querying",
@@ -6133,6 +6148,17 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         "federated database", "web databases",
         "multidimensional database", "data integration",
         "materialized views", "data recovery",
+        // ACM CCS: Data management systems
+        "query optimization", "query planning",
+        "transaction processing", "data locking",
+        "key-value store", "mapreduce",
+        "column based storage", "data warehouse",
+        "extraction, transformation and loading", "etl",
+        "data cleaning", "entity resolution",
+        "object-relational mapping", "orm",
+        "message queue", "service bus",
+        "information retrieval", "search engine",
+        "restful web services", "web services",
     ]),
 
     // LOC: Mobile apps + Mobile communication systems
@@ -6157,9 +6183,20 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         "computer vision", "distributed artificial intelligence",
         "genetic programming", "evolutionary programming",
         "truth maintenance", "human computation",
-        // LOC: Software AI (from software search)
+        // LOC: Software AI
         "intelligent agents", "intelligent personal assistant",
         "chatbot", "multiagent systems", "mobile agents",
+        // ACM CCS: Machine learning + AI + Computing methodologies
+        "supervised learning", "unsupervised learning",
+        "reinforcement learning", "transfer learning",
+        "classification", "clustering", "regression",
+        "object detection", "object recognition", "image segmentation",
+        "speech recognition", "machine translation",
+        "recommender systems", "sentiment analysis",
+        "information extraction", "question answering",
+        "knowledge representation", "ontology engineering",
+        "topic modeling", "dimensionality reduction",
+        "anomaly detection", "multi-agent systems",
     ]),
 
     // LOC: Cloud computing + Ubiquitous computing + Distributed systems
