@@ -10873,15 +10873,70 @@ fn infer_pass1_intents(activity: &str) -> Vec<String> {
 /// Extract programming languages mentioned in keywords.
 /// Returns a list of recognized language names.
 fn extract_pass1_languages(keywords: &[String]) -> Vec<String> {
+    // Language mapping sourced from LOC Subject Headings "Computer program language"
+    // classification (467 entries), filtered to modern/relevant languages.
+    // Source: https://id.loc.gov/authorities/subjects (2026-03-19)
     let lang_map: &[(&str, &str)] = &[
-        ("python", "python"), ("py", "python"), ("rust", "rust"), ("go", "go"),
-        ("golang", "go"), ("java", "java"), ("javascript", "javascript"), ("js", "javascript"),
-        ("typescript", "typescript"), ("ts", "typescript"), ("ruby", "ruby"), ("rb", "ruby"),
-        ("swift", "swift"), ("kotlin", "kotlin"), ("dart", "dart"), ("flutter", "dart"),
-        ("c++", "c++"), ("cpp", "c++"), ("csharp", "c#"), ("c#", "c#"),
-        ("php", "php"), ("scala", "scala"), ("elixir", "elixir"), ("lua", "lua"),
-        ("sql", "sql"), ("html", "html"), ("css", "css"), ("shell", "shell"),
-        ("bash", "shell"), ("haskell", "haskell"), ("perl", "perl"), ("r", "r"),
+        // Tier 1: Major modern languages (LOC + industry)
+        ("python", "python"), ("py", "python"),
+        ("rust", "rust"),
+        ("go", "go"), ("golang", "go"),
+        ("java", "java"),
+        ("javascript", "javascript"), ("js", "javascript"),
+        ("typescript", "typescript"), ("ts", "typescript"),
+        ("ruby", "ruby"), ("rb", "ruby"),
+        ("swift", "swift"),
+        ("kotlin", "kotlin"),
+        ("dart", "dart"), ("flutter", "dart"),
+        ("c++", "c++"), ("cpp", "c++"),
+        ("csharp", "c#"), ("c#", "c#"),
+        ("php", "php"),
+        ("scala", "scala"),
+        ("elixir", "elixir"),
+        ("lua", "lua"),
+        ("sql", "sql"),
+        ("html", "html"),
+        ("css", "css"),
+        ("shell", "shell"), ("bash", "shell"),
+        ("haskell", "haskell"),
+        ("perl", "perl"),
+        ("r", "r"),
+        // Tier 2: LOC-sourced languages with active communities
+        ("julia", "julia"),
+        ("groovy", "groovy"),
+        ("objective-c", "objective-c"), ("objc", "objective-c"),
+        ("clojure", "clojure"),
+        ("erlang", "erlang"),
+        ("ocaml", "ocaml"),
+        ("fortran", "fortran"),
+        ("cobol", "cobol"),
+        ("pascal", "pascal"),
+        ("prolog", "prolog"),
+        ("lisp", "lisp"),
+        ("scheme", "scheme"),
+        ("racket", "racket"),
+        ("smalltalk", "smalltalk"),
+        ("tcl", "tcl"),
+        ("ada", "ada"),
+        ("abap", "abap"),
+        // Tier 3: LOC-sourced niche/emerging languages
+        ("coffeescript", "coffeescript"),
+        ("elm", "elm"),
+        ("purescript", "purescript"),
+        ("nim", "nim"),
+        ("zig", "zig"),
+        ("crystal", "crystal"),
+        ("solidity", "solidity"),
+        ("cuda", "cuda"),
+        ("opencl", "opencl"),
+        ("wasm", "webassembly"), ("webassembly", "webassembly"),
+        ("powershell", "powershell"),
+        ("vhdl", "vhdl"),
+        ("verilog", "verilog"), ("systemverilog", "verilog"),
+        ("matlab", "matlab"),
+        ("visual-basic", "visual-basic"), ("vb", "visual-basic"), ("vba", "visual-basic"),
+        ("awk", "awk"),
+        ("sed", "sed"),
     ];
 
     let mut langs: Vec<String> = Vec::new();
@@ -10973,11 +11028,31 @@ fn extract_pass1_frameworks(keywords: &[String]) -> Vec<String> {
 
 /// Extract platform signals from keywords.
 fn extract_pass1_platforms(keywords: &[String]) -> Vec<String> {
+    // Platform mapping: modern deployment targets.
+    // LOC historical platforms (Atari, Commodore, IBM 360) excluded — not relevant.
     let plat_map: &[(&str, &str)] = &[
-        ("ios", "ios"), ("android", "android"), ("macos", "macos"), ("windows", "windows"),
-        ("linux", "linux"), ("web", "web"), ("mobile", "mobile"), ("desktop", "desktop"),
-        ("cloud", "cloud"), ("aws", "aws"), ("azure", "azure"), ("gcp", "gcp"),
-        ("docker", "docker"), ("wasm", "wasm"), ("serverless", "serverless"),
+        // Operating systems / mobile
+        ("ios", "ios"), ("iphone", "ios"), ("ipad", "ios"),
+        ("android", "android"),
+        ("macos", "macos"), ("mac", "macos"), ("darwin", "macos"),
+        ("windows", "windows"), ("win32", "windows"), ("win64", "windows"),
+        ("linux", "linux"), ("ubuntu", "linux"), ("debian", "linux"),
+        // Deployment targets
+        ("web", "web"), ("browser", "web"),
+        ("mobile", "mobile"),
+        ("desktop", "desktop"), ("electron", "desktop"),
+        ("embedded", "embedded"), ("iot", "embedded"), ("arduino", "embedded"),
+        ("raspberry", "embedded"),
+        // Cloud platforms
+        ("cloud", "cloud"),
+        ("aws", "aws"), ("lambda", "aws"),
+        ("azure", "azure"),
+        ("gcp", "gcp"), ("firebase", "gcp"),
+        ("docker", "docker"), ("kubernetes", "docker"),
+        ("wasm", "wasm"), ("webassembly", "wasm"),
+        ("serverless", "serverless"), ("edge", "edge"),
+        // LOC-sourced: FPGA/hardware
+        ("fpga", "fpga"), ("vhdl", "fpga"), ("verilog", "fpga"),
     ];
 
     let mut platforms: Vec<String> = Vec::new();
