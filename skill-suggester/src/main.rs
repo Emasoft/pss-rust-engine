@@ -11202,6 +11202,63 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
             "built-in"
         };
 
+        // Generate domain_gates from extracted languages, frameworks, platforms, and category.
+        // Domain gates are boolean pre-filters: a skill with a gate only matches prompts
+        // where the gate's domain is detected. Without gates, the skill matches any prompt.
+        let mut domain_gates: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+        // Gate: programming_language — skills locked to specific languages
+        if !languages.is_empty() {
+            domain_gates.insert(
+                "programming_language".to_string(),
+                serde_json::json!(languages),
+            );
+        }
+
+        // Gate: target_platform — skills locked to specific platforms
+        if !platforms.is_empty() {
+            domain_gates.insert(
+                "target_platform".to_string(),
+                serde_json::json!(platforms),
+            );
+        }
+
+        // Gate: framework — skills locked to specific frameworks
+        if !frameworks.is_empty() {
+            domain_gates.insert(
+                "framework".to_string(),
+                serde_json::json!(frameworks),
+            );
+        }
+
+        // Derive high-level domain from category for the domains field
+        let domains: Vec<String> = {
+            let mut d = Vec::new();
+            let cat_lower = category.to_lowercase();
+            // Map activity categories to domain tags
+            if cat_lower.contains("security") { d.push("security".to_string()); }
+            if cat_lower.contains("test") { d.push("testing".to_string()); }
+            if cat_lower.contains("devops") || cat_lower.contains("deploy") || cat_lower.contains("ci-cd") {
+                d.push("devops".to_string());
+            }
+            if cat_lower.contains("frontend") || cat_lower.contains("ui-") || cat_lower.contains("css") {
+                d.push("frontend".to_string());
+            }
+            if cat_lower.contains("backend") || cat_lower.contains("api-") || cat_lower.contains("database") {
+                d.push("backend".to_string());
+            }
+            if cat_lower.contains("mobile") || cat_lower.contains("ios") || cat_lower.contains("android") {
+                d.push("mobile".to_string());
+            }
+            if cat_lower.contains("data") || cat_lower.contains("ml") || cat_lower.contains("ai") {
+                d.push("data-ml".to_string());
+            }
+            if cat_lower.contains("cloud") || cat_lower.contains("infra") {
+                d.push("cloud".to_string());
+            }
+            d
+        };
+
         // Build enriched output object
         let output = serde_json::json!({
             "name": name,
@@ -11219,7 +11276,7 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
             "platforms": platforms,
             "frameworks": frameworks,
             "languages": languages,
-            "domains": [],
+            "domains": domains,
             "tools": tools,
             "services": services,
             "file_types": [],
@@ -11228,7 +11285,7 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
             "path_patterns": [],
             "use_cases": use_cases,
             "secondary_categories": [],
-            "domain_gates": {},
+            "domain_gates": domain_gates,
         });
 
         // Write enriched JSONL line to stdout
@@ -11431,6 +11488,44 @@ fn run_index_file(path: &str) -> Result<(), SuggesterError> {
         "built-in"
     };
 
+    // Generate domain_gates from extracted fields (same logic as run_pass1_batch)
+    let mut domain_gates: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    if !languages.is_empty() {
+        domain_gates.insert("programming_language".to_string(), serde_json::json!(languages));
+    }
+    if !platforms.is_empty() {
+        domain_gates.insert("target_platform".to_string(), serde_json::json!(platforms));
+    }
+    if !frameworks.is_empty() {
+        domain_gates.insert("framework".to_string(), serde_json::json!(frameworks));
+    }
+
+    let domains: Vec<String> = {
+        let mut d = Vec::new();
+        let cat_lower = category.to_lowercase();
+        if cat_lower.contains("security") { d.push("security".to_string()); }
+        if cat_lower.contains("test") { d.push("testing".to_string()); }
+        if cat_lower.contains("devops") || cat_lower.contains("deploy") || cat_lower.contains("ci-cd") {
+            d.push("devops".to_string());
+        }
+        if cat_lower.contains("frontend") || cat_lower.contains("ui-") || cat_lower.contains("css") {
+            d.push("frontend".to_string());
+        }
+        if cat_lower.contains("backend") || cat_lower.contains("api-") || cat_lower.contains("database") {
+            d.push("backend".to_string());
+        }
+        if cat_lower.contains("mobile") || cat_lower.contains("ios") || cat_lower.contains("android") {
+            d.push("mobile".to_string());
+        }
+        if cat_lower.contains("data") || cat_lower.contains("ml") || cat_lower.contains("ai") {
+            d.push("data-ml".to_string());
+        }
+        if cat_lower.contains("cloud") || cat_lower.contains("infra") {
+            d.push("cloud".to_string());
+        }
+        d
+    };
+
     // (j) Build enriched output JSON (same fields as run_pass1_batch)
     let output = serde_json::json!({
         "name": name,
@@ -11448,7 +11543,7 @@ fn run_index_file(path: &str) -> Result<(), SuggesterError> {
         "platforms": platforms,
         "frameworks": frameworks,
         "languages": languages,
-        "domains": [],
+        "domains": domains,
         "tools": tools,
         "services": services,
         "file_types": [],
@@ -11457,7 +11552,7 @@ fn run_index_file(path: &str) -> Result<(), SuggesterError> {
         "path_patterns": [],
         "use_cases": use_cases,
         "secondary_categories": [],
-        "domain_gates": {},
+        "domain_gates": domain_gates,
     });
 
     // (k) Print to stdout
