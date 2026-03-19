@@ -6927,7 +6927,57 @@ fn find_matches(
                     return None;
                 }
             }
-            // No non-programming domain detected → implicitly "programming", passes through
+
+            // SOFTWARE SUB-DOMAIN FILTER: when the prompt mentions specific software
+            // sub-domains (security, testing, devops, frontend, backend, etc.), also
+            // check skills that are purely "programming" (no sub-domain). If the skill's
+            // name+description+keywords don't mention ANY of the prompt's sub-domains,
+            // it's a generic utility skill that doesn't match the agent's specialization.
+            // This is what filters GitHub/utility skills from security agent profiles.
+            let prompt_sub_domains: Vec<&&str> = prompt_detected_domains.iter()
+                .filter(|d| **d != "programming")
+                .collect();
+            if !prompt_sub_domains.is_empty() && !has_non_programming {
+                // Skill has no non-programming domain — it's generic programming.
+                // Check if any prompt sub-domain synonym appears in the skill's text.
+                let mut matches_any_sub = false;
+                for &sub_domain in &prompt_sub_domains {
+                    for &(domain_name, synonyms) in domain_taxonomy {
+                        if domain_name == *sub_domain {
+                            if synonyms.iter().any(|syn| synonym_matches_in_text(syn, &entry_text, &entry_words)) {
+                                matches_any_sub = true;
+                                break;
+                            }
+                        }
+                    }
+                    if matches_any_sub { break; }
+                }
+                if !matches_any_sub {
+                    debug!(
+                        "Skill '{}': EXCLUDED by sub-domain filter (no {:?} signal in skill text)",
+                        name, prompt_sub_domains
+                    );
+                    return None;
+                }
+            }
+        }
+
+        // DOMAIN OVERLAP BOOST: when the skill's domains[] field overlaps with the
+        // prompt's detected domains, give a significant score boost. This promotes
+        // security-tagged skills for security prompts, testing-tagged for testing
+        // prompts, etc. — solving the "GitHub skills dominate everything" problem
+        // where generic programming skills outscored domain-specific ones.
+        if !prompt_detected_domains.is_empty() && !entry.domains.is_empty() {
+            let overlap_count = entry.domains.iter()
+                .filter(|d| prompt_detected_domains.contains(d.as_str()))
+                .count();
+            if overlap_count > 0 {
+                // Each domain overlap is worth 2x a keyword match — strong signal
+                let domain_boost = (overlap_count as i32) * weights.keyword * 2;
+                score += domain_boost;
+                has_non_low_signal_match = true;
+                evidence.push(format!("domain_overlap:{}", overlap_count));
+            }
         }
 
         // Project context matching (platform/framework/language)
@@ -9051,13 +9101,37 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
 
     let empty_domains: DetectedDomains = HashMap::new();
 
+    // Pre-compute the agent's domains from the full description ONCE.
+    // These are injected into every query's context_signals so the domain filter
+    // activates even for queries like the agent name that lack domain keywords.
+    // Without this, query "aegis" has no detected domains → no sub-domain filter
+    // → GitHub skills pass through and dominate the aggregate scores.
+    let agent_domain_signals: Vec<String> = {
+        let full_text = format!("{} {} {} {}",
+            profile.name, profile.description, profile.role,
+            profile.duties.join(" ")
+        );
+        infer_domains_from_text(&full_text)
+    };
+    info!("Agent domain signals: {:?}", agent_domain_signals);
+
     // Parallel query scoring: each query runs find_matches() independently across all CPU cores,
     // then results are merged sequentially. This turns 15 sequential scoring passes into parallel ones.
     let query_results: Vec<(usize, Vec<MatchedSkill>)> = queries.par_iter().enumerate().map(|(qi, query)| {
         let corrected = correct_typos(query);
-        let expanded = expand_synonyms(&corrected);
+        // Append agent domain signals to the expanded query so the taxonomy-based
+        // domain inference in find_matches() detects the agent's domains even for
+        // queries like "aegis" that lack domain keywords on their own.
+        let base_expanded = expand_synonyms(&corrected);
+        let expanded = if agent_domain_signals.is_empty() {
+            base_expanded
+        } else {
+            format!("{} {}", base_expanded, agent_domain_signals.join(" "))
+        };
 
-        // Detect domains for this query (uses registry if available)
+        // Detect domains for this query (uses registry if available).
+        // Always includes the agent's pre-computed domain signals so sub-domain
+        // filtering activates even for queries that lack domain keywords.
         let detected_domains: DetectedDomains = match &registry {
             Some(reg) => {
                 let mut context_signals: Vec<String> = Vec::new();
@@ -9065,6 +9139,8 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
                 context_signals.extend(context.tools.iter().cloned());
                 context_signals.extend(context.frameworks.iter().cloned());
                 context_signals.extend(context.languages.iter().cloned());
+                // Inject agent domain signals into every query's context
+                context_signals.extend(agent_domain_signals.iter().cloned());
                 detect_domains_from_prompt_with_context(&expanded, reg, &context_signals)
             }
             None => HashMap::new(),
@@ -9233,6 +9309,36 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
                     // 80% penalty: framework-specific entries are noise for generic agents
                     adj_combined = (adj_combined as f64 * 0.20) as i32;
                     adj_domain = (adj_domain as f64 * 0.20) as i32;
+                }
+            }
+
+            // DOMAIN-SPECIFIC AGENT PENALTY: when the agent has detected software
+            // sub-domains (security, testing, devops, etc.), penalize skills that
+            // don't overlap. This prevents generic GitHub/utility skills from
+            // dominating domain-specific agent profiles.
+            // Detect agent domains from the description using the shared taxonomy.
+            let agent_domains = infer_domains_from_text(
+                &format!("{} {}", profile.name, profile.description)
+            );
+            // Filter to non-programming sub-domains (security, testing, devops, etc.)
+            let agent_sub_domains: Vec<&str> = agent_domains.iter()
+                .filter(|d| *d != "programming")
+                .map(|d| d.as_str())
+                .collect();
+            if !agent_sub_domains.is_empty() {
+                if let Some(entry) = index.get_by_name(&name) {
+                    let has_overlap = entry.domains.iter()
+                        .any(|d| agent_sub_domains.contains(&d.as_str()));
+                    if !has_overlap && !entry.domains.is_empty() {
+                        // Skill has domains but NONE match the agent's — heavy penalty
+                        adj_combined = (adj_combined as f64 * 0.10) as i32;
+                        adj_domain = (adj_domain as f64 * 0.10) as i32;
+                    } else if !has_overlap && entry.domains.is_empty() {
+                        // Skill has no domain tags — moderate penalty (domain-agnostic)
+                        adj_combined = (adj_combined as f64 * 0.25) as i32;
+                        adj_domain = (adj_domain as f64 * 0.25) as i32;
+                    }
+                    // Skills with matching domains keep their full score
                 }
             }
 
