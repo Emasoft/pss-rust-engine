@@ -713,6 +713,14 @@ pub struct AgentProfileInput {
     #[serde(default)]
     pub cwd: String,
 
+    /// Auto-skills declared in frontmatter (must be pinned to primary tier)
+    #[serde(default)]
+    pub auto_skills: Vec<String>,
+
+    /// Whether agent is a non-coding orchestrator (detected from role/description)
+    #[serde(default)]
+    pub is_orchestrator: bool,
+
     /// Absolute path to the agent's .md definition file (set by resolve_agent_input)
     #[serde(skip)]
     pub source_path: String,
@@ -8186,26 +8194,62 @@ fn parse_frontmatter(content: &str) -> HashMap<String, String> {
     let after_first = &content[3..];
     if let Some(end) = after_first.find("\n---") {
         let fm_block = &after_first[..end];
+        let mut current_key: Option<String> = None;
+        let mut current_val = String::new();
+
         for line in fm_block.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            if let Some(colon_pos) = line.find(':') {
-                let key = line[..colon_pos].trim().to_string();
-                let val = line[colon_pos + 1..].trim().to_string();
-                // Strip surrounding quotes if present
-                // Strip surrounding quotes if value is at least 2 chars (avoid panic on single-quote)
-                let val = if val.len() >= 2
-                    && ((val.starts_with('"') && val.ends_with('"'))
-                        || (val.starts_with('\'') && val.ends_with('\'')))
-                {
-                    val[1..val.len() - 1].to_string()
-                } else {
-                    val
-                };
-                map.insert(key, val);
+
+            // Check if this is a YAML list item (continuation of previous key)
+            if trimmed.starts_with("- ") || trimmed.starts_with("-\t") {
+                if current_key.is_some() {
+                    // Append list item to current value
+                    if !current_val.is_empty() {
+                        current_val.push('\n');
+                    }
+                    current_val.push_str(trimmed);
+                }
+                continue;
             }
+
+            // New key:value pair — flush previous key if any
+            if let Some(colon_pos) = trimmed.find(':') {
+                // Flush previous key
+                if let Some(ref key) = current_key {
+                    let val = current_val.trim().to_string();
+                    let val = if val.len() >= 2
+                        && ((val.starts_with('"') && val.ends_with('"'))
+                            || (val.starts_with('\'') && val.ends_with('\'')))
+                    {
+                        val[1..val.len() - 1].to_string()
+                    } else {
+                        val
+                    };
+                    map.insert(key.clone(), val);
+                }
+
+                let key = trimmed[..colon_pos].trim().to_string();
+                let val = trimmed[colon_pos + 1..].trim().to_string();
+                current_key = Some(key);
+                current_val = val;
+            }
+        }
+
+        // Flush last key
+        if let Some(key) = current_key {
+            let val = current_val.trim().to_string();
+            let val = if val.len() >= 2
+                && ((val.starts_with('"') && val.ends_with('"'))
+                    || (val.starts_with('\'') && val.ends_with('\'')))
+            {
+                val[1..val.len() - 1].to_string()
+            } else {
+                val
+            };
+            map.insert(key, val);
         }
     }
     map
@@ -8380,6 +8424,27 @@ fn parse_agent_md(path: &str) -> Result<AgentProfileInput, SuggesterError> {
     let role = infer_role(&description, body);
     let domains = infer_domains(&description, body);
 
+    // Extract auto_skills from frontmatter YAML list
+    let auto_skills: Vec<String> = fm.get("auto_skills")
+        .map(|s| {
+            // Parse YAML list: "- skill1\n  - skill2" or "[skill1, skill2]"
+            s.lines()
+                .map(|l| l.trim().trim_start_matches('-').trim().to_string())
+                .filter(|l| !l.is_empty() && !l.starts_with('['))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Detect non-coding orchestrator from role/description
+    let desc_lower = format!("{} {} {}", name, description, role).to_lowercase();
+    let is_orchestrator = desc_lower.contains("orchestrat")
+        || desc_lower.contains("coordinator")
+        || desc_lower.contains("manager")
+        || desc_lower.contains("gatekeeper")
+        || desc_lower.contains("route to sub-agent")
+        || desc_lower.contains("delegate")
+        || (fm.get("type").map(|t| t.to_lowercase()) == Some("orchestrator".to_string()));
+
     // Store the absolute path so the TOML output can reference it
     let abs_path = fs::canonicalize(path)
         .map(|p| p.to_string_lossy().to_string())
@@ -8394,6 +8459,8 @@ fn parse_agent_md(path: &str) -> Result<AgentProfileInput, SuggesterError> {
         domains,
         requirements_summary: String::new(),
         cwd: String::new(),
+        auto_skills,
+        is_orchestrator,
         source_path: abs_path,
     })
 }
@@ -8739,12 +8806,17 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
 
     // Query 1b: Extract bullet points / individual lines from description as separate queries.
     // Long descriptions dilute scoring signal; individual capability phrases match more precisely.
+    // Cap at 10 lines to prevent 80+ query explosion on verbose agent definitions.
     if profile.description.len() > 50 {
+        let mut desc_line_count = 0usize;
+        let max_desc_lines = 10;
         for line in profile.description.lines() {
+            if desc_line_count >= max_desc_lines { break; }
             let trimmed = line.trim().trim_start_matches('-').trim_start_matches('*').trim();
             // Only use lines that look like capability descriptions (>10 chars, not headers)
             if trimmed.len() > 10 && !trimmed.starts_with('#') && !trimmed.starts_with("##") {
                 queries.push(trimmed.to_string());
+                desc_line_count += 1;
             }
         }
     }
@@ -8760,7 +8832,8 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
     }
 
     // Query 3: Each duty as a separate query (matches action-oriented keywords)
-    for duty in &profile.duties {
+    // Cap at 10 duties to prevent query explosion on agents with many responsibilities.
+    for duty in profile.duties.iter().take(10) {
         if duty.len() > 5 {
             queries.push(duty.clone());
         }
@@ -8776,73 +8849,15 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
         queries.push(profile.tools.join(" "));
     }
 
-    // Queries 6-10: Universal development workflow queries.
-    // Split into separate queries so each gets full scoring independently,
-    // strongly boosting universal MCPs/agents/commands that every developer needs.
-
-    // Query 6: Documentation & API reference (boosts context7 MCP)
+    // Workflow query: consolidated universal development keywords.
+    // Previously 9 separate queries (6-14) that each ran a full scoring pass.
+    // Consolidated into 1 query for performance — the scarce-type injection (rules/MCP/LSP)
+    // and co-usage discovery already ensure universal elements are captured.
     queries.push(
-        "library documentation API reference version lookup current docs \
-         up-to-date documentation fetcher prevent hallucination".to_string()
-    );
-
-    // Query 7: Browser testing & DevTools (boosts chrome-devtools MCP)
-    queries.push(
-        "Chrome browser DevTools automation testing screenshot page inspection \
-         network debugging console performance tracing web debugging".to_string()
-    );
-
-    // Query 8: Containerization & deployment (boosts MCP_DOCKER)
-    queries.push(
-        "Docker container image build deployment orchestration registry \
-         containerized application CI CD pipeline docker compose".to_string()
-    );
-
-    // Query 9: Universal development agents (boosts cross-cutting agents like
-    // UI designers, CI/CD designers, debug specialists, lifecycle managers)
-    queries.push(
-        "UI UX design system architecture component library accessibility \
-         CI CD pipeline build deployment infrastructure monitoring \
-         debug specialist error investigation resource lifecycle".to_string()
-    );
-
-    // Query 10: Common development commands (boosts universal commands like
-    // create-component, design-review, fix-build, validate, audit)
-    queries.push(
-        "create component design review fix build optimize validate audit \
-         refactor check changes run tests resource report platform".to_string()
-    );
-
-    // Query 11: Build failures and diagnostics (boosts fix-build, optimize-build commands
-    // and eia-debug-specialist, build-fixer agents)
-    queries.push(
-        "xcode build failure fix compile error resolution diagnostics \
-         build time optimization incremental build swift compilation \
-         derived data cleanup simulator boot crash analysis log pattern".to_string()
-    );
-
-    // Query 12: Agent lifecycle and resource management (boosts ecos-lifecycle-manager,
-    // ecos-resource-monitor, ecos-resource-report agents/commands)
-    queries.push(
-        "agent lifecycle management spawn terminate hibernate wake \
-         system resource monitoring cpu memory disk usage tracking \
-         resource threshold health check recovery workflow".to_string()
-    );
-
-    // Query 13: CI/CD pipeline and release management (boosts eaa-cicd-designer,
-    // deployment-engineer agents and related commands)
-    queries.push(
-        "CI CD pipeline github actions workflow release automation \
-         app store upload deployment cross platform build configuration \
-         secret management test gates TDD enforcement".to_string()
-    );
-
-    // Query 14: Hook infrastructure and delegation patterns (boosts hook-auto-execute
-    // and proactive-delegation rules which are top gold rules at 66% and 61%)
-    queries.push(
-        "hook auto execution preTool routing redirect bash command \
-         agent delegation spawning parallel orchestration coordination \
-         task distribution workflow chaining agent output reporting".to_string()
+        "documentation API reference browser DevTools automation testing screenshot \
+         Docker container deployment CI CD pipeline build optimization \
+         agent lifecycle management resource monitoring debug diagnostics \
+         hook delegation orchestration coordination workflow release".to_string()
     );
 
     if queries.is_empty() {
@@ -8866,8 +8881,8 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
     }
 
     // Queries 0..num_domain_queries are domain-specific (agent name, description, role, duties, etc.)
-    // Queries num_domain_queries.. are workflow queries (documentation, browser, docker, universal agents/commands)
-    let num_workflow_queries = 9; // Queries 6-14 are workflow queries
+    // Last query is the consolidated workflow query (universal dev keywords)
+    let num_workflow_queries = 1; // Consolidated from 9 into 1 for performance
     let num_domain_queries = queries.len() - num_workflow_queries;
 
     info!("Synthesized {} scoring queries ({} domain + {} workflow) from agent descriptor",
@@ -8878,7 +8893,9 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
 
     let empty_domains: DetectedDomains = HashMap::new();
 
-    for (qi, query) in queries.iter().enumerate() {
+    // Parallel query scoring: each query runs find_matches() independently across all CPU cores,
+    // then results are merged sequentially. This turns 15 sequential scoring passes into parallel ones.
+    let query_results: Vec<(usize, Vec<MatchedSkill>)> = queries.par_iter().enumerate().map(|(qi, query)| {
         let corrected = correct_typos(query);
         let expanded = expand_synonyms(&corrected);
 
@@ -8896,16 +8913,17 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
         };
 
         // Score all skills with the unchanged find_matches() algorithm
-        // (index was loaded from CozoDB or JSON above — scoring is identical either way)
         let matches = find_matches(
             &corrected, &expanded, &index, &profile.cwd, &context,
             false, if detected_domains.is_empty() { &empty_domains } else { &detected_domains },
             registry.as_ref(),
         );
 
-        debug!("Query {}/{}: '{}' → {} matches", qi + 1, queries.len(),
-            &query[..query.len().min(60)], matches.len());
+        (qi, matches)
+    }).collect();
 
+    // Merge parallel results sequentially
+    for (qi, matches) in query_results {
         let is_domain_query = qi < num_domain_queries;
 
         for m in matches {
@@ -9805,6 +9823,151 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
                 secondary.push(skill);
             } else {
                 specialized.push(skill);
+            }
+        }
+    }
+
+    // ========================================================================
+    // PRE-OPTIMIZATIONS (benefit both fast and AI modes)
+    // ========================================================================
+
+    // PRE-OPT 1: Mutual exclusivity filter — keep only highest-scoring per conflict group.
+    // These conflict groups represent frameworks/tools that are alternatives to each other.
+    {
+        let conflict_groups: &[&[&str]] = &[
+            // Frontend frameworks
+            &["react", "vue", "angular", "svelte", "solid", "preact"],
+            &["nextjs", "nuxtjs", "sveltekit", "remix", "astro"],
+            &["nextjs-react-typescript", "nextjs-typescript-tailwindcss-supabase",
+              "nextjs-react-redux-typescript-cursor-rules", "optimized-nextjs-typescript"],
+            // CSS-in-JS / styling
+            &["styled-components-best-practices", "tailwindcss", "bootstrap", "css"],
+            // CSS preprocessors
+            &["sass-best-practices", "scss-best-practices", "less-best-practices", "postcss-best-practices"],
+            // State management
+            &["redux-toolkit", "zustand-state-management", "tanstack-query", "swr", "react-query"],
+            // Testing frameworks
+            &["jest", "playwright", "cypress", "playwright-cursor-rules"],
+            &["rspec", "jest", "pytest", "python-testing"],
+            // ORMs
+            &["prisma", "prisma-development", "typeorm", "drizzle-orm", "sequelize", "kysely"],
+            // Backend frameworks (Python)
+            &["django-python", "django-rest-api-development", "rest-api-django", "fastapi-python",
+              "fastapi-microservices-serverless", "flask-python"],
+            // Backend frameworks (JS/TS)
+            &["express-typescript", "nestjs-clean-typescript", "hono-typescript",
+              "fastify-typescript", "koa-typescript"],
+            // Deployment platforms
+            &["vercel-development", "netlify-development", "cloudflare-development", "aws-development",
+              "azure", "gcp-development"],
+            // Mobile frameworks
+            &["flutter", "expo-react-native-typescript", "expo-react-native-javascript-best-practices",
+              "react-native-cursor-rules", "ionic", "android-development"],
+            // Animation libraries
+            &["framer-motion", "gsap", "anime-js", "motion", "lottie"],
+            // Bundlers
+            &["webpack-bundler", "esbuild-bundler", "rollup-bundler", "parcel-bundler",
+              "turbopack-bundler", "vite"],
+            // Package managers / monorepo
+            &["pnpm", "lerna", "nx", "turborepo"],
+            // Auth providers
+            &["auth0-authentication", "clerk-authentication", "nextauth-authentication", "oauth-implementation"],
+            // Java frameworks
+            &["spring-boot", "spring-framework", "java-spring-development", "quarkus",
+              "java-quarkus-development", "micronaut"],
+            // PHP frameworks
+            &["laravel", "laravel-development", "wordpress", "woocommerce", "drupal-development"],
+            // GraphQL
+            &["graphql", "graphql-development", "apollo-graphql", "trpc"],
+        ];
+
+        let mut remove_skills: HashSet<String> = HashSet::new();
+
+        // For each conflict group, find all members present in any tier
+        for group in conflict_groups {
+            let mut present: Vec<(&str, f64)> = Vec::new();
+            for &member in *group {
+                // Check primary, secondary, specialized
+                for skill in primary.iter().chain(secondary.iter()).chain(specialized.iter()) {
+                    if skill.name == member {
+                        present.push((member, skill.score));
+                        break;
+                    }
+                }
+            }
+            // If more than one member present, keep highest-scoring, remove rest
+            if present.len() > 1 {
+                present.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (name, _) in present.iter().skip(1) {
+                    remove_skills.insert(name.to_string());
+                }
+            }
+        }
+
+        if !remove_skills.is_empty() {
+            info!("Mutual exclusivity filter: removing {} conflicting skills", remove_skills.len());
+            primary.retain(|s| !remove_skills.contains(&s.name));
+            secondary.retain(|s| !remove_skills.contains(&s.name));
+            specialized.retain(|s| !remove_skills.contains(&s.name));
+        }
+    }
+
+    // PRE-OPT 2: Non-coding agent filter — remove LSP/linting/code-fix for orchestrators
+    if profile.is_orchestrator {
+        info!("Non-coding agent filter: removing LSP/linting/code-fix entries for orchestrator");
+        let coding_patterns: &[&str] = &[
+            "lsp", "eslint", "ruff", "prettier", "black", "pylint", "mypy",
+            "code-fixer", "test-writer", "python-code-fixer", "js-code-fixer",
+        ];
+        let is_coding_entry = |name: &str| -> bool {
+            let lower = name.to_lowercase();
+            coding_patterns.iter().any(|p| lower.contains(p))
+        };
+        primary.retain(|s| !is_coding_entry(&s.name));
+        secondary.retain(|s| !is_coding_entry(&s.name));
+        specialized.retain(|s| !is_coding_entry(&s.name));
+        // Also clear LSP for non-coding agents
+        lsp_candidates = Vec::new();
+    }
+
+    // PRE-OPT 3: Auto-skills pinning — force auto_skills into primary tier
+    if !profile.auto_skills.is_empty() {
+        info!("Auto-skills pinning: {} skills from frontmatter", profile.auto_skills.len());
+        for auto_skill in &profile.auto_skills {
+            // Check if already in primary
+            if primary.iter().any(|s| s.name == *auto_skill) {
+                continue;
+            }
+            // Check if in secondary or specialized — move to primary
+            let mut found = false;
+            if let Some(pos) = secondary.iter().position(|s| s.name == *auto_skill) {
+                let skill = secondary.remove(pos);
+                primary.insert(0, skill); // Insert at front (highest priority)
+                found = true;
+            }
+            if !found {
+                if let Some(pos) = specialized.iter().position(|s| s.name == *auto_skill) {
+                    let skill = specialized.remove(pos);
+                    primary.insert(0, skill);
+                    found = true;
+                }
+            }
+            // If not found in any tier, add it as a synthetic entry
+            if !found {
+                // Try to find in index for metadata
+                let (path, desc) = if let Some(entry) = index.get_by_name(auto_skill) {
+                    (entry.path.clone(), entry.description.clone())
+                } else {
+                    (String::new(), format!("Auto-skill from agent frontmatter"))
+                };
+                primary.insert(0, AgentProfileCandidate {
+                    name: auto_skill.clone(),
+                    path,
+                    score: 1.0, // Max score — author-declared requirement
+                    confidence: "HIGH".to_string(),
+                    evidence: vec!["auto_skill_pin".to_string()],
+                    description: desc,
+                });
             }
         }
     }
