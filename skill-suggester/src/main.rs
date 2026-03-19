@@ -6033,32 +6033,46 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         // LOC: Software engineering
         "software measurement", "software prototyping", "antipatterns",
         "agile software development", "extreme programming",
+        "software refactoring", "software reengineering",
+        "software maintenance", "software documentation",
+        "software architecture", "software patterns", "software frameworks",
+        "software configuration management", "software visualization",
+        "software product line", "component software",
+        "cross-platform software development", "model-driven software",
+        "aspect-oriented programming", "scrum",
         // LOC: Core CS
         "data structures", "algorithms", "source code",
         "parallel programming", "functional programming",
         "object-oriented programming", "generic programming",
         "constraint programming", "scripting languages",
         "formal methods", "modeling languages",
+        // LOC: Software (additional)
+        "software architecture", "representational state transfer",
+        "application program interface", "enterprise service bus",
+        "open source software", "free computer software",
     ]),
 
     // =========================================================================
     // SOFTWARE SUB-DOMAINS (LOC: Computer security, AI, Database, etc.)
     // =========================================================================
 
-    // LOC: Computer security + Penetration testing + Intrusion detection
+    // LOC: Computer security + Penetration testing + Intrusion detection + Malware
     ("security", &[
         "security", "vulnerability", "penetration testing", "pentest",
         "owasp", "cve", "exploit", "hardening", "threat model",
         "security audit", "security scan", "secret detection",
         "authentication", "authorization", "encryption",
-        // LOC terms
+        // LOC: Computer security
         "computer security", "intrusion detection", "anomaly detection",
         "firewalls", "public key infrastructure", "cyber intelligence",
         "behavioral cybersecurity", "group signatures",
         "data encryption", "privacy-preserving",
+        // LOC: Software security (from software search)
+        "malware", "computer virus", "rootkit", "ransomware", "spyware",
+        "software protection", "access control",
     ]),
 
-    // LOC: Software testing + Debugging + Formal verification
+    // LOC: Software testing + Debugging + Formal verification + Quality control
     ("testing", &[
         "testing", "test automation", "unit test", "integration test",
         "end-to-end test", "e2e test", "test driven", "tdd",
@@ -6066,15 +6080,22 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         // LOC terms
         "debugging", "structured walkthrough", "formal verification",
         "self-stabilization", "software testing",
+        // LOC: Software quality (from software search)
+        "software verification", "software validation",
+        "quality control", "software reliability",
+        "capability maturity model",
     ]),
 
-    // DevOps (LOC: derived from CI/CD, containerization concepts)
+    // DevOps (LOC: Software container technologies + Software-defined networking)
     ("devops", &[
         "devops", "ci/cd", "continuous integration", "continuous deployment",
         "infrastructure as code", "terraform", "ansible", "kubernetes",
         "docker", "containerization", "deployment pipeline",
         "container orchestration", "configuration management",
         "monitoring", "observability",
+        // LOC: Software (from software search)
+        "software container", "software-defined networking",
+        "software deployment", "software configuration",
     ]),
 
     // LOC: Web site development + Document Object Model + Ajax
@@ -6127,6 +6148,9 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         "computer vision", "distributed artificial intelligence",
         "genetic programming", "evolutionary programming",
         "truth maintenance", "human computation",
+        // LOC: Software AI (from software search)
+        "intelligent agents", "intelligent personal assistant",
+        "chatbot", "multiagent systems", "mobile agents",
     ]),
 
     // LOC: Cloud computing + Ubiquitous computing + Distributed systems
