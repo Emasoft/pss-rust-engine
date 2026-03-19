@@ -6515,8 +6515,19 @@ fn find_matches(
     let weights = MatchWeights::default();
     let thresholds = ConfidenceThresholds::default();
 
-    let original_lower = original_prompt.to_lowercase();
-    let expanded_lower = expanded_prompt.to_lowercase();
+    // Strip trailing punctuation from prompt words so "bun." matches "bun".
+    // Punctuation at word boundaries prevents keyword matching for terms at
+    // end of sentences (e.g., "developing with bun." → "bun." ≠ "bun").
+    let original_lower: String = original_prompt.to_lowercase()
+        .split_whitespace()
+        .map(|w| w.trim_end_matches(|c: char| c.is_ascii_punctuation()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let expanded_lower: String = expanded_prompt.to_lowercase()
+        .split_whitespace()
+        .map(|w| w.trim_end_matches(|c: char| c.is_ascii_punctuation()))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     // LANGUAGE/FRAMEWORK CONFLICT GATE — prompt-level detection
     // Detect languages mentioned in the prompt so we can reject entries with conflicting languages.
