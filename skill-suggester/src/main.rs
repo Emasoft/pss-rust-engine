@@ -6184,16 +6184,38 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         "photo retouching", "photo manipulation",
         "photograph", "photo editor", "photo edit",
     ]),
+    // LOC: Graphic design (Typography) + Graphic arts
     ("graphic-design", &[
         "graphic design", "visual design", "illustration",
         "digital illustration", "graphic designer", "illustrat",
+        // LOC terms
+        "graphic arts", "graphic methods", "graphic statics",
+        "presentation graphics",
     ]),
+    // LOC: Computer graphics + Rendering + Real-time rendering + 3D
     ("3d-graphics", &[
         "3d modeling", "3d rendering", "3d animation",
         "3d design", "3d modelling",
+        // LOC terms
+        "real-time rendering", "interactive computer graphics",
+        "avatars", "virtual reality", "x3d",
     ]),
     ("motion-graphics", &[
         "motion graphics", "motion design", "visual effects",
+    ]),
+    // LOC: Computer graphics + Graphics processing units + WebGL + SVG
+    ("computer-graphics", &[
+        "computer graphics", "graphics processing",
+        "rendering", "rasterization", "ray tracing",
+        "shader", "fragment shader", "vertex shader",
+        "opengl", "vulkan", "directx", "metal graphics",
+        // LOC terms
+        "color computer graphics", "bit-mapped graphics",
+        "icons", "layers", "graphical user interface",
+        "webgl", "svg", "canvas",
+        "graphics processing unit", "gpu programming", "gpu computing",
+        "image synthesis", "texture mapping", "anti-aliasing",
+        "screen space", "framebuffer", "pixel shader",
     ]),
     ("copywriting", &[
         "copywriting", "content writing", "blog writing",
