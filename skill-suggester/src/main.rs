@@ -6050,6 +6050,13 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         "software architecture", "representational state transfer",
         "application program interface", "enterprise service bus",
         "open source software", "free computer software",
+        // LOC: Computer programs (conceptual terms)
+        "compiler", "interpreter", "linker", "subroutine",
+        "device driver", "emulator", "coroutine",
+        "program transformation", "mutation testing",
+        "plug-in", "text editor",
+        "computer programming", "assembly language",
+        "programming language",
     ]),
 
     // =========================================================================
@@ -6105,6 +6112,8 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         // LOC terms
         "web site development", "document object model",
         "ajax", "web application",
+        // LOC: Computer programs
+        "browser", "html editor",
     ]),
 
     // LOC: Database management + Service-oriented architecture
