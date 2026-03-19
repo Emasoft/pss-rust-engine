@@ -6018,13 +6018,157 @@ fn synonym_matches_in_text(synonym: &str, text: &str, words: &[&str]) -> bool {
 }
 
 /// Shared domain taxonomy: each domain is a group of synonyms meaning the same thing.
-/// Used by both find_matches() (runtime prompt inference) and the enrichment pipeline
-/// (index-time skill domain tagging). Must be kept in sync.
+/// Based on Library of Congress Subject Headings (LCSH) classification, enriched with
+/// modern industry terms. Used by both find_matches() (runtime prompt inference) and
+/// the enrichment pipeline (index-time skill domain tagging).
+/// Source: https://id.loc.gov/authorities/subjects (extracted 2026-03-19)
 const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
+    // =========================================================================
+    // PROGRAMMING (LOC: Computer science + Software engineering)
+    // The default fallback — most skills are programming-related
+    // =========================================================================
     ("programming", &[
         "programming", "coding", "software development", "computer science",
         "software engineering", "programm", "coder",
+        // LOC: Software engineering
+        "software measurement", "software prototyping", "antipatterns",
+        "agile software development", "extreme programming",
+        // LOC: Core CS
+        "data structures", "algorithms", "source code",
+        "parallel programming", "functional programming",
+        "object-oriented programming", "generic programming",
+        "constraint programming", "scripting languages",
+        "formal methods", "modeling languages",
     ]),
+
+    // =========================================================================
+    // SOFTWARE SUB-DOMAINS (LOC: Computer security, AI, Database, etc.)
+    // =========================================================================
+
+    // LOC: Computer security + Penetration testing + Intrusion detection
+    ("security", &[
+        "security", "vulnerability", "penetration testing", "pentest",
+        "owasp", "cve", "exploit", "hardening", "threat model",
+        "security audit", "security scan", "secret detection",
+        "authentication", "authorization", "encryption",
+        // LOC terms
+        "computer security", "intrusion detection", "anomaly detection",
+        "firewalls", "public key infrastructure", "cyber intelligence",
+        "behavioral cybersecurity", "group signatures",
+        "data encryption", "privacy-preserving",
+    ]),
+
+    // LOC: Software testing + Debugging + Formal verification
+    ("testing", &[
+        "testing", "test automation", "unit test", "integration test",
+        "end-to-end test", "e2e test", "test driven", "tdd",
+        "test coverage", "test suite", "test runner",
+        // LOC terms
+        "debugging", "structured walkthrough", "formal verification",
+        "self-stabilization", "software testing",
+    ]),
+
+    // DevOps (LOC: derived from CI/CD, containerization concepts)
+    ("devops", &[
+        "devops", "ci/cd", "continuous integration", "continuous deployment",
+        "infrastructure as code", "terraform", "ansible", "kubernetes",
+        "docker", "containerization", "deployment pipeline",
+        "container orchestration", "configuration management",
+        "monitoring", "observability",
+    ]),
+
+    // LOC: Web site development + Document Object Model + Ajax
+    ("frontend", &[
+        "frontend", "front-end", "ui component", "user interface",
+        "css", "html", "dom", "responsive design", "web design",
+        // LOC terms
+        "web site development", "document object model",
+        "ajax", "web application",
+    ]),
+
+    // LOC: Database management + Service-oriented architecture
+    ("backend", &[
+        "backend", "back-end", "server-side", "api development",
+        "rest api", "graphql api", "microservice",
+        // LOC terms
+        "service-oriented architecture", "web services",
+    ]),
+
+    // LOC: Database management + Database design + Querying
+    ("database", &[
+        "database", "database management", "database design",
+        "database security", "database searching", "querying",
+        "relational database", "sql", "nosql",
+        // LOC terms
+        "federated database", "web databases",
+        "multidimensional database", "data integration",
+        "materialized views", "data recovery",
+    ]),
+
+    // LOC: Mobile apps + Mobile communication systems
+    ("mobile", &[
+        "mobile development", "mobile app", "ios development",
+        "android development", "react native", "flutter",
+        "mobile ui", "app store",
+        // LOC terms
+        "mobile apps", "mobile communication",
+    ]),
+
+    // LOC: Artificial intelligence + Neural networks + NLP
+    ("data-ml", &[
+        "machine learning", "deep learning", "data science",
+        "neural network", "model training", "data analysis",
+        "data pipeline", "data engineering",
+        // LOC terms
+        "artificial intelligence", "back propagation",
+        "natural language processing", "natural language generation",
+        "expert systems", "generative artificial intelligence",
+        "human face recognition", "gesture recognition",
+        "computer vision", "distributed artificial intelligence",
+        "genetic programming", "evolutionary programming",
+        "truth maintenance", "human computation",
+    ]),
+
+    // LOC: Cloud computing + Ubiquitous computing + Distributed systems
+    ("cloud", &[
+        "cloud computing", "cloud infrastructure", "serverless",
+        "cloud function", "cloud deployment", "iaas", "paas",
+        // LOC terms
+        "ubiquitous computing", "distributed shared memory",
+        "high performance computing", "granular computing",
+    ]),
+
+    // LOC: Computer network architectures + Network protocols
+    ("networking", &[
+        "networking", "computer network", "network protocol",
+        "network architecture", "network security",
+        // LOC terms
+        "directory services", "network publishing",
+        "network slicing", "network file system",
+        "network management", "network time protocol",
+    ]),
+
+    // LOC: Blockchains (Databases) + Smart contracts
+    ("blockchain", &[
+        "blockchain", "smart contract", "solidity", "ethereum",
+        "web3", "defi", "nft", "cryptocurrency",
+        // LOC terms
+        "blockchains",
+    ]),
+
+    // LOC: Video games + Level design + Game theory
+    ("game-dev", &[
+        "game development", "game engine", "unity", "unreal",
+        "game design", "game programming", "sprite", "physics engine",
+        // LOC terms
+        "video games", "level design", "computer game",
+    ]),
+
+    // =========================================================================
+    // NON-PROGRAMMING DOMAINS (LOC subject classifications)
+    // Skills matching these are excluded when the prompt is about programming
+    // =========================================================================
+
     ("video-production", &[
         "video editing", "video production", "video processing",
         "film editing", "film production", "filmmaking",
@@ -6121,54 +6265,6 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         "acrylic painting", "painter",
     ]),
     ("sculpture", &["sculpture", "sculpting", "ceramics", "sculptor"]),
-    // --- Software sub-domains (programming-specific) ---
-    ("security", &[
-        "security", "vulnerability", "penetration testing", "pentest",
-        "owasp", "cve", "exploit", "hardening", "threat model",
-        "security audit", "security scan", "secret detection",
-        "authentication", "authorization", "encryption",
-    ]),
-    ("testing", &[
-        "testing", "test automation", "unit test", "integration test",
-        "end-to-end test", "e2e test", "test driven", "tdd",
-        "test coverage", "test suite", "test runner",
-    ]),
-    ("devops", &[
-        "devops", "ci/cd", "continuous integration", "continuous deployment",
-        "infrastructure as code", "terraform", "ansible", "kubernetes",
-        "docker", "containerization", "deployment pipeline",
-    ]),
-    ("frontend", &[
-        "frontend", "front-end", "ui component", "user interface",
-        "css", "html", "dom", "responsive design", "web design",
-    ]),
-    ("backend", &[
-        "backend", "back-end", "server-side", "api development",
-        "rest api", "graphql api", "microservice", "database",
-    ]),
-    ("mobile", &[
-        "mobile development", "mobile app", "ios development",
-        "android development", "react native", "flutter",
-        "mobile ui", "app store",
-    ]),
-    ("data-ml", &[
-        "machine learning", "deep learning", "data science",
-        "neural network", "model training", "data analysis",
-        "data pipeline", "data engineering", "nlp",
-        "natural language processing", "computer vision",
-    ]),
-    ("cloud", &[
-        "cloud computing", "cloud infrastructure", "serverless",
-        "cloud function", "cloud deployment", "iaas", "paas",
-    ]),
-    ("blockchain", &[
-        "blockchain", "smart contract", "solidity", "ethereum",
-        "web3", "defi", "nft", "cryptocurrency",
-    ]),
-    ("game-dev", &[
-        "game development", "game engine", "unity", "unreal",
-        "game design", "game programming", "sprite", "physics engine",
-    ]),
 ];
 
 /// Infer domain tags from text using the shared taxonomy.
