@@ -6515,19 +6515,32 @@ fn find_matches(
     let weights = MatchWeights::default();
     let thresholds = ConfidenceThresholds::default();
 
-    // Strip trailing punctuation from prompt words so "bun." matches "bun".
-    // Punctuation at word boundaries prevents keyword matching for terms at
-    // end of sentences (e.g., "developing with bun." → "bun." ≠ "bun").
-    let original_lower: String = original_prompt.to_lowercase()
-        .split_whitespace()
-        .map(|w| w.trim_end_matches(|c: char| c.is_ascii_punctuation()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let expanded_lower: String = expanded_prompt.to_lowercase()
-        .split_whitespace()
-        .map(|w| w.trim_end_matches(|c: char| c.is_ascii_punctuation()))
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Normalize prompt words: strip trailing punctuation, deduplicate, cap at 100 words.
+    // Punctuation stripping: "bun." → "bun" so keyword matching works at sentence ends.
+    // Dedup + cap: prevents O(words × skills × keywords) explosion when users paste
+    // large code blocks. 1000 repeated "function" = 1000× keyword comparisons per skill;
+    // dedup reduces to 1×. 100 unique words is sufficient for intent detection.
+    // Without this, 4000-char prompts with repetitive code take 2-4s (linear scaling).
+    let original_lower: String = {
+        let mut seen = std::collections::HashSet::new();
+        original_prompt.to_lowercase()
+            .split_whitespace()
+            .map(|w| w.trim_end_matches(|c: char| c.is_ascii_punctuation()))
+            .filter(|w| !w.is_empty() && seen.insert(w.to_string()))
+            .take(100)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let expanded_lower: String = {
+        let mut seen = std::collections::HashSet::new();
+        expanded_prompt.to_lowercase()
+            .split_whitespace()
+            .map(|w| w.trim_end_matches(|c: char| c.is_ascii_punctuation()))
+            .filter(|w| !w.is_empty() && seen.insert(w.to_string()))
+            .take(150) // expanded is larger due to synonym expansion
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
 
     // LANGUAGE/FRAMEWORK CONFLICT GATE — prompt-level detection
     // Detect languages mentioned in the prompt so we can reject entries with conflicting languages.
