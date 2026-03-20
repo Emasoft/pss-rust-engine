@@ -9243,6 +9243,15 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
         "widgetkit", "core-data", "swiftdata",
     ];
 
+    // Pre-compute agent sub-domains ONCE (was incorrectly computed per-entry in the loop below).
+    // infer_domains_from_text() is expensive — O(domains × synonyms × words).
+    let agent_sub_domains: Vec<String> = {
+        let agent_domains = infer_domains_from_text(
+            &format!("{} {}", profile.name, profile.description)
+        );
+        agent_domains.into_iter().filter(|d| d != "programming").collect()
+    };
+
     // Build sorted list. Each entry gets a type-appropriate score:
     // - Skills and agents use domain_score only (workflow queries pollute domain-specific rankings)
     // - Commands, rules, MCPs use combined_score (these benefit from workflow query boost)
@@ -9329,19 +9338,11 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
             // sub-domains (security, testing, devops, etc.), penalize skills that
             // don't overlap. This prevents generic GitHub/utility skills from
             // dominating domain-specific agent profiles.
-            // Detect agent domains from the description using the shared taxonomy.
-            let agent_domains = infer_domains_from_text(
-                &format!("{} {}", profile.name, profile.description)
-            );
-            // Filter to non-programming sub-domains (security, testing, devops, etc.)
-            let agent_sub_domains: Vec<&str> = agent_domains.iter()
-                .filter(|d| *d != "programming")
-                .map(|d| d.as_str())
-                .collect();
+            // Uses pre-computed agent_sub_domains (computed ONCE before this loop).
             if !agent_sub_domains.is_empty() {
                 if let Some(entry) = index.get_by_name(&name) {
                     let has_overlap = entry.domains.iter()
-                        .any(|d| agent_sub_domains.contains(&d.as_str()));
+                        .any(|d| agent_sub_domains.iter().any(|asd| asd == d));
                     if !has_overlap && !entry.domains.is_empty() {
                         // Skill has domains but NONE match the agent's — heavy penalty
                         adj_combined = (adj_combined as f64 * 0.10) as i32;
