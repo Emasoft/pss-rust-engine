@@ -749,6 +749,9 @@ pub struct AgentProfileOutput {
 
     /// LSP servers relevant to this agent
     pub lsp: Vec<AgentProfileCandidate>,
+
+    /// Output styles relevant to this agent
+    pub output_styles: Vec<AgentProfileCandidate>,
 }
 
 /// Tiered skill lists for agent profile output
@@ -8810,6 +8813,11 @@ fn write_agent_toml(
     toml.push_str("tech_stack = []\n");
     toml.push('\n');
 
+    // [description] section — empty for now (populated by AI post-filter)
+    toml.push_str("[description]\n");
+    toml.push_str("text = \"\"\n");
+    toml.push('\n');
+
     // [skills] section — primary/secondary/specialized are name arrays
     toml.push_str("[skills]\n");
     let primary_names = candidates_to_names(&output.skills.primary);
@@ -8853,6 +8861,27 @@ fn write_agent_toml(
     toml.push_str("[lsp]\n");
     let lsp_names = candidates_to_names(&output.lsp);
     toml.push_str(&format!("recommended = {}\n", toml_string_array(&lsp_names)));
+    toml.push('\n');
+
+    // [output_styles] section
+    toml.push_str("[output_styles]\n");
+    let output_style_names = candidates_to_names(&output.output_styles);
+    toml.push_str(&format!("recommended = {}\n", toml_string_array(&output_style_names)));
+    toml.push('\n');
+
+    // [dependencies] section — empty defaults for all 11 sub-keys
+    toml.push_str("[dependencies]\n");
+    toml.push_str("plugins = []\n");
+    toml.push_str("skills = []\n");
+    toml.push_str("rules = []\n");
+    toml.push_str("agents = []\n");
+    toml.push_str("commands = []\n");
+    toml.push_str("hooks = []\n");
+    toml.push_str("mcp_servers = []\n");
+    toml.push_str("lsp_servers = []\n");
+    toml.push_str("output_styles = []\n");
+    toml.push_str("tools = []\n");
+    toml.push_str("frameworks = []\n");
 
     // Write to <agent-name>.agent.toml in current directory
     let filename = format!("{}.agent.toml", output.agent);
@@ -9095,6 +9124,7 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
             rules: vec![],
             mcp: vec![],
             lsp: vec![],
+            output_styles: vec![],
         };
         let toml_path = write_agent_toml(&output, &profile.source_path)?;
         eprintln!("Wrote {}", toml_path);
@@ -10268,6 +10298,7 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
         rules: to_candidates(rule_candidates),
         mcp: to_candidates(mcp_candidates),
         lsp: to_candidates(lsp_candidates),
+        output_styles: vec![],
     };
 
     // Write .agent.toml file instead of JSON to stdout
