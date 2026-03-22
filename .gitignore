@@ -2,3 +2,5 @@ target/
 *.swp
 *.swo
 .DS_Store
+.claude/
+reports_dev/
