@@ -4,3 +4,8 @@ target/
 .DS_Store
 .claude/
 reports_dev/
+# TLDR artifacts (added by rechecker)
+.tldr/
+.tldrignore
+.tldr_session_*
+.rechecker/
