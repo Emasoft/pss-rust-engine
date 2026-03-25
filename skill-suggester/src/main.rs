@@ -10567,10 +10567,15 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
             }
         }
 
-        // Scan agents for reverse co_usage discoveries (limited to top 10 by score to avoid noise)
+        // Scan agents for reverse co_usage discoveries (limited to top 10 by score to avoid noise).
+        // Also include the profiled agent's own name — entries listing this agent in their co_usage
+        // are highly complementary (e.g., axiom-ios-games.co_usage contains "ios-developer").
         let mut agent_names_for_reverse: Vec<(String, f64)> = complementary_agents_vec.iter()
             .map(|a| (a.name.clone(), a.score))
             .collect();
+        if !agent_names_for_reverse.iter().any(|(n, _)| n == &profile.name) {
+            agent_names_for_reverse.push((profile.name.clone(), 1.0));
+        }
         agent_names_for_reverse.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         agent_names_for_reverse.truncate(10); // Only reverse-scan top 10 agents
         let mut total_reverse_agents = 0usize;
