@@ -3019,32 +3019,27 @@ pub struct ContextItem {
 }
 
 impl ContextItem {
-    /// Format context items as a readable string for additionalContext
+    /// Format context items as a compact string for additionalContext.
+    /// One line per skill to minimize token overhead on every user message.
     pub fn format_as_context(items: &[ContextItem]) -> Option<String> {
         if items.is_empty() {
             return None;
         }
 
-        let mut context = String::from("<pss-skill-suggestions>\n");
+        let mut context = String::from("<pss-skills>\n");
 
         for item in items {
+            // Compact: "name [type] (CONFIDENCE, 0.85)" — one line per skill
             context.push_str(&format!(
-                "SUGGESTED: {} [{}]\n  Path: {}\n  Confidence: {} (score: {:.2})\n  Evidence: {}\n",
+                "  {} [{}] ({}, {:.2})\n",
                 item.name,
                 item.item_type,
-                item.path,
                 item.confidence,
                 item.score,
-                item.evidence.join(", ")
             ));
-
-            if let Some(commitment) = &item.commitment {
-                context.push_str(&format!("  Commitment: {}\n", commitment));
-            }
-            context.push('\n');
         }
 
-        context.push_str("</pss-skill-suggestions>");
+        context.push_str("</pss-skills>");
         Some(context)
     }
 }
@@ -15731,17 +15726,20 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
         );
     }
 
-    // W20: Include ALL element types (skills, agents, commands, rules, mcp, lsp).
-    // Commands (run-tests, think-harder, translate) are actionable user suggestions.
-    // Rules (claim-verification) provide relevant behavioral context.
-    // MCP entries provide tool access. Previously only skill/agent were included,
-    // which caused 67/500 gold skills to be unreachable in benchmarks.
+    // Hook mode: only suggest skills (compact output, saves tokens for the model).
+    // JSON mode (agent profiler): include ALL element types for .agent.toml generation.
     let filtered_items: Vec<_> = context_items
         .into_iter()
         .filter(|item| {
             let t = item.item_type.as_str();
-            // Include all actionable types; only exclude truly invisible types
-            t == "skill" || t == "agent" || t == "command" || t == "rule" || t == "mcp" || t == "lsp" || t.is_empty()
+            if cli.format == "hook" {
+                // Hook mode: skills only — agents, commands, rules, mcp, lsp waste
+                // ~50 lines of token budget on every user message
+                t == "skill"
+            } else {
+                // JSON/profiler mode: all actionable types for .agent.toml profiles
+                t == "skill" || t == "agent" || t == "command" || t == "rule" || t == "mcp" || t == "lsp" || t.is_empty()
+            }
         })
         .collect();
 
