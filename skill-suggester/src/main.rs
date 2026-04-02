@@ -15969,7 +15969,13 @@ fn extract_prev_user_message(transcript_path: &str) -> String {
         // Skip 1st (current prompt already in transcript), return 2nd
         if user_messages_found >= 2 {
             if text.len() > max_result_len {
-                return text[..max_result_len].to_string();
+                // Truncate at a valid UTF-8 char boundary to avoid panic
+                // on multi-byte characters (CJK, emoji, accented text)
+                let mut end = max_result_len;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                return text[..end].to_string();
             }
             return text;
         }
