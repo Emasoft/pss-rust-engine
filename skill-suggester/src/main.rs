@@ -12549,6 +12549,9 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
         let description = input["description"].as_str().unwrap_or("");
         // use_context: "when to use" / "use cases" section from the body (if present)
         let use_context = input["use_context"].as_str().unwrap_or("");
+        // AgentSkills open standard metadata (agentskills.io spec)
+        let agentskills_meta = &input["agentskills_metadata"];
+        let compatibility = input["compatibility"].as_str().unwrap_or("");
 
         if name.is_empty() {
             eprintln!("Warning: skipping element with empty name");
@@ -12570,9 +12573,9 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
         // Primary category = top-scoring activity (backward compat for existing consumers)
         let category = activities.first().map(|(a, _)| a.as_str()).unwrap_or("general-development");
         let intents = infer_pass1_intents(category);
-        let languages = extract_pass1_languages(&keywords);
-        let frameworks = extract_pass1_frameworks(&keywords);
-        let platforms = extract_pass1_platforms(&keywords);
+        let mut languages = extract_pass1_languages(&keywords);
+        let mut frameworks = extract_pass1_frameworks(&keywords);
+        let mut platforms = extract_pass1_platforms(&keywords);
         let tools = extract_pass1_tools(&keywords);
         let services = extract_pass1_services(&keywords);
 
@@ -12665,6 +12668,49 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
                 "framework".to_string(),
                 serde_json::json!(frameworks),
             );
+        }
+
+        // AgentSkills metadata: if present, use as authoritative domain signals
+        // (more reliable than text inference — skill author explicitly declared these)
+        if agentskills_meta.is_object() {
+            let meta = agentskills_meta.as_object().unwrap();
+            // language/framework/platform from metadata → add to extracted lists + gates
+            for (meta_key, gate_name, target) in [
+                ("language", "programming_language", &mut languages),
+                ("framework", "framework", &mut frameworks),
+                ("platform", "target_platform", &mut platforms),
+            ] {
+                if let Some(val) = meta.get(meta_key).and_then(|v| v.as_str()) {
+                    let lower = val.to_lowercase();
+                    if !target.contains(&lower) {
+                        target.push(lower.clone());
+                    }
+                    // Ensure corresponding domain gate exists
+                    if !domain_gates.contains_key(gate_name) {
+                        domain_gates.insert(
+                            gate_name.to_string(),
+                            serde_json::json!([lower]),
+                        );
+                    }
+                }
+            }
+            // tags from metadata → add as extra keywords
+            if let Some(tags) = meta.get("tags").and_then(|v| v.as_str()) {
+                for tag in tags.split(',').map(|t| t.trim().to_lowercase()) {
+                    if !tag.is_empty() && tag.len() > 2 && !all_keywords.contains(&tag) {
+                        all_keywords.push(tag);
+                    }
+                }
+            }
+        }
+        // compatibility field → add tool/platform keywords
+        if !compatibility.is_empty() {
+            for word in compatibility.split_whitespace() {
+                let lower = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                if lower.len() > 2 && !all_keywords.contains(&lower) && !is_pass1_stopword(&lower) {
+                    all_keywords.push(lower);
+                }
+            }
         }
 
         // Infer domains from name + description using the shared synonym taxonomy
