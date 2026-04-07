@@ -7368,6 +7368,19 @@ fn find_matches(
     // Called ONCE before the par_iter loop; result shared across all skill evaluations.
     let prompt_negated_terms = detect_prompt_negations(original_prompt);
 
+    // Pre-compute word vectors ONCE outside par_iter to avoid per-skill allocation.
+    // prompt_words is already computed above (line ~7353).
+    let original_words: Vec<&str> = original_lower.split_whitespace().collect();
+    let extended_prompt_words: Vec<String> = prompt_words.iter()
+        .flat_map(|pw| {
+            if pw.contains('-') {
+                pw.split('-').map(|s| s.to_string()).collect::<Vec<_>>()
+            } else {
+                vec![pw.to_string()]
+            }
+        })
+        .collect();
+
     // Parallel scoring: each skill scored independently across all CPU cores via rayon
     // HashMap key is entry ID (not element name); use entry.name for the element name.
     let mut matches: Vec<MatchedSkill> = index.skills.par_iter().filter_map(|(_entry_id, entry)| {
@@ -7662,7 +7675,7 @@ fn find_matches(
         // names are rarely mentioned unless they are the focus of the discussion.
         // These names (e.g. "bun", "react", "ffmpeg", "graphql") are strong signals.
         // Uses word-boundary matching to avoid "com" matching "comprehensive".
-        let original_words: Vec<&str> = original_lower.split_whitespace().collect();
+        // original_words is pre-computed outside par_iter (see above)
         for fw in &entry.frameworks {
             let fw_lower = fw.to_lowercase();
             // Skip framework names that are low-signal words (shouldn't happen often,
@@ -7880,7 +7893,7 @@ fn find_matches(
         // Also includes fuzzy matching for typo tolerance
         // Fixed: Now handles multi-word keyword phrases properly
         // Low-signal word detection: tracks if match came only from generic words
-        let prompt_words: Vec<&str> = expanded_lower.split_whitespace().collect();
+        // prompt_words is pre-computed outside par_iter (see above)
 
         for keyword in &entry.keywords {
             let kw_lower = keyword.to_lowercase();
@@ -8088,16 +8101,7 @@ fn find_matches(
             .filter(|p| !LOW_SIGNAL_WORDS.contains(stem_word(p).as_str()))
             .copied()
             .collect();
-        // Build extended prompt words by also splitting hyphenated words
-        let extended_prompt_words: Vec<String> = prompt_words.iter()
-            .flat_map(|pw| {
-                if pw.contains('-') {
-                    pw.split('-').map(|s| s.to_string()).collect::<Vec<_>>()
-                } else {
-                    vec![pw.to_string()]
-                }
-            })
-            .collect();
+        // extended_prompt_words is pre-computed outside par_iter (see above)
         let mut name_match_count = 0;
         for np in &significant_name_parts {
             let np_stem = stem_word(np);
@@ -10838,42 +10842,45 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
                     }
                     match mentioner_type {
                         "skill" if !existing_skill_names.contains(mentioner_name) => {
-                            let entry = &index.get_by_name(mentioner_name).unwrap();
-                            specialized.push(AgentProfileCandidate {
-                                name: mentioner_name.to_string(),
-                                path: entry.path.clone(),
-                                score: 0.15, // Moderate score: reverse co_usage is a weaker signal
-                                confidence: "LOW".to_string(),
-                                evidence: vec!["reverse_co_usage".to_string()],
-                                description: entry.description.clone(),
-                            });
-                            existing_skill_names.insert(mentioner_name.to_string());
+                            if let Some(entry) = index.get_by_name(mentioner_name) {
+                                specialized.push(AgentProfileCandidate {
+                                    name: mentioner_name.to_string(),
+                                    path: entry.path.clone(),
+                                    score: 0.15, // Moderate score: reverse co_usage is a weaker signal
+                                    confidence: "LOW".to_string(),
+                                    evidence: vec!["reverse_co_usage".to_string()],
+                                    description: entry.description.clone(),
+                                });
+                                existing_skill_names.insert(mentioner_name.to_string());
+                            }
                         }
                         "agent" if !existing_agent_names.contains(mentioner_name)
                             && total_reverse_agents < max_reverse_agents => {
-                            let entry = &index.get_by_name(mentioner_name).unwrap();
-                            complementary_agents_vec.push(AgentProfileCandidate {
-                                name: mentioner_name.to_string(),
-                                path: entry.path.clone(),
-                                score: 0.12,
-                                confidence: "LOW".to_string(),
-                                evidence: vec!["reverse_co_usage".to_string()],
-                                description: entry.description.clone(),
-                            });
-                            existing_agent_names.insert(mentioner_name.to_string());
-                            total_reverse_agents += 1;
+                            if let Some(entry) = index.get_by_name(mentioner_name) {
+                                complementary_agents_vec.push(AgentProfileCandidate {
+                                    name: mentioner_name.to_string(),
+                                    path: entry.path.clone(),
+                                    score: 0.12,
+                                    confidence: "LOW".to_string(),
+                                    evidence: vec!["reverse_co_usage".to_string()],
+                                    description: entry.description.clone(),
+                                });
+                                existing_agent_names.insert(mentioner_name.to_string());
+                                total_reverse_agents += 1;
+                            }
                         }
                         "command" if !existing_command_names.contains(mentioner_name) => {
-                            let entry = &index.get_by_name(mentioner_name).unwrap();
-                            command_candidates_vec.push(AgentProfileCandidate {
-                                name: mentioner_name.to_string(),
-                                path: entry.path.clone(),
-                                score: 0.12,
-                                confidence: "LOW".to_string(),
-                                evidence: vec!["reverse_co_usage".to_string()],
-                                description: entry.description.clone(),
-                            });
-                            existing_command_names.insert(mentioner_name.to_string());
+                            if let Some(entry) = index.get_by_name(mentioner_name) {
+                                command_candidates_vec.push(AgentProfileCandidate {
+                                    name: mentioner_name.to_string(),
+                                    path: entry.path.clone(),
+                                    score: 0.12,
+                                    confidence: "LOW".to_string(),
+                                    evidence: vec!["reverse_co_usage".to_string()],
+                                    description: entry.description.clone(),
+                                });
+                                existing_command_names.insert(mentioner_name.to_string());
+                            }
                         }
                         _ => {}
                     }
@@ -10895,40 +10902,43 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
                     }
                     match mentioner_type {
                         "skill" if !existing_skill_names.contains(mentioner_name) => {
-                            let entry = &index.get_by_name(mentioner_name).unwrap();
-                            specialized.push(AgentProfileCandidate {
-                                name: mentioner_name.to_string(),
-                                path: entry.path.clone(),
-                                score: 0.10,
-                                confidence: "LOW".to_string(),
-                                evidence: vec!["reverse_co_usage_skill".to_string()],
-                                description: entry.description.clone(),
-                            });
-                            existing_skill_names.insert(mentioner_name.to_string());
+                            if let Some(entry) = index.get_by_name(mentioner_name) {
+                                specialized.push(AgentProfileCandidate {
+                                    name: mentioner_name.to_string(),
+                                    path: entry.path.clone(),
+                                    score: 0.10,
+                                    confidence: "LOW".to_string(),
+                                    evidence: vec!["reverse_co_usage_skill".to_string()],
+                                    description: entry.description.clone(),
+                                });
+                                existing_skill_names.insert(mentioner_name.to_string());
+                            }
                         }
                         "agent" if !existing_agent_names.contains(mentioner_name) => {
-                            let entry = &index.get_by_name(mentioner_name).unwrap();
-                            complementary_agents_vec.push(AgentProfileCandidate {
-                                name: mentioner_name.to_string(),
-                                path: entry.path.clone(),
-                                score: 0.08,
-                                confidence: "LOW".to_string(),
-                                evidence: vec!["reverse_co_usage_skill".to_string()],
-                                description: entry.description.clone(),
-                            });
-                            existing_agent_names.insert(mentioner_name.to_string());
+                            if let Some(entry) = index.get_by_name(mentioner_name) {
+                                complementary_agents_vec.push(AgentProfileCandidate {
+                                    name: mentioner_name.to_string(),
+                                    path: entry.path.clone(),
+                                    score: 0.08,
+                                    confidence: "LOW".to_string(),
+                                    evidence: vec!["reverse_co_usage_skill".to_string()],
+                                    description: entry.description.clone(),
+                                });
+                                existing_agent_names.insert(mentioner_name.to_string());
+                            }
                         }
                         "command" if !existing_command_names.contains(mentioner_name) => {
-                            let entry = &index.get_by_name(mentioner_name).unwrap();
-                            command_candidates_vec.push(AgentProfileCandidate {
-                                name: mentioner_name.to_string(),
-                                path: entry.path.clone(),
-                                score: 0.08,
-                                confidence: "LOW".to_string(),
-                                evidence: vec!["reverse_co_usage_skill".to_string()],
-                                description: entry.description.clone(),
-                            });
-                            existing_command_names.insert(mentioner_name.to_string());
+                            if let Some(entry) = index.get_by_name(mentioner_name) {
+                                command_candidates_vec.push(AgentProfileCandidate {
+                                    name: mentioner_name.to_string(),
+                                    path: entry.path.clone(),
+                                    score: 0.08,
+                                    confidence: "LOW".to_string(),
+                                    evidence: vec!["reverse_co_usage_skill".to_string()],
+                                    description: entry.description.clone(),
+                                });
+                                existing_command_names.insert(mentioner_name.to_string());
+                            }
                         }
                         _ => {}
                     }
@@ -15320,7 +15330,10 @@ fn main() {
     // Box::leak converts String to &'static str, which clap's .version() requires
     let version: &'static str = Box::leak(read_version().into_boxed_str());
     let matches = Cli::command().version(version).get_matches();
-    let cli = Cli::from_arg_matches(&matches).expect("Failed to parse CLI arguments");
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(2);
+    });
 
     if cli.incomplete_mode {
         info!("Running in INCOMPLETE MODE - co_usage data will be ignored");
@@ -16033,6 +16046,9 @@ fn extract_prev_user_message(transcript_path: &str) -> String {
 /// Fast subsequence check (avoids allocating a Window iterator for short needles)
 #[inline]
 fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return needle.is_empty();
+    }
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
