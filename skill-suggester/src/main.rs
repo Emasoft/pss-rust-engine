@@ -2690,7 +2690,7 @@ fn dedup_vec(v: &mut Vec<String>) {
 // ============================================================================
 
 /// The complete skill index (enhanced v3.0 format)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SkillIndex {
     /// Index version
     pub version: String,
@@ -8709,6 +8709,15 @@ fn load_index(path: &PathBuf) -> Result<SkillIndex, SuggesterError> {
         return Err(SuggesterError::IndexNotFound(path.clone()));
     }
 
+    // Bincode cache: skip JSON parsing when a fresh binary cache exists.
+    // The cache is invalidated automatically when the JSON file is newer.
+    let cache_path = path.with_extension("bin");
+    if let Some(index) = load_bincode_cache(&cache_path, path) {
+        return Ok(index);
+    }
+
+    // Cache miss — parse JSON (slow path)
+    info!("Bincode cache miss, parsing JSON index: {:?}", path);
     let content = fs::read_to_string(path).map_err(|e| SuggesterError::IndexRead {
         path: path.clone(),
         source: e,
@@ -8740,7 +8749,49 @@ fn load_index(path: &PathBuf) -> Result<SkillIndex, SuggesterError> {
     index.skills_count = index.skills.len();
     index.build_name_index();
 
+    // Write bincode cache for next invocation (best-effort, don't fail on write errors)
+    write_bincode_cache(&cache_path, &index);
+
     Ok(index)
+}
+
+/// Try to load the post-processed SkillIndex from a bincode cache file.
+/// Returns None if the cache is missing, stale (older than JSON source), or corrupt.
+fn load_bincode_cache(cache_path: &Path, json_path: &Path) -> Option<SkillIndex> {
+    let cache_meta = fs::metadata(cache_path).ok()?;
+    let json_meta = fs::metadata(json_path).ok()?;
+
+    // Stale check: cache must be newer than JSON source
+    let cache_mtime = cache_meta.modified().ok()?;
+    let json_mtime = json_meta.modified().ok()?;
+    if cache_mtime <= json_mtime {
+        info!("Bincode cache stale, will rebuild");
+        return None;
+    }
+
+    let data = fs::read(cache_path).ok()?;
+    let mut index: SkillIndex = bincode::deserialize(&data).ok()?;
+    // Rebuild the skip-serialized secondary index
+    index.build_name_index();
+    info!("Loaded {} skills from bincode cache", index.skills.len());
+    Some(index)
+}
+
+/// Write the post-processed SkillIndex to a bincode cache file (best-effort).
+fn write_bincode_cache(cache_path: &Path, index: &SkillIndex) {
+    match bincode::serialize(index) {
+        Ok(data) => {
+            // Atomic write: write to .tmp then rename
+            let tmp_path = cache_path.with_extension("bin.tmp");
+            if fs::write(&tmp_path, &data).is_ok() {
+                let _ = fs::rename(&tmp_path, cache_path);
+                info!("Wrote bincode cache ({} bytes)", data.len());
+            }
+        }
+        Err(e) => {
+            warn!("Failed to serialize bincode cache: {}", e);
+        }
+    }
 }
 
 // ============================================================================
@@ -13190,6 +13241,16 @@ fn create_db_schema(db: &DbInstance) -> Result<(), SuggesterError> {
         ScriptMutability::Mutable,
     ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (domain_skills) failed: {}", e)))?;
 
+    // Unified inverted lookup: keyword_lower is the FIRST key for fast prefix scans.
+    // Populated from ALL inverted tables (keywords, frameworks, intents, tools, services,
+    // languages, platforms, domains) plus skill name parts.
+    // At hook time: query by keyword_lower to get candidate skill_names in O(log n).
+    db.run_script(
+        "{:create kw_lookup { keyword_lower: String, skill_name: String }}",
+        Default::default(),
+        ScriptMutability::Mutable,
+    ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (kw_lookup) failed: {}", e)))?;
+
     // ID lookup table: maps 13-char deterministic IDs to entry (name, source) pairs
     db.run_script(
         "{:create skill_ids { id: String => name: String, source: String }}",
@@ -13398,6 +13459,48 @@ fn insert_skills_batch(
     batch_insert("skill_domains", &domain_pairs)?;
     batch_insert("skill_file_types", &ft_pairs)?;
 
+    // Build unified kw_lookup from all inverted sources.
+    // keyword_lower is the first key → O(log n) prefix scan at query time.
+    {
+        let mut lookup_pairs: Vec<(String, String)> = Vec::new();
+        let all_sources: [&Vec<(String, String)>; 9] = [
+            &kw_pairs, &intent_pairs, &tool_pairs, &svc_pairs,
+            &fw_pairs, &lang_pairs, &plat_pairs, &domain_pairs, &ft_pairs,
+        ];
+        for source in &all_sources {
+            for (skill_name, value) in *source {
+                let lower = value.to_lowercase();
+                if lower.len() >= 2 {
+                    lookup_pairs.push((lower, skill_name.clone()));
+                }
+            }
+        }
+        // Deduplicate
+        lookup_pairs.sort();
+        lookup_pairs.dedup();
+        // Custom insert: kw_lookup uses {keyword_lower, skill_name} not {skill_name, value}
+        for chunk in lookup_pairs.chunks(500) {
+            let data: String = chunk.iter()
+                .map(|(kw, name)| format!(
+                    "[\"{}\", \"{}\"]",
+                    kw.replace('\\', "\\\\").replace('"', "\\\""),
+                    name.replace('\\', "\\\\").replace('"', "\\\""),
+                ))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if data.is_empty() { continue; }
+            let script = format!(
+                "?[keyword_lower, skill_name] <- [{}] :put kw_lookup {{ keyword_lower, skill_name }}",
+                data
+            );
+            db.run_script(&script, Default::default(), ScriptMutability::Mutable)
+                .map_err(|e| SuggesterError::IndexParse(
+                    format!("Batch insert kw_lookup failed: {}", e)
+                ))?;
+        }
+        info!("Built kw_lookup with {} entries", lookup_pairs.len());
+    }
+
     // Batch-insert ID → (name, source) mappings into skill_ids lookup table
     for chunk in id_pairs.chunks(500) {
         let data: String = chunk.iter()
@@ -13464,6 +13567,41 @@ fn run_build_db(cli: &Cli) -> Result<(), SuggesterError> {
         "Inserted {} skills in {:.2}s",
         count, elapsed.as_secs_f64()
     );
+
+    // Add skill name parts to kw_lookup (e.g., "react-query" → "react", "query")
+    {
+        let mut name_pairs: Vec<(String, String)> = Vec::new();
+        for entry in index.skills.values() {
+            for part in entry.name.to_lowercase().split(|c: char| c == '-' || c == '_' || c == ' ') {
+                if part.len() >= 2 {
+                    name_pairs.push((part.to_string(), entry.name.clone()));
+                }
+            }
+        }
+        name_pairs.sort();
+        name_pairs.dedup();
+        // Reuse the batch_insert helper via a direct script
+        for chunk in name_pairs.chunks(500) {
+            let data: String = chunk.iter()
+                .map(|(kw, name)| format!(
+                    "[\"{}\", \"{}\"]",
+                    kw.replace('\\', "\\\\").replace('"', "\\\""),
+                    name.replace('\\', "\\\\").replace('"', "\\\""),
+                ))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if data.is_empty() { continue; }
+            let script = format!(
+                "?[keyword_lower, skill_name] <- [{}] :put kw_lookup {{ keyword_lower, skill_name }}",
+                data
+            );
+            db.run_script(&script, Default::default(), ScriptMutability::Mutable)
+                .map_err(|e| SuggesterError::IndexParse(
+                    format!("Batch insert kw_lookup name parts failed: {}", e)
+                ))?;
+        }
+        eprintln!("Added {} name-part entries to kw_lookup", name_pairs.len());
+    }
 
     // Insert domain registry into DB (if available)
     // Look for domain-registry.json in same directory as skill-index.json
@@ -13805,6 +13943,124 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
         version,
         generated: String::new(),
         method: "cozodb".to_string(),
+        skills_count,
+        skills,
+        name_to_ids: HashMap::new(),
+    };
+    index.build_name_index();
+    Ok(index)
+}
+
+/// Load only candidate entries matching prompt words via the kw_lookup inverted index.
+/// Returns a SkillIndex with only the matching entries (typically 50-500 instead of 10K).
+/// Falls back to load_index_from_db (full load) if kw_lookup is empty or query fails.
+fn load_candidates_from_db(
+    db: &DbInstance,
+    prompt_words: &[String],
+) -> Result<SkillIndex, SuggesterError> {
+    if prompt_words.is_empty() {
+        info!("No prompt words for pre-filtering, loading full index");
+        return load_index_from_db(db);
+    }
+
+    // Build inline data for prompt words (already lowercased by caller)
+    let words_data: String = prompt_words.iter()
+        .map(|w| format!("[\"{}\"]", w.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Single Datalog query: look up kw_lookup → join with skills table
+    let query = format!(
+        "words[w] <- [{}]\n\
+         candidates[name] := *kw_lookup{{keyword_lower: w, skill_name: name}}, words[w]\n\
+         ?[name, path, skill_type, source, description, tier, boost, category, \
+          server_type, server_command, server_args_json, language_ids_json, \
+          negative_kw_json, patterns_json, directories_json, path_patterns_json, \
+          use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
+          keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json] := \
+          candidates[name], *skills{{ name, source, path, skill_type, description, tier, boost, category, \
+                   server_type, server_command, server_args_json, language_ids_json, \
+                   negative_kw_json, patterns_json, directories_json, path_patterns_json, \
+                   use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
+                   keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json }}",
+        words_data
+    );
+
+    let main_result = match db.run_script(&query, Default::default(), ScriptMutability::Immutable) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Candidate query failed: {}, falling back to full load", e);
+            return load_index_from_db(db);
+        }
+    };
+
+    if main_result.rows.is_empty() {
+        info!("No candidates matched, falling back to full load");
+        return load_index_from_db(db);
+    }
+
+    // Same deserialization as load_index_from_db
+    let dv_str = |v: &DataValue| -> String {
+        match v {
+            DataValue::Str(s) => s.to_string(),
+            _ => String::new(),
+        }
+    };
+    let dv_i32 = |v: &DataValue| -> i32 {
+        match v {
+            DataValue::Num(cozo::Num::Int(n)) => *n as i32,
+            DataValue::Num(cozo::Num::Float(f)) => *f as i32,
+            _ => 0,
+        }
+    };
+
+    let mut skills: HashMap<String, SkillEntry> = HashMap::new();
+    for row in &main_result.rows {
+        if row.len() < 29 { continue; }
+        let name = dv_str(&row[0]);
+        let source = dv_str(&row[3]);
+        let entry_id = make_entry_id(&name, &source);
+        let entry = SkillEntry {
+            name: name.clone(),
+            path: dv_str(&row[1]),
+            skill_type: dv_str(&row[2]),
+            source,
+            description: dv_str(&row[4]),
+            tier: dv_str(&row[5]),
+            boost: dv_i32(&row[6]),
+            category: dv_str(&row[7]),
+            server_type: dv_str(&row[8]),
+            server_command: dv_str(&row[9]),
+            server_args: serde_json::from_str(&dv_str(&row[10])).unwrap_or_default(),
+            language_ids: serde_json::from_str(&dv_str(&row[11])).unwrap_or_default(),
+            negative_keywords: serde_json::from_str(&dv_str(&row[12])).unwrap_or_default(),
+            patterns: serde_json::from_str(&dv_str(&row[13])).unwrap_or_default(),
+            directories: serde_json::from_str(&dv_str(&row[14])).unwrap_or_default(),
+            path_patterns: serde_json::from_str(&dv_str(&row[15])).unwrap_or_default(),
+            use_cases: serde_json::from_str(&dv_str(&row[16])).unwrap_or_default(),
+            co_usage: serde_json::from_str(&dv_str(&row[17])).unwrap_or_default(),
+            alternatives: serde_json::from_str(&dv_str(&row[18])).unwrap_or_default(),
+            domain_gates: serde_json::from_str(&dv_str(&row[19])).unwrap_or_default(),
+            file_types: serde_json::from_str(&dv_str(&row[20])).unwrap_or_default(),
+            keywords: serde_json::from_str(&dv_str(&row[21])).unwrap_or_default(),
+            intents: serde_json::from_str(&dv_str(&row[22])).unwrap_or_default(),
+            tools: serde_json::from_str(&dv_str(&row[23])).unwrap_or_default(),
+            services: serde_json::from_str(&dv_str(&row[24])).unwrap_or_default(),
+            frameworks: serde_json::from_str(&dv_str(&row[25])).unwrap_or_default(),
+            languages: serde_json::from_str(&dv_str(&row[26])).unwrap_or_default(),
+            platforms: serde_json::from_str(&dv_str(&row[27])).unwrap_or_default(),
+            domains: serde_json::from_str(&dv_str(&row[28])).unwrap_or_default(),
+        };
+        skills.insert(entry_id, entry);
+    }
+
+    let skills_count = skills.len();
+    info!("Pre-filtered to {} candidates from kw_lookup", skills_count);
+
+    let mut index = SkillIndex {
+        version: String::new(),
+        generated: String::new(),
+        method: "cozodb-prefiltered".to_string(),
         skills_count,
         skills,
         name_to_ids: HashMap::new(),
@@ -15422,15 +15678,29 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
         }
     });
 
-    // Load skill index: try CozoDB first, then JSON file fallback
+    // Extract prompt words early for CozoDB pre-filtering.
+    // Apply typo correction + synonym expansion so pre-filter catches the same terms as scoring.
+    let corrected_for_filter = correct_typos(&input.prompt);
+    let expanded_for_filter = expand_synonyms(&corrected_for_filter);
+    let filter_words: Vec<String> = expanded_for_filter
+        .split_whitespace()
+        .filter(|w| w.len() >= 2)
+        .take(50) // cap to prevent huge CozoDB queries
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect::<HashSet<_>>() // deduplicate
+        .into_iter()
+        .collect();
+
+    // Load skill index: CozoDB pre-filtered (fast) → CozoDB full → JSON fallback
     let mut index = if let Some(ref db) = db {
-        match load_index_from_db(db) {
+        match load_candidates_from_db(db, &filter_words) {
             Ok(idx) => {
-                info!("Loaded {} skills from CozoDB", idx.skills.len());
+                info!("Loaded {} candidates from CozoDB (pre-filtered)", idx.skills.len());
                 idx
             }
             Err(e) => {
-                warn!("CozoDB index load failed: {}, falling back to JSON", e);
+                warn!("CozoDB candidate load failed: {}, falling back to JSON", e);
                 let index_path = get_index_path(cli.index.as_deref())?;
                 match load_index(&index_path) {
                     Ok(idx) => idx,

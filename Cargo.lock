@@ -1797,8 +1797,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "perfect-skill-suggester"
-version = "2.9.29"
+version = "2.9.30"
 dependencies = [
+ "bincode",
  "chrono",
  "clap",
  "colored",
