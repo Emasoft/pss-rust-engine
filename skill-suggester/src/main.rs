@@ -628,9 +628,9 @@ pub struct PssMetadata {
 // Input Types (from Claude Code hook)
 // ============================================================================
 
-/// Input payload from Claude Code UserPromptSubmit hook
+/// Input payload from Claude Code UserPromptSubmit hook.
+/// Field names match CC's snake_case hook input schema (hooks.md "Common input fields").
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct HookInput {
     /// The user's prompt text
     pub prompt: String,
@@ -2852,6 +2852,13 @@ pub struct SkillEntry {
     /// Special keyword "generic" means the gate passes whenever the domain is detected.
     #[serde(default)]
     pub domain_gates: HashMap<String, Vec<String>>,
+
+    /// Path-scoped activation globs from rule frontmatter `paths:` field (CC rules spec).
+    /// Empty = no gate (rule always applies). Non-empty = rule only applies when the
+    /// project contains at least one file matching the listed globs.
+    /// Currently populated only for rule-type entries during Pass 1 enrichment.
+    #[serde(default)]
+    pub path_gates: Vec<String>,
 
     // MCP server additional metadata (only for type=mcp entries)
 
@@ -6459,6 +6466,43 @@ fn detect_domains_from_prompt_with_context(
     detected
 }
 
+/// Check whether a rule's `paths:` activation globs align with the current project.
+///
+/// Logic:
+/// - Empty `path_gates` → always pass (rule has no path scope).
+/// - For each glob, extract the trailing file extension (e.g. `**/*.py` → `py`).
+/// - If at least one extracted extension matches a project file type → pass.
+/// - If no glob had an extractable extension (e.g. `src/**`, `Dockerfile*`) → pass
+///   permissively (we can't evaluate cwd-based globs with the current inputs).
+/// - Otherwise → fail (rule excluded from suggestions).
+///
+/// This is the minimum-viable filter for rule scoping: exact glob matching against
+/// cwd paths would require a glob crate and is left as future work.
+fn check_path_gates(path_gates: &[String], file_types: &[String]) -> bool {
+    if path_gates.is_empty() {
+        return true;
+    }
+    let ft_set: std::collections::HashSet<String> =
+        file_types.iter().map(|s| s.to_lowercase()).collect();
+    let mut has_extractable_ext = false;
+    for glob in path_gates {
+        if let Some(dot) = glob.rfind('.') {
+            let ext = glob[dot + 1..]
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_lowercase();
+            if !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+                has_extractable_ext = true;
+                if ft_set.contains(&ext) {
+                    return true;
+                }
+            }
+        }
+    }
+    // If no gate was extension-parseable, pass permissively — the glob is
+    // path-based (e.g. `src/**`) and we don't do full cwd globbing yet.
+    !has_extractable_ext
+}
+
 /// Check whether a single skill passes ALL its domain gates.
 ///
 /// Gate logic:
@@ -7474,6 +7518,19 @@ fn find_matches(
                 if t_l.contains(' ') { original_lower.contains(&t_l) }
                 else { orig_words.iter().any(|w| *w == t_l.as_str()) }
             });
+
+            // Rule path gates — only applies to rule-type entries with a non-empty
+            // `paths:` frontmatter field. Filter rules whose path-scope does not
+            // align with the current project's detected file types.
+            if entry.skill_type == "rule"
+                && !check_path_gates(&entry.path_gates, &context.file_types)
+            {
+                debug!(
+                    "Rule '{}': EXCLUDED by path_gates (no matching file types in project)",
+                    name
+                );
+                return None;
+            }
 
             if !has_explicit_tech_match {
                 // Use expanded prompt for gate checking (W5 fix) — synonym
@@ -8964,6 +9021,7 @@ fn load_pss_file(pss_path: &PathBuf, index: &mut SkillIndex) -> Result<(), io::E
             file_types: vec![],
             // Domain gates (empty for PSS files - populated by reindex)
             domain_gates: HashMap::new(),
+            path_gates: Vec::new(),
             // MCP server metadata (empty for PSS files - populated by reindex)
             server_type: String::new(),
             server_command: String::new(),
@@ -9302,6 +9360,39 @@ fn parse_frontmatter(content: &str) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Extract `paths:` YAML list from frontmatter (used by rule-type entries).
+/// Returns empty Vec if the field is absent or malformed.
+/// Handles both inline `paths: [a, b]` and block `- a\n- b` forms.
+/// Quotes around entries are stripped.
+fn extract_rule_paths(frontmatter: &HashMap<String, String>) -> Vec<String> {
+    let raw = match frontmatter.get("paths") {
+        Some(v) if !v.is_empty() => v,
+        _ => return Vec::new(),
+    };
+    let trimmed = raw.trim();
+    // Inline form: "[*.py, src/**]"
+    if trimmed.starts_with('[') {
+        return trimmed
+            .trim_matches(|c: char| c == '[' || c == ']')
+            .split(',')
+            .map(|s| s.trim().trim_matches(|c: char| c == '"' || c == '\'').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    // Block form: "- *.py\n- src/**" (parse_frontmatter preserves list items with the dash prefix)
+    trimmed
+        .lines()
+        .map(|l| {
+            l.trim()
+                .trim_start_matches('-')
+                .trim()
+                .trim_matches(|c: char| c == '"' || c == '\'')
+                .to_string()
+        })
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// Extract the markdown body (everything after frontmatter).
@@ -12777,6 +12868,21 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
         // Infer domains from name + description using the shared synonym taxonomy
         let domains = infer_domains_from_text(&format!("{} {} {}", name, description, use_context));
 
+        // Extract rule path_gates from frontmatter `paths:` field (rules only).
+        // The caller passes the source file path — we re-read it and parse frontmatter
+        // to extract the `paths:` glob list. Negligible cost because rule count is small (<20).
+        let path_gates: Vec<String> = if elem_type == "rule" && !path.is_empty() {
+            fs::read_to_string(path)
+                .ok()
+                .map(|content| {
+                    let fm = parse_frontmatter(&content);
+                    extract_rule_paths(&fm)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // Build enriched output object
         let output = serde_json::json!({
             "name": name,
@@ -12804,6 +12910,7 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
             "use_cases": use_cases,
             "secondary_categories": [],
             "domain_gates": domain_gates,
+            "path_gates": path_gates,
         });
 
         // Write enriched JSONL line to stdout
@@ -13021,6 +13128,14 @@ fn run_index_file(path: &str) -> Result<(), SuggesterError> {
     // Infer domains from name + description using the shared synonym taxonomy
     let domains = infer_domains_from_text(&format!("{} {} {}", name, description, use_context));
 
+    // Extract rule path gates from frontmatter `paths:` field (rules only).
+    // Empty for non-rule entries; non-empty for rules that declare path-scoped activation.
+    let path_gates: Vec<String> = if elem_type == "rule" {
+        extract_rule_paths(&frontmatter)
+    } else {
+        Vec::new()
+    };
+
     // (j) Build enriched output JSON (same fields as run_pass1_batch)
     let output = serde_json::json!({
         "name": name,
@@ -13048,6 +13163,7 @@ fn run_index_file(path: &str) -> Result<(), SuggesterError> {
         "use_cases": use_cases,
         "secondary_categories": [],
         "domain_gates": domain_gates,
+        "path_gates": path_gates,
     });
 
     // (k) Print to stdout
@@ -13918,6 +14034,7 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
             languages: serde_json::from_str(&dv_str(&row[26])).unwrap_or_default(),
             platforms: serde_json::from_str(&dv_str(&row[27])).unwrap_or_default(),
             domains: serde_json::from_str(&dv_str(&row[28])).unwrap_or_default(),
+            path_gates: Vec::new(),
         };
         skills.insert(entry_id, entry);
     }
@@ -14050,6 +14167,7 @@ fn load_candidates_from_db(
             languages: serde_json::from_str(&dv_str(&row[26])).unwrap_or_default(),
             platforms: serde_json::from_str(&dv_str(&row[27])).unwrap_or_default(),
             domains: serde_json::from_str(&dv_str(&row[28])).unwrap_or_default(),
+            path_gates: Vec::new(),
         };
         skills.insert(entry_id, entry);
     }
@@ -16383,6 +16501,7 @@ mod tests {
             services: vec![],
             file_types: vec![],
             domain_gates: HashMap::new(),
+            path_gates: Vec::new(),
             co_usage: CoUsageData::default(),
             alternatives: vec![],
             use_cases: vec![],
@@ -16420,6 +16539,7 @@ mod tests {
             services: vec![],
             file_types: vec![],
             domain_gates: HashMap::new(),
+            path_gates: Vec::new(),
             co_usage: CoUsageData::default(),
             alternatives: vec![],
             use_cases: vec![],
@@ -16571,6 +16691,7 @@ mod tests {
             services: vec![],
             file_types: vec![],
             domain_gates: HashMap::new(),
+            path_gates: Vec::new(),
             co_usage: CoUsageData::default(),
             alternatives: vec![],
             use_cases: vec![],
@@ -16603,6 +16724,7 @@ mod tests {
             services: vec![],
             file_types: vec![],
             domain_gates: HashMap::new(),
+            path_gates: Vec::new(),
             co_usage: CoUsageData::default(),
             alternatives: vec![],
             use_cases: vec![],
@@ -16732,6 +16854,7 @@ mod tests {
             services: vec![],
             file_types: vec![],
             domain_gates: HashMap::new(),
+            path_gates: Vec::new(),
             co_usage: CoUsageData::default(),
             alternatives: vec![],
             use_cases: vec![],
@@ -17285,6 +17408,7 @@ mod tests {
                 g.insert("target_language".to_string(), vec!["python".to_string()]);
                 g
             },
+            path_gates: Vec::new(),
             co_usage: CoUsageData::default(),
             alternatives: vec![],
             use_cases: vec![],
@@ -17321,6 +17445,7 @@ mod tests {
                 g.insert("target_language".to_string(), vec!["rust".to_string()]);
                 g
             },
+            path_gates: Vec::new(),
             co_usage: CoUsageData::default(),
             alternatives: vec![],
             use_cases: vec![],
@@ -18168,6 +18293,7 @@ mediapipe>=0.10
             services: vec![],
             file_types: vec![],
             domain_gates: HashMap::new(),
+            path_gates: Vec::new(),
             co_usage: CoUsageData::default(),
             alternatives: vec![],
             use_cases: vec![],
@@ -18297,6 +18423,7 @@ mediapipe>=0.10
             services: vec![],
             file_types: vec![],
             domain_gates: HashMap::new(),
+            path_gates: Vec::new(),
             co_usage: CoUsageData::default(),
             alternatives: vec![],
             use_cases: vec![],
@@ -18366,6 +18493,7 @@ mediapipe>=0.10
                 services: vec![],
                 file_types: vec![],
                 domain_gates: HashMap::new(),
+            path_gates: Vec::new(),
                 co_usage: CoUsageData::default(),
                 alternatives: vec![],
                 use_cases: vec![],
@@ -18519,6 +18647,7 @@ mediapipe>=0.10
                 services: vec![],
                 file_types: vec![],
                 domain_gates: HashMap::new(),
+            path_gates: Vec::new(),
                 co_usage: CoUsageData::default(),
                 alternatives: vec![],
                 use_cases: vec![],
