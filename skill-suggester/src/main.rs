@@ -6,11 +6,16 @@
 //! - LimorAI: 70+ synonym expansion patterns, skills-first ordering
 //! - reliable: Weighted scoring, three-tier confidence routing, commitment mechanism
 //!
-//! # Input (via stdin)
-//! JSON with fields: prompt, cwd, sessionId, transcriptPath, permissionMode
+//! # Input (via stdin, from `pss_hook.py` calling `--format hook`)
+//! JSON with snake_case fields per CC hooks.md: `prompt`, `cwd`, `session_id`,
+//! `transcript_path`, `permission_mode`, plus PSS-internal `context_*` arrays.
+//! Field names are snake_case; do NOT re-add `#[serde(rename_all = "camelCase")]`
+//! to HookInput — CC sends snake_case in hook inputs but expects camelCase on
+//! hook OUTPUTS (HookOutput / HookSpecificOutput). This asymmetry is intentional.
 //!
 //! # Output (via stdout)
-//! JSON with additionalContext array containing matched skills with confidence levels
+//! JSON with `hookSpecificOutput.additionalContext` containing matched skills
+//! with confidence levels. Output uses camelCase per CC hook-reply schema.
 //!
 //! # Performance
 //! - ~5-15ms total execution time
@@ -630,6 +635,16 @@ pub struct PssMetadata {
 
 /// Input payload from Claude Code UserPromptSubmit hook.
 /// Field names match CC's snake_case hook input schema (hooks.md "Common input fields").
+///
+/// IMPORTANT: DO NOT add `#[serde(rename_all = "camelCase")]` to this struct.
+/// CC sends snake_case in hook INPUT (`transcript_path`, `session_id`,
+/// `permission_mode`) but expects camelCase in hook OUTPUT
+/// (`hookSpecificOutput`, `hookEventName`, `additionalContext`). This
+/// asymmetry is intentional and required by the CC hook protocol:
+///   - `HookInput` below: snake_case (default serde naming)
+///   - `HookOutput` at line ~2979: camelCase (via `rename_all`)
+///   - `HookSpecificOutput` at line ~2987: camelCase (via `rename_all`)
+/// A "consistency cleanup" that unified these would break the hook boundary.
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
     /// The user's prompt text
@@ -6466,24 +6481,96 @@ fn detect_domains_from_prompt_with_context(
     detected
 }
 
+/// Map a programming-language name to the file extensions it typically uses.
+///
+/// Used by `check_path_gates()` so a rule with `paths: ["**/*.py"]` matches a
+/// Python project even when `context.file_types` is empty. PSS's project scanner
+/// does NOT add source-language extensions to `file_types` — languages are
+/// detected via manifest files (`pyproject.toml`, `Cargo.toml`, `package.json`),
+/// so the project ends up with `languages: ["python"]` but `file_types: []`.
+/// Without this mapping, path gates would silently exclude rules from their
+/// intended target projects.
+fn language_to_extensions(language: &str) -> &'static [&'static str] {
+    match language.to_lowercase().as_str() {
+        "python" => &["py", "pyi", "pyx", "pyw", "ipynb"],
+        "rust" => &["rs"],
+        "javascript" | "js" => &["js", "mjs", "cjs", "jsx"],
+        "typescript" | "ts" => &["ts", "tsx", "mts", "cts"],
+        "go" | "golang" => &["go"],
+        "java" => &["java"],
+        "kotlin" => &["kt", "kts"],
+        "swift" => &["swift"],
+        "objective-c" | "objc" => &["m", "mm"],
+        "c" => &["c", "h"],
+        "cpp" | "c++" => &["cpp", "cc", "cxx", "hpp", "hxx", "h"],
+        "csharp" | "c#" | "cs" => &["cs"],
+        "ruby" => &["rb", "erb"],
+        "php" => &["php", "phtml"],
+        "scala" => &["scala", "sc"],
+        "elixir" => &["ex", "exs"],
+        "erlang" => &["erl", "hrl"],
+        "haskell" => &["hs", "lhs"],
+        "ocaml" => &["ml", "mli"],
+        "fsharp" | "f#" => &["fs", "fsi", "fsx"],
+        "lua" => &["lua"],
+        "perl" => &["pl", "pm", "t"],
+        "r" => &["r", "rmd"],
+        "julia" => &["jl"],
+        "dart" => &["dart"],
+        "clojure" => &["clj", "cljs", "cljc", "edn"],
+        "shell" | "bash" | "sh" => &["sh", "bash", "zsh", "fish"],
+        "powershell" => &["ps1", "psm1", "psd1"],
+        "zig" => &["zig"],
+        "nim" => &["nim", "nims"],
+        "crystal" => &["cr"],
+        "solidity" => &["sol"],
+        "vyper" => &["vy"],
+        "html" => &["html", "htm"],
+        "css" => &["css"],
+        "scss" | "sass" => &["scss", "sass"],
+        "less" => &["less"],
+        "svelte" => &["svelte"],
+        "vue" => &["vue"],
+        "astro" => &["astro"],
+        "sql" => &["sql"],
+        _ => &[],
+    }
+}
+
 /// Check whether a rule's `paths:` activation globs align with the current project.
 ///
-/// Logic:
-/// - Empty `path_gates` → always pass (rule has no path scope).
-/// - For each glob, extract the trailing file extension (e.g. `**/*.py` → `py`).
-/// - If at least one extracted extension matches a project file type → pass.
-/// - If no glob had an extractable extension (e.g. `src/**`, `Dockerfile*`) → pass
-///   permissively (we can't evaluate cwd-based globs with the current inputs).
-/// - Otherwise → fail (rule excluded from suggestions).
+/// Returns `true` when the rule should be considered (pass), `false` when it
+/// should be excluded. Semantics:
+/// - **Empty `path_gates`**: always passes (rule has no path scope).
+/// - **Extension-based globs** (e.g. `**/*.py`, `*.rs`): extract the trailing
+///   extension and check whether the project's `file_types` OR the extensions
+///   derived from the project's `languages` (via [`language_to_extensions`])
+///   contain it. This fixes the common case where PSS detects a Python project
+///   via `pyproject.toml` but doesn't add `py` to `file_types`.
+/// - **Non-extension globs** (e.g. `src/**`, `Dockerfile*`): permissively pass,
+///   because PSS currently doesn't do full cwd glob walking.
 ///
-/// This is the minimum-viable filter for rule scoping: exact glob matching against
-/// cwd paths would require a glob crate and is left as future work.
-fn check_path_gates(path_gates: &[String], file_types: &[String]) -> bool {
+/// Matching is case-insensitive. Exact glob matching against cwd paths would
+/// require a glob crate and is left as future work.
+fn check_path_gates(
+    path_gates: &[String],
+    file_types: &[String],
+    languages: &[String],
+) -> bool {
     if path_gates.is_empty() {
         return true;
     }
-    let ft_set: std::collections::HashSet<String> =
-        file_types.iter().map(|s| s.to_lowercase()).collect();
+    // Build the project's effective extension set: raw file_types plus all
+    // extensions inferred from the project's detected languages.
+    let mut ext_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ft in file_types {
+        ext_set.insert(ft.to_lowercase());
+    }
+    for lang in languages {
+        for ext in language_to_extensions(lang) {
+            ext_set.insert((*ext).to_string());
+        }
+    }
     let mut has_extractable_ext = false;
     for glob in path_gates {
         if let Some(dot) = glob.rfind('.') {
@@ -6492,7 +6579,7 @@ fn check_path_gates(path_gates: &[String], file_types: &[String]) -> bool {
                 .to_lowercase();
             if !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
                 has_extractable_ext = true;
-                if ft_set.contains(&ext) {
+                if ext_set.contains(&ext) {
                     return true;
                 }
             }
@@ -7487,6 +7574,26 @@ fn find_matches(
             }
         }
 
+        // Rule path gates — orthogonal to domain gates, must run unconditionally.
+        // A rule with frontmatter `paths:` activation globs (e.g. `["**/*.py"]`) should
+        // only be suggested when the current project contains files matching at least one
+        // glob's extension. This check is independent of PSS domain gates and must NOT be
+        // nested under `if let Some(reg) = registry` — registry-less runs still need
+        // path_gate enforcement.
+        if entry.skill_type == "rule"
+            && !check_path_gates(
+                &entry.path_gates,
+                &context.file_types,
+                &context.languages,
+            )
+        {
+            debug!(
+                "Rule '{}': EXCLUDED by path_gates (no matching file types or languages in project)",
+                name
+            );
+            return None;
+        }
+
         // Domain gate hard pre-filter: ALL gates must pass or skill is skipped entirely.
         // This runs before scoring because failing a gate is a hard disqualification.
         if let Some(reg) = registry {
@@ -7518,19 +7625,6 @@ fn find_matches(
                 if t_l.contains(' ') { original_lower.contains(&t_l) }
                 else { orig_words.iter().any(|w| *w == t_l.as_str()) }
             });
-
-            // Rule path gates — only applies to rule-type entries with a non-empty
-            // `paths:` frontmatter field. Filter rules whose path-scope does not
-            // align with the current project's detected file types.
-            if entry.skill_type == "rule"
-                && !check_path_gates(&entry.path_gates, &context.file_types)
-            {
-                debug!(
-                    "Rule '{}': EXCLUDED by path_gates (no matching file types in project)",
-                    name
-                );
-                return None;
-            }
 
             if !has_explicit_tech_match {
                 // Use expanded prompt for gate checking (W5 fix) — synonym
@@ -13301,7 +13395,8 @@ fn create_db_schema(db: &DbInstance) -> Result<(), SuggesterError> {
             frameworks_json: String,
             languages_json: String,
             platforms_json: String,
-            domains_json: String
+            domains_json: String,
+            path_gates_json: String
         }}
         "#,
         Default::default(),
@@ -13490,23 +13585,25 @@ fn insert_skills_batch(
                 serde_json::to_string(&entry.platforms).unwrap_or_default().into()));
             params.insert("domains_json".into(), DataValue::Str(
                 serde_json::to_string(&entry.domains).unwrap_or_default().into()));
+            params.insert("path_gates_json".into(), DataValue::Str(
+                serde_json::to_string(&entry.path_gates).unwrap_or_default().into()));
 
             db.run_script(
                 "?[name, id, path, skill_type, source, description, tier, boost, category, \
                  server_type, server_command, server_args_json, language_ids_json, \
                  negative_kw_json, patterns_json, directories_json, path_patterns_json, \
                  use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-                 keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json] <- \
+                 keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json] <- \
                  [[$name, $id, $path, $skill_type, $source, $description, $tier, $boost, $category, \
                    $server_type, $server_command, $server_args_json, $language_ids_json, \
                    $negative_kw_json, $patterns_json, $directories_json, $path_patterns_json, \
                    $use_cases_json, $co_usage_json, $alternatives_json, $domain_gates_json, $file_types_json, \
-                   $keywords_json, $intents_json, $tools_json, $services_json, $frameworks_json, $languages_json, $platforms_json, $domains_json]] \
+                   $keywords_json, $intents_json, $tools_json, $services_json, $frameworks_json, $languages_json, $platforms_json, $domains_json, $path_gates_json]] \
                  :put skills { name, source => id, path, skill_type, description, tier, boost, category, \
                               server_type, server_command, server_args_json, language_ids_json, \
                               negative_kw_json, patterns_json, directories_json, path_patterns_json, \
                               use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-                              keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json }",
+                              keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json }",
                 params,
                 ScriptMutability::Mutable,
             ).map_err(|e| SuggesterError::IndexParse(
@@ -13972,12 +14069,12 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
          server_type, server_command, server_args_json, language_ids_json, \
          negative_kw_json, patterns_json, directories_json, path_patterns_json, \
          use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-         keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json] := \
+         keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json] := \
          *skills{ name, path, skill_type, source, description, tier, boost, category, \
                   server_type, server_command, server_args_json, language_ids_json, \
                   negative_kw_json, patterns_json, directories_json, path_patterns_json, \
                   use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-                  keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json }",
+                  keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json }",
         Default::default(),
         ScriptMutability::Immutable,
     ).map_err(|e| SuggesterError::IndexParse(format!("Load all skills from DB failed: {}", e)))?;
@@ -13999,7 +14096,7 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
 
     let mut skills: HashMap<String, SkillEntry> = HashMap::new();
     for row in &main_result.rows {
-        if row.len() < 29 { continue; }
+        if row.len() < 30 { continue; }
         let name = dv_str(&row[0]);
         let source = dv_str(&row[3]);
         // Use entry ID as HashMap key (collision-safe: same name + different source = different ID)
@@ -14034,7 +14131,7 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
             languages: serde_json::from_str(&dv_str(&row[26])).unwrap_or_default(),
             platforms: serde_json::from_str(&dv_str(&row[27])).unwrap_or_default(),
             domains: serde_json::from_str(&dv_str(&row[28])).unwrap_or_default(),
-            path_gates: Vec::new(),
+            path_gates: serde_json::from_str(&dv_str(&row[29])).unwrap_or_default(),
         };
         skills.insert(entry_id, entry);
     }
@@ -14094,12 +14191,12 @@ fn load_candidates_from_db(
           server_type, server_command, server_args_json, language_ids_json, \
           negative_kw_json, patterns_json, directories_json, path_patterns_json, \
           use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-          keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json] := \
+          keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json] := \
           candidates[name], *skills{{ name, source, path, skill_type, description, tier, boost, category, \
                    server_type, server_command, server_args_json, language_ids_json, \
                    negative_kw_json, patterns_json, directories_json, path_patterns_json, \
                    use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-                   keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json }}",
+                   keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json }}",
         words_data
     );
 
@@ -14133,7 +14230,7 @@ fn load_candidates_from_db(
 
     let mut skills: HashMap<String, SkillEntry> = HashMap::new();
     for row in &main_result.rows {
-        if row.len() < 29 { continue; }
+        if row.len() < 30 { continue; }
         let name = dv_str(&row[0]);
         let source = dv_str(&row[3]);
         let entry_id = make_entry_id(&name, &source);
@@ -14167,7 +14264,7 @@ fn load_candidates_from_db(
             languages: serde_json::from_str(&dv_str(&row[26])).unwrap_or_default(),
             platforms: serde_json::from_str(&dv_str(&row[27])).unwrap_or_default(),
             domains: serde_json::from_str(&dv_str(&row[28])).unwrap_or_default(),
-            path_gates: Vec::new(),
+            path_gates: serde_json::from_str(&dv_str(&row[29])).unwrap_or_default(),
         };
         skills.insert(entry_id, entry);
     }
@@ -14739,12 +14836,12 @@ fn cmd_inspect(db: &DbInstance, name_or_id: &str, format: &str) -> Result<(), Su
          server_type, server_command, server_args_json, language_ids_json, \
          negative_kw_json, patterns_json, directories_json, path_patterns_json, \
          use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-         keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json] := \
+         keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json] := \
          *skills{ name, id, path, skill_type, source, description, tier, boost, category, \
                   server_type, server_command, server_args_json, language_ids_json, \
                   negative_kw_json, patterns_json, directories_json, path_patterns_json, \
                   use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-                  keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json }, name = $name",
+                  keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json }, name = $name",
         params,
         ScriptMutability::Immutable,
     ).map_err(|e| SuggesterError::IndexParse(format!("inspect query failed: {}", e)))?;
