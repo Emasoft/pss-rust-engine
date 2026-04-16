@@ -340,6 +340,23 @@ enum Commands {
         #[arg(long, default_value = "json")]
         format: String,
     },
+
+    /// Export a JSON snapshot of the CozoDB for debugging / git diff workflows.
+    /// As of v2.11.0 (Phase B), the runtime hook no longer reads JSON — this
+    /// subcommand exists purely so power users can still `git diff` the
+    /// index. The export is written atomically to --path (default:
+    /// $CLAUDE_PLUGIN_DATA/skill-index.export.json).
+    Export {
+        /// Export format. Only "json" is supported today.
+        #[arg(long = "json", default_value_t = true)]
+        json: bool,
+
+        /// Destination path for the JSON export. Default is
+        /// $CLAUDE_PLUGIN_DATA/skill-index.export.json (or
+        /// ~/.claude/cache/skill-index.export.json if env var is unset).
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+    },
 }
 
 // ============================================================================
@@ -13777,13 +13794,84 @@ fn insert_skills_batch(
 }
 
 /// Build CozoDB from JSON index: pss --build-db --index path/to/skill-index.json
+///
+/// DEPRECATED in Phase B (v2.11.0): the Python merge writer
+/// (`scripts/pss_merge_queue.py`) now populates CozoDB directly during each
+/// merge, so this subcommand is redundant on modern installs. The function
+/// detects a populated CozoDB from the current run (the metadata generator
+/// field set to "python-merge-queue") and short-circuits with a deprecation
+/// notice. On legacy JSON-only installs (no CozoDB yet), it still falls
+/// through to the full rebuild path. Phase C removes this function entirely.
 fn run_build_db(cli: &Cli) -> Result<(), SuggesterError> {
-    let json_path = get_index_path(cli.index.as_deref())?;
-    // Place DB in the same directory as the JSON index, using DB_FILE name
-    let db_path = json_path.parent()
-        .map(|p| p.join(DB_FILE))
+    // Phase B: the Python merge writer now populates CozoDB directly. We must
+    // check the CozoDB FIRST — before attempting to load the JSON — so that
+    // the short-circuit works even when callers run `pss --build-db` without
+    // a --index flag pointing at a non-existent JSON (e.g. the reindex
+    // orchestrator that already deleted the staging JSON after merging).
+    // Derive the DB path by probing the candidate locations for the JSON.
+    let db_path = get_db_path(cli.index.as_deref())
+        .or_else(|| {
+            // Fall back to the default location if get_db_path returned None
+            // (its "exists" check returns None when the DB is absent, but we
+            // want the path regardless so we can decide whether to build).
+            let home = dirs::home_dir()?;
+            Some(home.join(".claude").join(CACHE_DIR).join(DB_FILE))
+        })
         .unwrap_or_else(|| PathBuf::from(DB_FILE));
 
+    // Phase B short-circuit: check if the CozoDB was just populated by the
+    // Python merge writer. That writer stamps pss_metadata.generator with
+    // the value "python-merge-queue"; if we see that and the row count is
+    // healthy, there is nothing for us to do — the Rust build-db call has
+    // been superseded. Do NOT read/load the JSON in this branch; JSON is a
+    // derived export now, not canonical.
+    if db_path.exists() {
+        if let Ok(prior_db) = open_db(&db_path) {
+            let gen_is_python = prior_db
+                .run_script(
+                    "?[value] := *pss_metadata{ key: 'generator', value }",
+                    Default::default(),
+                    ScriptMutability::Immutable,
+                )
+                .ok()
+                .and_then(|r| r.rows.first().cloned())
+                .and_then(|row| row.first().cloned())
+                .map(|v| matches!(v, DataValue::Str(ref s) if s.as_str() == "python-merge-queue"))
+                .unwrap_or(false);
+            if gen_is_python {
+                let row_count = prior_db
+                    .run_script(
+                        "?[count(name)] := *skills{ name }",
+                        Default::default(),
+                        ScriptMutability::Immutable,
+                    )
+                    .ok()
+                    .and_then(|r| r.rows.first().cloned())
+                    .and_then(|row| row.first().cloned())
+                    .and_then(|v| match v {
+                        DataValue::Num(cozo::Num::Int(n)) => Some(n),
+                        DataValue::Num(cozo::Num::Float(f)) => Some(f as i64),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                if row_count > 0 {
+                    eprintln!(
+                        "CozoDB already built by Python merge (Phase B); \
+                         skipping redundant rebuild. {} rows at {:?}",
+                        row_count, db_path
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Legacy path: CozoDB was not populated by Python (or was populated by
+    // an older Rust-only build). Fall back to reading JSON and building from
+    // there. This path is only hit on first-install migration from a
+    // Phase-A or earlier layout — once Python writes CozoDB with the
+    // python-merge-queue generator, the short-circuit above takes over.
+    let json_path = get_index_path(cli.index.as_deref())?;
     eprintln!("Loading JSON index from {:?}...", json_path);
     let mut index = load_index(&json_path)?;
     eprintln!("Loaded {} skills from JSON index", index.skills.len());
@@ -14486,7 +14574,121 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             cmd_index_rules(&db, project_root.as_deref(), format),
         Commands::ListRules { scope, format } =>
             cmd_list_rules(&db, scope.as_deref(), format),
+        Commands::Export { json, path } =>
+            cmd_export(&db, *json, path.as_deref()),
     }
+}
+
+/// Export the CozoDB to a JSON snapshot for debugging / git diff workflows.
+///
+/// Phase B (v2.11.0) deliverable. Reads the CozoDB via load_index_from_db,
+/// serialises the SkillIndex to JSON, and atomic-writes it to the requested
+/// path. The default path deliberately differs from skill-index.json — the
+/// legacy file stays where it is until Phase C, and this export is a
+/// separate file so power users can diff the two.
+fn cmd_export(db: &DbInstance, json: bool, path: Option<&str>) -> Result<(), SuggesterError> {
+    if !json {
+        return Err(SuggesterError::IndexParse(
+            "Only --json export format is supported today".to_string(),
+        ));
+    }
+
+    let dest = match path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            // Default: $CLAUDE_PLUGIN_DATA/skill-index.export.json if the
+            // env var is set and PSS-scoped, else ~/.claude/cache/.
+            let data_dir = std::env::var("CLAUDE_PLUGIN_DATA")
+                .ok()
+                .map(PathBuf::from)
+                .filter(|p| {
+                    p.is_absolute()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.to_ascii_lowercase().contains("perfect-skill-suggester"))
+                            .unwrap_or(false)
+                })
+                .or_else(|| {
+                    dirs::home_dir().map(|h| h.join(".claude").join(CACHE_DIR))
+                })
+                .ok_or_else(|| SuggesterError::IndexParse(
+                    "Could not resolve default export path".to_string()
+                ))?;
+            data_dir.join("skill-index.export.json")
+        }
+    };
+
+    eprintln!("Exporting CozoDB → JSON at {:?}", dest);
+    let index = load_index_from_db(db)?;
+
+    // Serialise. Entries are keyed by entry ID in the in-memory SkillIndex,
+    // but humans expect the composite `source::name` key they saw in the
+    // legacy JSON. Re-key for output so git diff against the legacy file
+    // stays meaningful.
+    let mut rekeyed: std::collections::BTreeMap<String, &SkillEntry> =
+        std::collections::BTreeMap::new();
+    for entry in index.skills.values() {
+        let k = format!("{}::{}", entry.source, entry.name);
+        rekeyed.insert(k, entry);
+    }
+
+    // Wrap into the top-level envelope that matches skill-index.json format.
+    #[derive(Serialize)]
+    struct ExportEnvelope<'a> {
+        version: &'a str,
+        generated: String,
+        generator: &'a str,
+        skill_count: usize,
+        skills: &'a std::collections::BTreeMap<String, &'a SkillEntry>,
+    }
+
+    let envelope = ExportEnvelope {
+        version: &index.version,
+        generated: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        generator: "pss-export-json",
+        skill_count: rekeyed.len(),
+        skills: &rekeyed,
+    };
+
+    // Ensure parent dir exists before writing.
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| SuggesterError::IndexRead {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+
+    // Atomic write via temp file + rename (same pattern as pss_merge_queue).
+    let tmp_path = {
+        let mut t = dest.clone();
+        let fn_str = dest.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("skill-index.export.json");
+        t.set_file_name(format!(".{}.tmp", fn_str));
+        t
+    };
+    let tmp_str = tmp_path.to_str().unwrap_or_default().to_string();
+    {
+        let file = fs::File::create(&tmp_path).map_err(|e| SuggesterError::IndexRead {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+        serde_json::to_writer_pretty(file, &envelope).map_err(|e| {
+            SuggesterError::IndexParse(format!("JSON serialisation failed: {}", e))
+        })?;
+    }
+    fs::rename(&tmp_path, &dest).map_err(|e| SuggesterError::IndexRead {
+        path: dest.clone(),
+        source: e,
+    })?;
+
+    eprintln!(
+        "Exported {} entries to {} (atomic write via {})",
+        rekeyed.len(),
+        dest.display(),
+        tmp_str
+    );
+    Ok(())
 }
 
 /// Helper: extract string from DataValue.
