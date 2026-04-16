@@ -2908,6 +2908,19 @@ pub struct SkillEntry {
     /// Use cases describing when this skill should be activated
     #[serde(default)]
     pub use_cases: Vec<String>,
+
+    /// ISO 8601 (RFC 3339) UTC timestamp of when this element FIRST appeared
+    /// in the PSS index. Preserved across reindexes — only set on the very
+    /// first insert and never updated thereafter. Empty string until first
+    /// population. Powers the "installed since / between" query helpers.
+    #[serde(default)]
+    pub first_indexed_at: String,
+
+    /// ISO 8601 (RFC 3339) UTC timestamp of the most recent write to this
+    /// row. Updated on every reindex even when the content is unchanged.
+    /// Useful for detecting which rows were re-enriched in the last run.
+    #[serde(default)]
+    pub last_updated_at: String,
 }
 
 // ============================================================================
@@ -9126,6 +9139,8 @@ fn load_pss_file(pss_path: &PathBuf, index: &mut SkillIndex) -> Result<(), io::E
             co_usage: CoUsageData::default(),
             alternatives: vec![],
             use_cases: vec![],
+            first_indexed_at: String::new(),
+            last_updated_at: String::new(),
         };
 
         info!("Added skill '{}' from PSS file: {:?}", skill_name, pss_path);
@@ -13396,7 +13411,9 @@ fn create_db_schema(db: &DbInstance) -> Result<(), SuggesterError> {
             languages_json: String,
             platforms_json: String,
             domains_json: String,
-            path_gates_json: String
+            path_gates_json: String,
+            first_indexed_at: String,
+            last_updated_at: String
         }}
         "#,
         Default::default(),
@@ -13588,22 +13605,42 @@ fn insert_skills_batch(
             params.insert("path_gates_json".into(), DataValue::Str(
                 serde_json::to_string(&entry.path_gates).unwrap_or_default().into()));
 
+            // Timestamps: preserve first_indexed_at across rebuilds (set to "now"
+            // only on the very first insert); refresh last_updated_at on every
+            // write. run_build_db snapshots old timestamps before wipe and passes
+            // them through on the entry — so a non-empty first_indexed_at here
+            // means "this element was already in the prior DB" and we preserve it.
+            let now_rfc3339 = chrono::Utc::now().to_rfc3339_opts(
+                chrono::SecondsFormat::Secs, true);
+            let first_indexed_at = if entry.first_indexed_at.is_empty() {
+                now_rfc3339.clone()
+            } else {
+                entry.first_indexed_at.clone()
+            };
+            params.insert("first_indexed_at".into(),
+                DataValue::Str(first_indexed_at.into()));
+            params.insert("last_updated_at".into(),
+                DataValue::Str(now_rfc3339.into()));
+
             db.run_script(
                 "?[name, id, path, skill_type, source, description, tier, boost, category, \
                  server_type, server_command, server_args_json, language_ids_json, \
                  negative_kw_json, patterns_json, directories_json, path_patterns_json, \
                  use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-                 keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json] <- \
+                 keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json, \
+                 first_indexed_at, last_updated_at] <- \
                  [[$name, $id, $path, $skill_type, $source, $description, $tier, $boost, $category, \
                    $server_type, $server_command, $server_args_json, $language_ids_json, \
                    $negative_kw_json, $patterns_json, $directories_json, $path_patterns_json, \
                    $use_cases_json, $co_usage_json, $alternatives_json, $domain_gates_json, $file_types_json, \
-                   $keywords_json, $intents_json, $tools_json, $services_json, $frameworks_json, $languages_json, $platforms_json, $domains_json, $path_gates_json]] \
+                   $keywords_json, $intents_json, $tools_json, $services_json, $frameworks_json, $languages_json, $platforms_json, $domains_json, $path_gates_json, \
+                   $first_indexed_at, $last_updated_at]] \
                  :put skills { name, source => id, path, skill_type, description, tier, boost, category, \
                               server_type, server_command, server_args_json, language_ids_json, \
                               negative_kw_json, patterns_json, directories_json, path_patterns_json, \
                               use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-                              keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json }",
+                              keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json, \
+                              first_indexed_at, last_updated_at }",
                 params,
                 ScriptMutability::Mutable,
             ).map_err(|e| SuggesterError::IndexParse(
@@ -13748,8 +13785,65 @@ fn run_build_db(cli: &Cli) -> Result<(), SuggesterError> {
         .unwrap_or_else(|| PathBuf::from(DB_FILE));
 
     eprintln!("Loading JSON index from {:?}...", json_path);
-    let index = load_index(&json_path)?;
+    let mut index = load_index(&json_path)?;
     eprintln!("Loaded {} skills from JSON index", index.skills.len());
+
+    // Snapshot existing first_indexed_at timestamps from the prior DB before
+    // wiping. This preserves the original "installation time" across reindexes
+    // — without it, every reindex would reset the timestamp to "now" and the
+    // `added_since` / `added_between` helpers would be useless. Keyed by
+    // (name, source) which matches the CozoDB primary key. Best-effort: if
+    // the prior DB is missing, corrupt, or has no timestamp columns yet
+    // (legacy pre-v2.10 layout), the map is empty and every row gets a fresh
+    // timestamp — which is correct migration behaviour for first install.
+    let prior_timestamps: HashMap<(String, String), String> = if db_path.exists() {
+        match open_db(&db_path) {
+            Ok(prior_db) => {
+                let q = "?[name, source, first_indexed_at] := \
+                         *skills{ name, source, first_indexed_at }";
+                match prior_db.run_script(q, Default::default(), ScriptMutability::Immutable) {
+                    Ok(result) => {
+                        let mut map = HashMap::new();
+                        for row in &result.rows {
+                            if row.len() >= 3 {
+                                let name = match &row[0] {
+                                    DataValue::Str(s) => s.to_string(),
+                                    _ => continue,
+                                };
+                                let source = match &row[1] {
+                                    DataValue::Str(s) => s.to_string(),
+                                    _ => continue,
+                                };
+                                let ts = match &row[2] {
+                                    DataValue::Str(s) => s.to_string(),
+                                    _ => continue,
+                                };
+                                if !ts.is_empty() {
+                                    map.insert((name, source), ts);
+                                }
+                            }
+                        }
+                        eprintln!("Preserved {} existing first_indexed_at \
+                                   timestamps from prior DB", map.len());
+                        map
+                    }
+                    Err(_) => HashMap::new(), // Legacy DB or query failed; start fresh
+                }
+            }
+            Err(_) => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
+
+    // Apply preserved timestamps to the in-memory index so insert_skills_batch
+    // (which reads entry.first_indexed_at) sees the prior value. Newly-
+    // discovered entries keep the empty string → will be stamped with "now".
+    for entry in index.skills.values_mut() {
+        if let Some(ts) = prior_timestamps.get(&(entry.name.clone(), entry.source.clone())) {
+            entry.first_indexed_at = ts.clone();
+        }
+    }
 
     // Remove existing DB file if present (fresh build)
     if db_path.exists() {
@@ -14069,12 +14163,14 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
          server_type, server_command, server_args_json, language_ids_json, \
          negative_kw_json, patterns_json, directories_json, path_patterns_json, \
          use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-         keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json] := \
+         keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json, \
+         first_indexed_at, last_updated_at] := \
          *skills{ name, path, skill_type, source, description, tier, boost, category, \
                   server_type, server_command, server_args_json, language_ids_json, \
                   negative_kw_json, patterns_json, directories_json, path_patterns_json, \
                   use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-                  keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json }",
+                  keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json, \
+                  first_indexed_at, last_updated_at }",
         Default::default(),
         ScriptMutability::Immutable,
     ).map_err(|e| SuggesterError::IndexParse(format!("Load all skills from DB failed: {}", e)))?;
@@ -14096,7 +14192,7 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
 
     let mut skills: HashMap<String, SkillEntry> = HashMap::new();
     for row in &main_result.rows {
-        if row.len() < 30 { continue; }
+        if row.len() < 32 { continue; }
         let name = dv_str(&row[0]);
         let source = dv_str(&row[3]);
         // Use entry ID as HashMap key (collision-safe: same name + different source = different ID)
@@ -14132,6 +14228,8 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
             platforms: serde_json::from_str(&dv_str(&row[27])).unwrap_or_default(),
             domains: serde_json::from_str(&dv_str(&row[28])).unwrap_or_default(),
             path_gates: serde_json::from_str(&dv_str(&row[29])).unwrap_or_default(),
+            first_indexed_at: dv_str(&row[30]),
+            last_updated_at: dv_str(&row[31]),
         };
         skills.insert(entry_id, entry);
     }
@@ -14191,12 +14289,14 @@ fn load_candidates_from_db(
           server_type, server_command, server_args_json, language_ids_json, \
           negative_kw_json, patterns_json, directories_json, path_patterns_json, \
           use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-          keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json] := \
+          keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json, \
+          first_indexed_at, last_updated_at] := \
           candidates[name], *skills{{ name, source, path, skill_type, description, tier, boost, category, \
                    server_type, server_command, server_args_json, language_ids_json, \
                    negative_kw_json, patterns_json, directories_json, path_patterns_json, \
                    use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-                   keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json }}",
+                   keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json, \
+                   first_indexed_at, last_updated_at }}",
         words_data
     );
 
@@ -14230,7 +14330,7 @@ fn load_candidates_from_db(
 
     let mut skills: HashMap<String, SkillEntry> = HashMap::new();
     for row in &main_result.rows {
-        if row.len() < 30 { continue; }
+        if row.len() < 32 { continue; }
         let name = dv_str(&row[0]);
         let source = dv_str(&row[3]);
         let entry_id = make_entry_id(&name, &source);
@@ -14265,6 +14365,8 @@ fn load_candidates_from_db(
             platforms: serde_json::from_str(&dv_str(&row[27])).unwrap_or_default(),
             domains: serde_json::from_str(&dv_str(&row[28])).unwrap_or_default(),
             path_gates: serde_json::from_str(&dv_str(&row[29])).unwrap_or_default(),
+            first_indexed_at: dv_str(&row[30]),
+            last_updated_at: dv_str(&row[31]),
         };
         skills.insert(entry_id, entry);
     }
@@ -14836,12 +14938,14 @@ fn cmd_inspect(db: &DbInstance, name_or_id: &str, format: &str) -> Result<(), Su
          server_type, server_command, server_args_json, language_ids_json, \
          negative_kw_json, patterns_json, directories_json, path_patterns_json, \
          use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-         keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json] := \
+         keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json, \
+         first_indexed_at, last_updated_at] := \
          *skills{ name, id, path, skill_type, source, description, tier, boost, category, \
                   server_type, server_command, server_args_json, language_ids_json, \
                   negative_kw_json, patterns_json, directories_json, path_patterns_json, \
                   use_cases_json, co_usage_json, alternatives_json, domain_gates_json, file_types_json, \
-                  keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json }, name = $name",
+                  keywords_json, intents_json, tools_json, services_json, frameworks_json, languages_json, platforms_json, domains_json, path_gates_json, \
+                  first_indexed_at, last_updated_at }, name = $name",
         params,
         ScriptMutability::Immutable,
     ).map_err(|e| SuggesterError::IndexParse(format!("inspect query failed: {}", e)))?;
@@ -16606,6 +16710,8 @@ mod tests {
             server_command: String::new(),
             server_args: vec![],
             language_ids: vec![],
+            first_indexed_at: String::new(),
+            last_updated_at: String::new(),
         });
 
         test_insert(&mut skills, SkillEntry {
@@ -16644,6 +16750,8 @@ mod tests {
             server_command: String::new(),
             server_args: vec![],
             language_ids: vec![],
+            first_indexed_at: String::new(),
+            last_updated_at: String::new(),
         });
 
         test_skill_index(skills)
@@ -16796,6 +16904,8 @@ mod tests {
             server_command: String::new(),
             server_args: vec![],
             language_ids: vec![],
+            first_indexed_at: String::new(),
+            last_updated_at: String::new(),
         });
 
         test_insert(&mut skills, SkillEntry {
@@ -16829,6 +16939,8 @@ mod tests {
             server_command: String::new(),
             server_args: vec![],
             language_ids: vec![],
+            first_indexed_at: String::new(),
+            last_updated_at: String::new(),
         });
 
         let index = test_skill_index(skills);
@@ -16959,6 +17071,8 @@ mod tests {
             server_command: String::new(),
             server_args: vec![],
             language_ids: vec![],
+            first_indexed_at: String::new(),
+            last_updated_at: String::new(),
         });
 
         let index = test_skill_index(skills);
@@ -17513,6 +17627,8 @@ mod tests {
             server_command: String::new(),
             server_args: vec![],
             language_ids: vec![],
+            first_indexed_at: String::new(),
+            last_updated_at: String::new(),
         });
 
         test_insert(&mut skills, SkillEntry {
@@ -17550,6 +17666,8 @@ mod tests {
             server_command: String::new(),
             server_args: vec![],
             language_ids: vec![],
+            first_indexed_at: String::new(),
+            last_updated_at: String::new(),
         });
 
         let index = test_skill_index(skills);
@@ -18398,6 +18516,8 @@ mediapipe>=0.10
             server_command: String::new(),
             server_args: vec![],
             language_ids: vec![],
+            first_indexed_at: String::new(),
+            last_updated_at: String::new(),
         });
 
         let index = test_skill_index(skills);
@@ -18528,6 +18648,8 @@ mediapipe>=0.10
             server_command: String::new(),
             server_args: vec![],
             language_ids: vec![],
+            first_indexed_at: String::new(),
+            last_updated_at: String::new(),
         });
 
         let index = test_skill_index(skills);
@@ -18598,6 +18720,8 @@ mediapipe>=0.10
                 server_command: String::new(),
                 server_args: vec![],
                 language_ids: vec![],
+                first_indexed_at: String::new(),
+                last_updated_at: String::new(),
             });
         }
 
@@ -18752,6 +18876,8 @@ mediapipe>=0.10
                 server_command: String::new(),
                 server_args: vec![],
                 language_ids: vec![],
+                first_indexed_at: String::new(),
+                last_updated_at: String::new(),
             });
         }
 
