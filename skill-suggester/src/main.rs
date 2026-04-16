@@ -101,12 +101,6 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     index_file: Option<String>,
 
-    /// Build CozoDB SQLite index from JSON index file.
-    /// Reads skill-index.json (from --index path) and writes skill-index.db alongside it.
-    /// The DB enables fast pre-filtered scoring (~35ms vs ~109ms for JSON full-scan).
-    #[arg(long, default_value_t = false)]
-    build_db: bool,
-
     /// Extract the previous user message from a JSONL transcript file.
     /// Uses mmap + backward scan — zero-copy, constant memory, ~3ms on 500MB files.
     /// Outputs the 2nd most recent user message text (skips current prompt).
@@ -356,6 +350,149 @@ enum Commands {
         /// ~/.claude/cache/skill-index.export.json if env var is unset).
         #[arg(long, value_name = "PATH")]
         path: Option<String>,
+    },
+
+    /// Print the total skill count from the CozoDB.
+    /// Default output is a single integer on stdout; `--json` yields `{"count": N}`.
+    /// Exits non-zero if the DB is missing or unreadable.
+    Count {
+        /// Output as JSON: {"count": N}.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Fetch a single entry by name. With --source, disambiguates when the
+    /// same name exists in multiple sources (e.g. user + plugin).
+    Get {
+        /// Element name (exact match; use find-by-name for substring).
+        name: String,
+
+        /// Restrict to a specific source (e.g. "user", "plugin:owner/name").
+        #[arg(long)]
+        source: Option<String>,
+
+        /// Output as JSON (default is human-readable).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Health probe. Exit 0=DB populated; 1=empty/corrupt; 2=missing.
+    /// Silent by default; use --verbose for a diagnostic line.
+    Health {
+        /// Print a one-line diagnostic to stdout.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
+
+    /// List entries whose `first_indexed_at` is >= the given datetime.
+    /// Accepts RFC 3339, date-only (YYYY-MM-DD → midnight UTC), or relative
+    /// shorthand (`1d`, `2w`, `24h`, `30m`, `120s`).
+    #[command(name = "list-added-since")]
+    ListAddedSince {
+        /// Datetime: RFC 3339, "YYYY-MM-DD", or relative ("1d", "2w", "24h").
+        when: String,
+
+        /// Maximum number of rows (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Output as JSON (default is human-readable).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// List entries whose `first_indexed_at` falls within [start, end] (inclusive).
+    #[command(name = "list-added-between")]
+    ListAddedBetween {
+        /// Start datetime: RFC 3339, "YYYY-MM-DD", or relative.
+        start: String,
+
+        /// End datetime: RFC 3339, "YYYY-MM-DD", or relative.
+        end: String,
+
+        /// Maximum number of rows (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// List entries whose `last_updated_at` is >= the given datetime.
+    /// Useful for "what changed in the last reindex?" queries.
+    #[command(name = "list-updated-since")]
+    ListUpdatedSince {
+        /// Datetime: RFC 3339, "YYYY-MM-DD", or relative ("1d", "2w", "24h").
+        when: String,
+
+        /// Maximum number of rows (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Find entries whose name contains the given substring (case-insensitive).
+    #[command(name = "find-by-name")]
+    FindByName {
+        /// Substring to match (case-insensitive).
+        substring: String,
+
+        /// Maximum number of rows (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Find entries with an exact keyword match via skill_keywords.
+    #[command(name = "find-by-keyword")]
+    FindByKeyword {
+        /// Keyword to match (case-insensitive, exact match).
+        keyword: String,
+
+        /// Maximum number of rows (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Find entries gated by (or tagged with) the given domain.
+    #[command(name = "find-by-domain")]
+    FindByDomain {
+        /// Domain value (e.g. "devops", "security", "web").
+        domain: String,
+
+        /// Maximum number of rows (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Find entries targeting the given programming language.
+    #[command(name = "find-by-language")]
+    FindByLanguage {
+        /// Language value (e.g. "python", "rust", "typescript").
+        language: String,
+
+        /// Maximum number of rows (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -13393,6 +13530,11 @@ fn open_db(path: &Path) -> Result<DbInstance, SuggesterError> {
 }
 
 /// Create the CozoDB schema with all relations needed for skill indexing.
+///
+/// Kept as a reference implementation alongside
+/// `scripts/pss_cozodb.py::_create_db_schema` after the Phase C (v3.0.0)
+/// removal of `run_build_db`. No Rust code path calls this function.
+#[allow(dead_code)]
 fn create_db_schema(db: &DbInstance) -> Result<(), SuggesterError> {
     // Main skills table: scalar fields + JSON-serialized vector fields
     // `id` is a deterministic 13-char hash of the entry key for stable references
@@ -13543,6 +13685,11 @@ fn build_inline_data(pairs: &[(String, String)]) -> String {
 
 /// Batch-insert all skills from a SkillIndex into the CozoDB.
 /// Uses batched inline data (500 rows per query) for efficiency.
+///
+/// Kept as a reference implementation alongside
+/// `scripts/pss_cozodb.py` after the Phase C (v3.0.0) removal of
+/// `run_build_db`. No Rust code path calls this function.
+#[allow(dead_code)]
 fn insert_skills_batch(
     db: &DbInstance,
     skills: &HashMap<String, SkillEntry>,
@@ -13793,256 +13940,22 @@ fn insert_skills_batch(
     Ok(count)
 }
 
-/// Build CozoDB from JSON index: pss --build-db --index path/to/skill-index.json
-///
-/// DEPRECATED in Phase B (v2.11.0): the Python merge writer
-/// (`scripts/pss_merge_queue.py`) now populates CozoDB directly during each
-/// merge, so this subcommand is redundant on modern installs. The function
-/// detects a populated CozoDB from the current run (the metadata generator
-/// field set to "python-merge-queue") and short-circuits with a deprecation
-/// notice. On legacy JSON-only installs (no CozoDB yet), it still falls
-/// through to the full rebuild path. Phase C removes this function entirely.
-fn run_build_db(cli: &Cli) -> Result<(), SuggesterError> {
-    // Phase B: the Python merge writer now populates CozoDB directly. We must
-    // check the CozoDB FIRST — before attempting to load the JSON — so that
-    // the short-circuit works even when callers run `pss --build-db` without
-    // a --index flag pointing at a non-existent JSON (e.g. the reindex
-    // orchestrator that already deleted the staging JSON after merging).
-    // Derive the DB path by probing the candidate locations for the JSON.
-    let db_path = get_db_path(cli.index.as_deref())
-        .or_else(|| {
-            // Fall back to the default location if get_db_path returned None
-            // (its "exists" check returns None when the DB is absent, but we
-            // want the path regardless so we can decide whether to build).
-            let home = dirs::home_dir()?;
-            Some(home.join(".claude").join(CACHE_DIR).join(DB_FILE))
-        })
-        .unwrap_or_else(|| PathBuf::from(DB_FILE));
-
-    // Phase B short-circuit: check if the CozoDB was just populated by the
-    // Python merge writer. That writer stamps pss_metadata.generator with
-    // the value "python-merge-queue"; if we see that and the row count is
-    // healthy, there is nothing for us to do — the Rust build-db call has
-    // been superseded. Do NOT read/load the JSON in this branch; JSON is a
-    // derived export now, not canonical.
-    if db_path.exists() {
-        if let Ok(prior_db) = open_db(&db_path) {
-            let gen_is_python = prior_db
-                .run_script(
-                    "?[value] := *pss_metadata{ key: 'generator', value }",
-                    Default::default(),
-                    ScriptMutability::Immutable,
-                )
-                .ok()
-                .and_then(|r| r.rows.first().cloned())
-                .and_then(|row| row.first().cloned())
-                .map(|v| matches!(v, DataValue::Str(ref s) if s.as_str() == "python-merge-queue"))
-                .unwrap_or(false);
-            if gen_is_python {
-                let row_count = prior_db
-                    .run_script(
-                        "?[count(name)] := *skills{ name }",
-                        Default::default(),
-                        ScriptMutability::Immutable,
-                    )
-                    .ok()
-                    .and_then(|r| r.rows.first().cloned())
-                    .and_then(|row| row.first().cloned())
-                    .and_then(|v| match v {
-                        DataValue::Num(cozo::Num::Int(n)) => Some(n),
-                        DataValue::Num(cozo::Num::Float(f)) => Some(f as i64),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                if row_count > 0 {
-                    eprintln!(
-                        "CozoDB already built by Python merge (Phase B); \
-                         skipping redundant rebuild. {} rows at {:?}",
-                        row_count, db_path
-                    );
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    // Legacy path: CozoDB was not populated by Python (or was populated by
-    // an older Rust-only build). Fall back to reading JSON and building from
-    // there. This path is only hit on first-install migration from a
-    // Phase-A or earlier layout — once Python writes CozoDB with the
-    // python-merge-queue generator, the short-circuit above takes over.
-    let json_path = get_index_path(cli.index.as_deref())?;
-    eprintln!("Loading JSON index from {:?}...", json_path);
-    let mut index = load_index(&json_path)?;
-    eprintln!("Loaded {} skills from JSON index", index.skills.len());
-
-    // Snapshot existing first_indexed_at timestamps from the prior DB before
-    // wiping. This preserves the original "installation time" across reindexes
-    // — without it, every reindex would reset the timestamp to "now" and the
-    // `added_since` / `added_between` helpers would be useless. Keyed by
-    // (name, source) which matches the CozoDB primary key. Best-effort: if
-    // the prior DB is missing, corrupt, or has no timestamp columns yet
-    // (legacy pre-v2.10 layout), the map is empty and every row gets a fresh
-    // timestamp — which is correct migration behaviour for first install.
-    let prior_timestamps: HashMap<(String, String), String> = if db_path.exists() {
-        match open_db(&db_path) {
-            Ok(prior_db) => {
-                let q = "?[name, source, first_indexed_at] := \
-                         *skills{ name, source, first_indexed_at }";
-                match prior_db.run_script(q, Default::default(), ScriptMutability::Immutable) {
-                    Ok(result) => {
-                        let mut map = HashMap::new();
-                        for row in &result.rows {
-                            if row.len() >= 3 {
-                                let name = match &row[0] {
-                                    DataValue::Str(s) => s.to_string(),
-                                    _ => continue,
-                                };
-                                let source = match &row[1] {
-                                    DataValue::Str(s) => s.to_string(),
-                                    _ => continue,
-                                };
-                                let ts = match &row[2] {
-                                    DataValue::Str(s) => s.to_string(),
-                                    _ => continue,
-                                };
-                                if !ts.is_empty() {
-                                    map.insert((name, source), ts);
-                                }
-                            }
-                        }
-                        eprintln!("Preserved {} existing first_indexed_at \
-                                   timestamps from prior DB", map.len());
-                        map
-                    }
-                    Err(_) => HashMap::new(), // Legacy DB or query failed; start fresh
-                }
-            }
-            Err(_) => HashMap::new(),
-        }
-    } else {
-        HashMap::new()
-    };
-
-    // Apply preserved timestamps to the in-memory index so insert_skills_batch
-    // (which reads entry.first_indexed_at) sees the prior value. Newly-
-    // discovered entries keep the empty string → will be stamped with "now".
-    for entry in index.skills.values_mut() {
-        if let Some(ts) = prior_timestamps.get(&(entry.name.clone(), entry.source.clone())) {
-            entry.first_indexed_at = ts.clone();
-        }
-    }
-
-    // Remove existing DB file if present (fresh build)
-    if db_path.exists() {
-        fs::remove_file(&db_path).map_err(|e| SuggesterError::IndexRead {
-            path: db_path.clone(),
-            source: e,
-        })?;
-    }
-
-    let db = open_db(&db_path)?;
-    create_db_schema(&db)?;
-
-    // Insert metadata
-    let mut meta_params: BTreeMap<String, DataValue> = BTreeMap::new();
-    meta_params.insert("key".into(), DataValue::Str("version".into()));
-    meta_params.insert("value".into(), DataValue::Str(index.version.clone().into()));
-    db.run_script(
-        "?[key, value] <- [[$key, $value]] :put pss_metadata { key => value }",
-        meta_params,
-        ScriptMutability::Mutable,
-    ).map_err(|e| SuggesterError::IndexParse(format!("Insert metadata failed: {}", e)))?;
-
-    let start = Instant::now();
-    let count = insert_skills_batch(&db, &index.skills)?;
-    let elapsed = start.elapsed();
-
-    eprintln!(
-        "Inserted {} skills in {:.2}s",
-        count, elapsed.as_secs_f64()
-    );
-
-    // Add skill name parts to kw_lookup (e.g., "react-query" → "react", "query")
-    {
-        let mut name_pairs: Vec<(String, String)> = Vec::new();
-        for entry in index.skills.values() {
-            for part in entry.name.to_lowercase().split(|c: char| c == '-' || c == '_' || c == ' ') {
-                if part.len() >= 2 {
-                    name_pairs.push((part.to_string(), entry.name.clone()));
-                }
-            }
-        }
-        name_pairs.sort();
-        name_pairs.dedup();
-        // Reuse the batch_insert helper via a direct script
-        for chunk in name_pairs.chunks(500) {
-            let data: String = chunk.iter()
-                .map(|(kw, name)| format!(
-                    "[\"{}\", \"{}\"]",
-                    kw.replace('\\', "\\\\").replace('"', "\\\""),
-                    name.replace('\\', "\\\\").replace('"', "\\\""),
-                ))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if data.is_empty() { continue; }
-            let script = format!(
-                "?[keyword_lower, skill_name] <- [{}] :put kw_lookup {{ keyword_lower, skill_name }}",
-                data
-            );
-            db.run_script(&script, Default::default(), ScriptMutability::Mutable)
-                .map_err(|e| SuggesterError::IndexParse(
-                    format!("Batch insert kw_lookup name parts failed: {}", e)
-                ))?;
-        }
-        eprintln!("Added {} name-part entries to kw_lookup", name_pairs.len());
-    }
-
-    // Insert domain registry into DB (if available)
-    // Look for domain-registry.json in same directory as skill-index.json
-    let registry_path = json_path.parent()
-        .map(|p| p.join(REGISTRY_FILE))
-        .unwrap_or_else(|| PathBuf::from(REGISTRY_FILE));
-
-    if registry_path.exists() {
-        let reg_start = Instant::now();
-        match load_domain_registry(&registry_path)? {
-            Some(registry) => {
-                let domain_count = insert_domain_registry_batch(&db, &registry)?;
-                let reg_elapsed = reg_start.elapsed();
-                eprintln!(
-                    "Inserted {} domains in {:.2}s",
-                    domain_count, reg_elapsed.as_secs_f64()
-                );
-
-                // Store registry metadata
-                let mut meta_params: BTreeMap<String, DataValue> = BTreeMap::new();
-                meta_params.insert("key".into(), DataValue::Str("registry_version".into()));
-                meta_params.insert("value".into(), DataValue::Str(registry.version.into()));
-                db.run_script(
-                    "?[key, value] <- [[$key, $value]] :put pss_metadata { key => value }",
-                    meta_params,
-                    ScriptMutability::Mutable,
-                ).map_err(|e| SuggesterError::IndexParse(format!("Insert registry metadata failed: {}", e)))?;
-            }
-            None => {
-                eprintln!("Domain registry file exists but could not be loaded, skipping");
-            }
-        }
-    } else {
-        eprintln!("No domain registry found at {:?}, skipping", registry_path);
-    }
-
-    eprintln!(
-        "Built CozoDB at {:?} in {:.2}s total",
-        db_path, start.elapsed().as_secs_f64()
-    );
-
-    Ok(())
-}
+// Phase C (v3.0.0): `run_build_db` has been removed. The Python merge writer
+// (`scripts/pss_merge_queue.py::_sync_cozodb`) populates CozoDB directly
+// during each merge — see `scripts/pss_cozodb.py::atomic_write_cozodb`. The
+// auxiliary helpers `create_db_schema`, `insert_skills_batch`, and
+// `insert_domain_registry_batch` are retained below with `#[allow(dead_code)]`
+// as reference implementations that the Python port mirrors byte-for-byte.
+// Removing them here would make it harder to diff the two implementations
+// when hunting schema drift or compatibility bugs.
 
 /// Batch-insert domain registry data into CozoDB.
 /// Populates domain_registry, domain_aliases, domain_keywords, domain_skills tables.
+///
+/// Kept as a reference implementation alongside
+/// `scripts/pss_cozodb.py` after the Phase C (v3.0.0) removal of
+/// `run_build_db`. No Rust code path calls this function.
+#[allow(dead_code)]
 fn insert_domain_registry_batch(
     db: &DbInstance,
     registry: &DomainRegistry,
@@ -14540,7 +14453,9 @@ fn resolve_name_or_id(db: &DbInstance, ref_str: &str) -> Result<String, Suggeste
     Ok(ref_str.to_string())
 }
 
-/// Dispatch query subcommands.
+/// Dispatch query subcommands. Health is handled BEFORE this function in
+/// `main()` because it needs special exit-code semantics (0/1/2) that don't
+/// fit the `Result<(), SuggesterError>` contract.
 fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
     let db = open_db_for_query(cli)?;
     match cmd {
@@ -14576,6 +14491,32 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             cmd_list_rules(&db, scope.as_deref(), format),
         Commands::Export { json, path } =>
             cmd_export(&db, *json, path.as_deref()),
+        // --- Phase D (v2.11.0) ---
+        Commands::Count { json } =>
+            cmd_count(&db, *json),
+        Commands::Get { name, source, json } =>
+            cmd_get(&db, name, source.as_deref(), *json),
+        Commands::Health { .. } => {
+            // Unreachable — Health is dispatched BEFORE run_query_command in main().
+            // If we get here, that's a routing bug; fail loudly.
+            Err(SuggesterError::IndexParse(
+                "internal error: Health command reached run_query_command".to_string(),
+            ))
+        }
+        Commands::ListAddedSince { when, limit, json } =>
+            cmd_list_added_since(&db, when, *limit, *json),
+        Commands::ListAddedBetween { start, end, limit, json } =>
+            cmd_list_added_between(&db, start, end, *limit, *json),
+        Commands::ListUpdatedSince { when, limit, json } =>
+            cmd_list_updated_since(&db, when, *limit, *json),
+        Commands::FindByName { substring, limit, json } =>
+            cmd_find_by_name(&db, substring, *limit, *json),
+        Commands::FindByKeyword { keyword, limit, json } =>
+            cmd_find_by_auxiliary(&db, "skill_keywords", keyword, *limit, *json),
+        Commands::FindByDomain { domain, limit, json } =>
+            cmd_find_by_auxiliary(&db, "skill_domains", domain, *limit, *json),
+        Commands::FindByLanguage { language, limit, json } =>
+            cmd_find_by_auxiliary(&db, "skill_languages", language, *limit, *json),
     }
 }
 
@@ -14776,6 +14717,33 @@ fn cmd_stats(db: &DbInstance, format: &str) -> Result<(), SuggesterError> {
     let by_source: Vec<(String, i64)> = source_result.rows.iter()
         .map(|r| (dv_to_string(&r[0]), dv_to_i64(&r[1]))).collect();
 
+    // Phase D banner: oldest/newest first_indexed_at + newest last_updated_at.
+    // Use min/max aggregates on the timestamp columns. Returns empty string
+    // if the DB has no rows (aggregates over empty relation return nothing).
+    let fetch_extreme = |order: &str, col: &str| -> (String, String) {
+        // First row by sort order. Bound to a separate variable because
+        // CozoDB can't return both min(col) and the row's other columns
+        // in a single aggregate — we use :order + :limit 1 instead.
+        let q = format!(
+            "?[name, ts] := *skills{{ name, {col} }}, ts = {col}, ts != '' {order} :limit 1",
+            col = col,
+            order = order,
+        );
+        let res = db.run_script(&q, Default::default(), ScriptMutability::Immutable);
+        match res {
+            Ok(r) => {
+                if let Some(row) = r.rows.first() {
+                    return (dv_to_string(&row[0]), dv_to_string(&row[1]));
+                }
+                (String::new(), String::new())
+            }
+            Err(_) => (String::new(), String::new()),
+        }
+    };
+    let (oldest_name, oldest_ts) = fetch_extreme(":order first_indexed_at", "first_indexed_at");
+    let (newest_name, newest_ts) = fetch_extreme(":order -first_indexed_at", "first_indexed_at");
+    let (reindex_name, reindex_ts) = fetch_extreme(":order -last_updated_at", "last_updated_at");
+
     // Top domains, categories, languages, frameworks, platforms, tools (top 20 each)
     let agg_query = |table: &str| -> Vec<(String, i64)> {
         db.run_script(
@@ -14800,6 +14768,20 @@ fn cmd_stats(db: &DbInstance, format: &str) -> Result<(), SuggesterError> {
     if format == "json" {
         let mut stats = serde_json::Map::new();
         stats.insert("total".into(), serde_json::Value::Number(total.into()));
+        // Phase D banner: timestamp extremes. Always present in the JSON
+        // (null when the DB has no rows or no timestamp data) so scripting
+        // callers don't need to branch on key existence.
+        let ts_value = |name: &str, ts: &str| -> serde_json::Value {
+            if ts.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({"entry": name, "timestamp": ts})
+            }
+        };
+        stats.insert("oldest_first_indexed".into(), ts_value(&oldest_name, &oldest_ts));
+        stats.insert("newest_first_indexed".into(), ts_value(&newest_name, &newest_ts));
+        stats.insert("last_reindex".into(), ts_value(&reindex_name, &reindex_ts));
+
         let to_obj = |pairs: &[(String, i64)]| -> serde_json::Value {
             let map: serde_json::Map<String, serde_json::Value> = pairs.iter()
                 .map(|(k, v)| (k.clone(), serde_json::Value::Number((*v).into())))
@@ -14818,7 +14800,19 @@ fn cmd_stats(db: &DbInstance, format: &str) -> Result<(), SuggesterError> {
         println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(stats))
             .unwrap_or_default());
     } else {
-        println!("Total entries: {}", total);
+        // Phase D: "Total: N entries" is the first human-readable line, no
+        // leading whitespace, no trailing colon — makes the output parseable
+        // by quick `head -1 | awk ...` scripts.
+        println!("Total: {} entries", total);
+        if !oldest_ts.is_empty() {
+            println!("Oldest first_indexed_at: {} (entry: {})", oldest_ts, oldest_name);
+        }
+        if !newest_ts.is_empty() {
+            println!("Newest first_indexed_at: {} (entry: {})", newest_ts, newest_name);
+        }
+        if !reindex_ts.is_empty() {
+            println!("Last reindex (newest last_updated_at): {}", reindex_ts);
+        }
         let print_section = |title: &str, pairs: &[(String, i64)]| {
             println!("\n  {} ({})", title, pairs.len());
             for (k, v) in pairs {
@@ -16059,6 +16053,641 @@ fn cmd_coverage(db: &DbInstance, type_filter: Option<&str>, format: &str) -> Res
 }
 
 // ============================================================================
+// Phase D (v2.11.0): datetime parsing + query/management subcommands
+// ============================================================================
+//
+// These subcommands expose CozoDB timestamp and search capabilities to the
+// CLI without requiring Python. They mirror the helpers in
+// `scripts/pss_cozodb.py` byte-for-byte semantically, but run faster.
+//
+// Datetime formats accepted by parse_datetime_arg:
+//   - RFC 3339 strings:  "2026-04-16T22:12:27Z" or "2026-04-16T22:12:27+00:00"
+//   - Date only:         "2026-04-16" (interpreted as midnight UTC)
+//   - Relative to now:   "1d", "2w", "24h", "30m", "120s"
+
+/// Parse a user-supplied datetime string into an RFC 3339 UTC string matching
+/// the format stored in CozoDB (via Rust's `to_rfc3339_opts(Secs, true)`).
+///
+/// Fail-fast on invalid input — callers are scripts/power-users who want
+/// clear errors, not silent fallbacks.
+fn parse_datetime_arg(arg: &str) -> Result<String, SuggesterError> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Err(SuggesterError::IndexParse(
+            "empty datetime argument".to_string(),
+        ));
+    }
+
+    // Try relative shorthand first (cheapest to check): N<unit> where unit is s/m/h/d/w
+    // Requires: last char is one of [smhdw], prefix is a positive integer.
+    let last = arg.chars().last().unwrap();
+    if matches!(last, 's' | 'm' | 'h' | 'd' | 'w') {
+        let num_part = &arg[..arg.len() - last.len_utf8()];
+        if !num_part.is_empty() && num_part.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(n) = num_part.parse::<i64>() {
+                let seconds = match last {
+                    's' => n,
+                    'm' => n * 60,
+                    'h' => n * 3600,
+                    'd' => n * 86400,
+                    'w' => n * 86400 * 7,
+                    _ => unreachable!(),
+                };
+                let dt = Utc::now() - chrono::Duration::seconds(seconds);
+                return Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+            }
+        }
+        // Fall through — the string looks like a relative shorthand but didn't
+        // parse cleanly, let the RFC 3339 parser produce the final error.
+    }
+
+    // Try full RFC 3339 / ISO 8601 (e.g. "2026-04-16T22:12:27Z")
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(arg) {
+        return Ok(dt
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+
+    // Try date-only (YYYY-MM-DD → midnight UTC)
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(arg, "%Y-%m-%d") {
+        if let Some(ndt) = date.and_hms_opt(0, 0, 0) {
+            let dt = ndt.and_utc();
+            return Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        }
+    }
+
+    // Try naive datetime without timezone (e.g. "2026-04-16T22:12:27")
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(arg, "%Y-%m-%dT%H:%M:%S") {
+        let dt = ndt.and_utc();
+        return Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+
+    Err(SuggesterError::IndexParse(format!(
+        "Invalid datetime {:?}. Expected RFC 3339 (2026-04-16T22:12:27Z), \
+         date-only (2026-04-16), or relative shorthand (1d, 2w, 24h, 30m, 120s).",
+        arg
+    )))
+}
+
+/// Print a compact, ps-style aligned table without borders — one row per line.
+/// Truncates cells to their column's max width (last column allowed to overflow).
+fn print_ps_table(headers: &[&str], rows: &[Vec<String>]) {
+    if rows.is_empty() {
+        println!("(no results)");
+        return;
+    }
+    // Compute each column's width as max(header, data) capped at 80 chars.
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(cell.chars().count().min(80));
+            }
+        }
+    }
+    // Print header (space-separated, left-aligned)
+    let mut header_parts: Vec<String> = Vec::new();
+    for (i, h) in headers.iter().enumerate() {
+        let w = widths[i];
+        header_parts.push(format!("{:<width$}", h, width = w));
+    }
+    println!("{}", header_parts.join("  "));
+
+    // Print rows — truncate each cell to its column width, except the last
+    // column which gets to overflow so descriptions remain readable.
+    let last_idx = headers.len().saturating_sub(1);
+    for row in rows {
+        let mut parts: Vec<String> = Vec::new();
+        for (i, cell) in row.iter().enumerate() {
+            if i >= widths.len() {
+                break;
+            }
+            let w = widths[i];
+            if i == last_idx {
+                // Last column: no truncation, no padding on the right
+                parts.push(cell.clone());
+            } else {
+                let truncated: String = cell.chars().take(w).collect();
+                parts.push(format!("{:<width$}", truncated, width = w));
+            }
+        }
+        println!("{}", parts.join("  "));
+    }
+}
+
+/// Shared projection: produce a Vec<(row_fields, json_object)> pair from the
+/// CozoDB timestamp queries. Columns are (name, skill_type, source,
+/// description, timestamp_iso).
+fn rows_to_timestamp_entries(
+    rows: &[Vec<DataValue>],
+    ts_label: &str,
+) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|r| {
+            // columns: 0=name, 1=skill_type, 2=source, 3=path, 4=description, 5=timestamp
+            serde_json::json!({
+                "name": dv_to_string(&r[0]),
+                "type": dv_to_string(&r[1]),
+                "source": dv_to_string(&r[2]),
+                "path": dv_to_string(&r[3]),
+                "description": dv_to_string(&r[4]),
+                ts_label: dv_to_string(&r[5]),
+            })
+        })
+        .collect()
+}
+
+/// Human-readable output for timestamp-based list commands.
+fn print_timestamp_list(entries: &[serde_json::Value], ts_label: &str) {
+    // Bind temporarily because the `headers` array borrows &str slices that
+    // must outlive the `print_ps_table` call.
+    let ts_hdr = ts_label_upper(ts_label);
+    let headers = ["TYPE", "NAME", "SOURCE", ts_hdr.as_str(), "DESCRIPTION"];
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .map(|e| {
+            vec![
+                e["type"].as_str().unwrap_or("").to_string(),
+                e["name"].as_str().unwrap_or("").to_string(),
+                e["source"].as_str().unwrap_or("").to_string(),
+                e[ts_label].as_str().unwrap_or("").to_string(),
+                e["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect(),
+            ]
+        })
+        .collect();
+    print_ps_table(&headers, &rows);
+}
+
+fn ts_label_upper(label: &str) -> String {
+    label.replace('_', " ").to_uppercase()
+}
+
+// --- cmd_count ---
+
+/// Print the total skill count. Integer on stdout by default; {"count": N}
+/// when `--json` is passed. Never exits non-zero when the DB has zero rows —
+/// that's a legitimate state (reindex in progress). Use `pss health` for
+/// exit-code-based health gating.
+fn cmd_count(db: &DbInstance, json: bool) -> Result<(), SuggesterError> {
+    let result = db
+        .run_script(
+            "?[count(name)] := *skills{ name }",
+            Default::default(),
+            ScriptMutability::Immutable,
+        )
+        .map_err(|e| SuggesterError::IndexParse(format!("count query failed: {}", e)))?;
+    let total = result
+        .rows
+        .first()
+        .and_then(|r| r.first())
+        .map(dv_to_i64)
+        .unwrap_or(0);
+    if json {
+        println!("{{\"count\": {}}}", total);
+    } else {
+        println!("{}", total);
+    }
+    Ok(())
+}
+
+// --- cmd_get ---
+
+/// Fetch a single entry by (name[, source]). Prints the entry as JSON or
+/// human-readable text. Exits with error if the entry is not found.
+///
+/// When `source` is None and multiple entries share the same name, prints
+/// all of them (as a JSON array or one block per entry in text mode).
+fn cmd_get(
+    db: &DbInstance,
+    name: &str,
+    source: Option<&str>,
+    json: bool,
+) -> Result<(), SuggesterError> {
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("name".into(), DataValue::Str(name.into()));
+
+    let query = if let Some(src) = source {
+        // Reject obviously malformed source strings before building the query
+        validate_filter_value("source", src)?;
+        params.insert("source".into(), DataValue::Str(src.into()));
+        "?[name, id, path, skill_type, source, description, tier, boost, category, \
+         first_indexed_at, last_updated_at, keywords_json, domains_json, \
+         languages_json, frameworks_json, platforms_json, tools_json] := \
+         *skills{ name, id, path, skill_type, source, description, tier, boost, category, \
+                  first_indexed_at, last_updated_at, keywords_json, domains_json, \
+                  languages_json, frameworks_json, platforms_json, tools_json }, \
+         name = $name, source = $source"
+            .to_string()
+    } else {
+        "?[name, id, path, skill_type, source, description, tier, boost, category, \
+         first_indexed_at, last_updated_at, keywords_json, domains_json, \
+         languages_json, frameworks_json, platforms_json, tools_json] := \
+         *skills{ name, id, path, skill_type, source, description, tier, boost, category, \
+                  first_indexed_at, last_updated_at, keywords_json, domains_json, \
+                  languages_json, frameworks_json, platforms_json, tools_json }, \
+         name = $name"
+            .to_string()
+    };
+
+    let result = db
+        .run_script(&query, params, ScriptMutability::Immutable)
+        .map_err(|e| SuggesterError::IndexParse(format!("get query failed: {}", e)))?;
+
+    if result.rows.is_empty() {
+        return Err(SuggesterError::IndexParse(format!(
+            "Entry not found: {:?}{}",
+            name,
+            source.map(|s| format!(" (source: {})", s)).unwrap_or_default()
+        )));
+    }
+
+    let parse_vec = |s: &str| -> Vec<String> { serde_json::from_str(s).unwrap_or_default() };
+    let row_to_json = |row: &[DataValue]| -> serde_json::Value {
+        serde_json::json!({
+            "name": dv_to_string(&row[0]),
+            "id": dv_to_string(&row[1]),
+            "path": dv_to_string(&row[2]),
+            "type": dv_to_string(&row[3]),
+            "source": dv_to_string(&row[4]),
+            "description": dv_to_string(&row[5]),
+            "tier": dv_to_string(&row[6]),
+            "boost": dv_to_i64(&row[7]),
+            "category": dv_to_string(&row[8]),
+            "first_indexed_at": dv_to_string(&row[9]),
+            "last_updated_at": dv_to_string(&row[10]),
+            "keywords": parse_vec(&dv_to_string(&row[11])),
+            "domains": parse_vec(&dv_to_string(&row[12])),
+            "languages": parse_vec(&dv_to_string(&row[13])),
+            "frameworks": parse_vec(&dv_to_string(&row[14])),
+            "platforms": parse_vec(&dv_to_string(&row[15])),
+            "tools": parse_vec(&dv_to_string(&row[16])),
+        })
+    };
+
+    if json {
+        if result.rows.len() == 1 {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&row_to_json(&result.rows[0])).unwrap_or_default()
+            );
+        } else {
+            let arr: Vec<serde_json::Value> =
+                result.rows.iter().map(|r| row_to_json(r)).collect();
+            println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        }
+    } else {
+        // Human-readable: one block per row, separated by a blank line.
+        for (i, row) in result.rows.iter().enumerate() {
+            if i > 0 {
+                println!();
+            }
+            println!("Name        : {}", dv_to_string(&row[0]));
+            println!("ID          : {}", dv_to_string(&row[1]));
+            println!("Type        : {}", dv_to_string(&row[3]));
+            println!("Source      : {}", dv_to_string(&row[4]));
+            println!("Category    : {}", dv_to_string(&row[8]));
+            println!("Path        : {}", dv_to_string(&row[2]));
+            println!("Description : {}", dv_to_string(&row[5]));
+            println!("Added       : {}", dv_to_string(&row[9]));
+            println!("Updated     : {}", dv_to_string(&row[10]));
+            let kws: Vec<String> = parse_vec(&dv_to_string(&row[11]));
+            if !kws.is_empty() {
+                println!("Keywords    : {}", kws.join(", "));
+            }
+            let langs: Vec<String> = parse_vec(&dv_to_string(&row[13]));
+            if !langs.is_empty() {
+                println!("Languages   : {}", langs.join(", "));
+            }
+            let doms: Vec<String> = parse_vec(&dv_to_string(&row[12]));
+            if !doms.is_empty() {
+                println!("Domains     : {}", doms.join(", "));
+            }
+        }
+    }
+    Ok(())
+}
+
+// --- cmd_health ---
+
+/// Exit 0/1/2 health probe. The function itself returns the exit code via
+/// the SuggesterError path; callers in main() translate it.
+///
+/// Semantics:
+///   0 = DB reachable AND has >= 1 row
+///   1 = DB reachable but empty or query failed (corrupt / schema drift)
+///   2 = DB path does not exist (handled in caller before we get here)
+///
+/// On `--verbose`, a one-line diagnostic is printed to stdout. Silent otherwise.
+///
+/// This function is unusual: it uses process::exit directly so that exit
+/// codes 1 and 2 map to "soft" DB-state signals, not to Rust error paths.
+/// Callers should NOT propagate the result through `run_query_command` —
+/// main() dispatches Health before the generic query handler.
+fn cmd_health(db: Option<&DbInstance>, verbose: bool) -> ! {
+    match db {
+        None => {
+            if verbose {
+                println!("DB missing");
+            }
+            std::process::exit(2);
+        }
+        Some(db) => {
+            // Count rows. Any error → exit 1 (treat as corrupt).
+            let result = db.run_script(
+                "?[count(name)] := *skills{ name }",
+                Default::default(),
+                ScriptMutability::Immutable,
+            );
+            match result {
+                Ok(r) => {
+                    let total = r
+                        .rows
+                        .first()
+                        .and_then(|row| row.first())
+                        .map(dv_to_i64)
+                        .unwrap_or(0);
+                    if total > 0 {
+                        if verbose {
+                            println!("OK ({} entries)", total);
+                        }
+                        std::process::exit(0);
+                    } else {
+                        if verbose {
+                            println!("empty (0 entries)");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    if verbose {
+                        println!("corrupt ({})", e);
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+// --- cmd_list_added_since ---
+
+fn cmd_list_added_since(
+    db: &DbInstance,
+    when: &str,
+    limit: usize,
+    json: bool,
+) -> Result<(), SuggesterError> {
+    let iso = parse_datetime_arg(when)?;
+    let limit = limit.min(10000);
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("since".into(), DataValue::Str(iso.clone().into()));
+    let query = format!(
+        "?[name, skill_type, source, path, description, first_indexed_at] := \
+         *skills{{ name, skill_type, source, path, description, first_indexed_at }}, \
+         first_indexed_at >= $since \
+         :order first_indexed_at \
+         :limit {}",
+        limit
+    );
+    let result = db
+        .run_script(&query, params, ScriptMutability::Immutable)
+        .map_err(|e| {
+            SuggesterError::IndexParse(format!("list-added-since query failed: {}", e))
+        })?;
+    let entries = rows_to_timestamp_entries(&result.rows, "first_indexed_at");
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries).unwrap_or_default());
+    } else {
+        print_timestamp_list(&entries, "first_indexed_at");
+    }
+    Ok(())
+}
+
+// --- cmd_list_added_between ---
+
+fn cmd_list_added_between(
+    db: &DbInstance,
+    start: &str,
+    end: &str,
+    limit: usize,
+    json: bool,
+) -> Result<(), SuggesterError> {
+    let start_iso = parse_datetime_arg(start)?;
+    let end_iso = parse_datetime_arg(end)?;
+    let limit = limit.min(10000);
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("start".into(), DataValue::Str(start_iso.clone().into()));
+    params.insert("end".into(), DataValue::Str(end_iso.clone().into()));
+    let query = format!(
+        "?[name, skill_type, source, path, description, first_indexed_at] := \
+         *skills{{ name, skill_type, source, path, description, first_indexed_at }}, \
+         first_indexed_at >= $start, first_indexed_at <= $end \
+         :order first_indexed_at \
+         :limit {}",
+        limit
+    );
+    let result = db
+        .run_script(&query, params, ScriptMutability::Immutable)
+        .map_err(|e| {
+            SuggesterError::IndexParse(format!("list-added-between query failed: {}", e))
+        })?;
+    let entries = rows_to_timestamp_entries(&result.rows, "first_indexed_at");
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries).unwrap_or_default());
+    } else {
+        print_timestamp_list(&entries, "first_indexed_at");
+    }
+    Ok(())
+}
+
+// --- cmd_list_updated_since ---
+
+fn cmd_list_updated_since(
+    db: &DbInstance,
+    when: &str,
+    limit: usize,
+    json: bool,
+) -> Result<(), SuggesterError> {
+    let iso = parse_datetime_arg(when)?;
+    let limit = limit.min(10000);
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("since".into(), DataValue::Str(iso.clone().into()));
+    // Descending order — most-recently-updated first is more useful.
+    let query = format!(
+        "?[name, skill_type, source, path, description, last_updated_at] := \
+         *skills{{ name, skill_type, source, path, description, last_updated_at }}, \
+         last_updated_at >= $since \
+         :order -last_updated_at \
+         :limit {}",
+        limit
+    );
+    let result = db
+        .run_script(&query, params, ScriptMutability::Immutable)
+        .map_err(|e| {
+            SuggesterError::IndexParse(format!("list-updated-since query failed: {}", e))
+        })?;
+    let entries = rows_to_timestamp_entries(&result.rows, "last_updated_at");
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries).unwrap_or_default());
+    } else {
+        print_timestamp_list(&entries, "last_updated_at");
+    }
+    Ok(())
+}
+
+// --- cmd_find_by_name ---
+
+/// Case-insensitive substring match over the `name` column.
+fn cmd_find_by_name(
+    db: &DbInstance,
+    substring: &str,
+    limit: usize,
+    json: bool,
+) -> Result<(), SuggesterError> {
+    let needle = substring.to_lowercase();
+    let limit = limit.min(10000);
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("q".into(), DataValue::Str(needle.into()));
+    let query = format!(
+        "?[name, skill_type, source, path, description] := \
+         *skills{{ name, skill_type, source, path, description }}, \
+         str_includes(lowercase(name), $q) \
+         :order name \
+         :limit {}",
+        limit
+    );
+    let result = db
+        .run_script(&query, params, ScriptMutability::Immutable)
+        .map_err(|e| SuggesterError::IndexParse(format!("find-by-name query failed: {}", e)))?;
+    let entries: Vec<serde_json::Value> = result
+        .rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "name": dv_to_string(&r[0]),
+                "type": dv_to_string(&r[1]),
+                "source": dv_to_string(&r[2]),
+                "path": dv_to_string(&r[3]),
+                "description": dv_to_string(&r[4]),
+            })
+        })
+        .collect();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries).unwrap_or_default());
+    } else {
+        let rows: Vec<Vec<String>> = entries
+            .iter()
+            .map(|e| {
+                vec![
+                    e["type"].as_str().unwrap_or("").to_string(),
+                    e["name"].as_str().unwrap_or("").to_string(),
+                    e["source"].as_str().unwrap_or("").to_string(),
+                    e["description"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect(),
+                ]
+            })
+            .collect();
+        print_ps_table(&["TYPE", "NAME", "SOURCE", "DESCRIPTION"], &rows);
+    }
+    Ok(())
+}
+
+// --- cmd_find_by_auxiliary (shared implementation) ---
+
+/// Helper: run a find-by-<aux-table> query against one of the 9 auxiliary
+/// normalised relations (skill_keywords / skill_domains / skill_languages /
+/// etc.), with JOIN back to skills for the output columns.
+fn cmd_find_by_auxiliary(
+    db: &DbInstance,
+    aux_table: &str,
+    value: &str,
+    limit: usize,
+    json: bool,
+) -> Result<(), SuggesterError> {
+    // Whitelist the aux-table name (no user-controlled value reaches Datalog here,
+    // but keep the check tight so an accidental caller bug can't inject).
+    const VALID_AUX: &[&str] = &[
+        "skill_keywords",
+        "skill_intents",
+        "skill_tools",
+        "skill_services",
+        "skill_frameworks",
+        "skill_languages",
+        "skill_platforms",
+        "skill_domains",
+        "skill_file_types",
+    ];
+    if !VALID_AUX.contains(&aux_table) {
+        return Err(SuggesterError::IndexParse(format!(
+            "invalid auxiliary table: {}",
+            aux_table
+        )));
+    }
+
+    let needle = value.to_lowercase();
+    let limit = limit.min(10000);
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("v".into(), DataValue::Str(needle.into()));
+    let query = format!(
+        "?[name, skill_type, source, path, description] := \
+         *{}{{ skill_name: name, value: $v }}, \
+         *skills{{ name, skill_type, source, path, description }} \
+         :order name \
+         :limit {}",
+        aux_table, limit
+    );
+    let result = db
+        .run_script(&query, params, ScriptMutability::Immutable)
+        .map_err(|e| {
+            SuggesterError::IndexParse(format!("find-by query failed ({}): {}", aux_table, e))
+        })?;
+    let entries: Vec<serde_json::Value> = result
+        .rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "name": dv_to_string(&r[0]),
+                "type": dv_to_string(&r[1]),
+                "source": dv_to_string(&r[2]),
+                "path": dv_to_string(&r[3]),
+                "description": dv_to_string(&r[4]),
+            })
+        })
+        .collect();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries).unwrap_or_default());
+    } else {
+        let rows: Vec<Vec<String>> = entries
+            .iter()
+            .map(|e| {
+                vec![
+                    e["type"].as_str().unwrap_or("").to_string(),
+                    e["name"].as_str().unwrap_or("").to_string(),
+                    e["source"].as_str().unwrap_or("").to_string(),
+                    e["description"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect(),
+                ]
+            })
+            .collect();
+        print_ps_table(&["TYPE", "NAME", "SOURCE", "DESCRIPTION"], &rows);
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Runtime Version
 // ============================================================================
 
@@ -16118,6 +16747,29 @@ fn main() {
 
     // Dispatch: query subcommands vs build-db vs pass1-batch vs agent-profile vs hook
     if let Some(ref cmd) = cli.command {
+        // Health has special exit-code semantics (0=populated, 1=empty/corrupt,
+        // 2=missing) and must not route through the generic error-to-exit-1
+        // path below. Intercept before `run_query_command`.
+        if let Commands::Health { verbose } = cmd {
+            // Health probe semantics: if the caller passed --index explicitly,
+            // that exact path is authoritative (no fallback to defaults).
+            // This lets `pss --index <bogus> health` return exit 2 without
+            // silently picking up the user's real DB.
+            let db_path = if let Some(explicit) = &cli.index {
+                let p = if explicit.ends_with(".db") {
+                    PathBuf::from(explicit)
+                } else {
+                    PathBuf::from(explicit).parent().map(|d| d.join(DB_FILE))
+                        .unwrap_or_else(|| PathBuf::from(explicit))
+                };
+                if p.exists() { Some(p) } else { None }
+            } else {
+                get_db_path(None)
+            };
+            let db = db_path.as_ref().and_then(|p| open_db(p).ok());
+            cmd_health(db.as_ref(), *verbose); // diverges — never returns
+        }
+
         // Query subcommands use stderr for errors and exit(1) on failure
         if let Err(e) = run_query_command(&cli, cmd) {
             eprintln!("Error: {}", e);
@@ -16136,9 +16788,6 @@ fn main() {
     let result = if let Some(ref file_path) = cli.index_file {
         info!("Running in INDEX FILE mode: {}", file_path);
         run_index_file(file_path)
-    } else if cli.build_db {
-        info!("Running in BUILD DB mode");
-        run_build_db(&cli)
     } else if cli.pass1_batch {
         info!("Running in PASS1 BATCH mode");
         run_pass1_batch()
