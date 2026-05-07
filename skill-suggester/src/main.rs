@@ -21,6 +21,9 @@
 //! - ~5-15ms total execution time
 //! - O(n*k) matching where n=skills, k=keywords per skill
 
+// Temporal history index — see design/tasks/TRDD-152e697f-*.md (v3.3.0+).
+mod temporal;
+
 use chrono::Utc;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use colored::Colorize;
@@ -493,6 +496,111 @@ enum Commands {
         /// Output as JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+
+    // ========================================================================
+    // Temporal history index — TRDD-152e697f. v3.3.0+.
+    // These query the event-sourced tables (events, elements_state, scan_runs)
+    // populated by `pss reindex`. All output is JSON.
+    // ========================================================================
+    /// List every element that was installed and active at the given date.
+    /// Reads from elements_state with an as-of cutoff against events.
+    #[command(name = "as-of")]
+    AsOf {
+        /// RFC3339 date or shorthand: "2026-03-14", "2026-03-14T12:00:00Z", "yesterday", "now"
+        date: String,
+        /// Optional element-type filter (skill / agent / command / rule / mcp / lsp / hook / plugin / channel / monitor / output-style / theme / marketplace).
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        /// Optional scope filter (local / project / user / plugin / marketplace).
+        #[arg(long)]
+        scope: Option<String>,
+        /// Optional scope_path filter (absolute path).
+        #[arg(long, value_name = "PATH")]
+        scope_path: Option<String>,
+        /// Maximum rows (default: 1000).
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
+
+    /// Show the full event timeline for one element.
+    Timeline {
+        /// element_id (e.g. "skill:my-skill@user:")
+        element_id: String,
+        /// Maximum rows (default: 200).
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+
+    /// First-seen and last-seen (or null) timestamps for one element.
+    Lifespan {
+        element_id: String,
+    },
+
+    /// All events whose `event_type` is content_changed / size_changed /
+    /// frontmatter_changed / description_changed / path_changed within
+    /// the closed `[start, end]` window.
+    #[command(name = "changed-between")]
+    ChangedBetween {
+        /// RFC3339 start (inclusive)
+        start: String,
+        /// RFC3339 end (inclusive)
+        end: String,
+        /// Optional element-type filter.
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        /// Maximum rows (default: 1000).
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
+
+    /// All `removed` events since the given date (inclusive).
+    #[command(name = "removed-since")]
+    RemovedSince {
+        /// RFC3339 cutoff
+        date: String,
+        /// Maximum rows.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
+
+    /// List recent scan runs (most recent first).
+    #[command(name = "scan-log")]
+    ScanLog {
+        /// Maximum rows (default: 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+
+    /// Statistics about the temporal database: event count, blob count,
+    /// blob bytes, oldest event, retention window.
+    #[command(name = "db-stats")]
+    DbStats,
+
+    /// Run a full reindex (discover → enrich → emit events). Suitable
+    /// for cron via the janitor `pss-reindex-due` detector.
+    Reindex {
+        /// Print the event set without writing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Drop events older than the configured retention window
+    /// (default: 9 months). Idempotent.
+    #[command(name = "prune-history")]
+    PruneHistory {
+        /// Print which rows would be dropped without committing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Get or set the retention window (default: 9 months).
+    Retention {
+        /// Set the retention window. Accepts ISO 8601 duration ("P9M",
+        /// "P30D") or shorthand ("9m", "30d", "1y"). Omit to print
+        /// the current value.
+        #[arg(long, value_name = "DURATION")]
+        set: Option<String>,
     },
 }
 
@@ -14395,7 +14503,14 @@ fn load_candidates_from_db(
 fn open_db_for_query(cli: &Cli) -> Result<DbInstance, SuggesterError> {
     let db_path = get_db_path(cli.index.as_deref())
         .ok_or_else(|| SuggesterError::IndexNotFound(PathBuf::from("pss-skill-index.db")))?;
-    open_db(&db_path)
+    let db = open_db(&db_path)?;
+    // Ensure the temporal-history tables exist (idempotent — TRDD-152e697f).
+    // Failure here is non-fatal for legacy queries, but warned so users
+    // know the temporal subcommands won't have data yet.
+    if let Err(e) = temporal::ensure_schema(&db) {
+        tracing::debug!("temporal::ensure_schema failed (non-fatal): {}", e);
+    }
+    Ok(db)
 }
 
 /// Valid entry types — whitelist for --type filter.
@@ -14517,6 +14632,52 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             cmd_find_by_auxiliary(&db, "skill_domains", domain, *limit, *json),
         Commands::FindByLanguage { language, limit, json } =>
             cmd_find_by_auxiliary(&db, "skill_languages", language, *limit, *json),
+
+        // ====================================================================
+        // Temporal history index (TRDD-152e697f) — see temporal::* dispatchers.
+        // Each dispatcher prints JSON to stdout and returns (); we wrap in Ok.
+        // ====================================================================
+        Commands::AsOf { date, r#type, scope, scope_path, limit } => {
+            temporal::cli::cmd_as_of(&db, date, r#type.as_deref(),
+                scope.as_deref(), scope_path.as_deref(), *limit);
+            Ok(())
+        }
+        Commands::Timeline { element_id, limit } => {
+            temporal::cli::cmd_timeline(&db, element_id, *limit);
+            Ok(())
+        }
+        Commands::Lifespan { element_id } => {
+            temporal::cli::cmd_lifespan(&db, element_id);
+            Ok(())
+        }
+        Commands::ChangedBetween { start, end, r#type, limit } => {
+            temporal::cli::cmd_changed_between(&db, start, end, r#type.as_deref(), *limit);
+            Ok(())
+        }
+        Commands::RemovedSince { date, limit } => {
+            temporal::cli::cmd_removed_since(&db, date, *limit);
+            Ok(())
+        }
+        Commands::ScanLog { limit } => {
+            temporal::cli::cmd_scan_log(&db, *limit);
+            Ok(())
+        }
+        Commands::DbStats => {
+            temporal::cli::cmd_db_stats(&db);
+            Ok(())
+        }
+        Commands::Reindex { dry_run } => {
+            temporal::cli::cmd_reindex(&db, *dry_run);
+            Ok(())
+        }
+        Commands::PruneHistory { dry_run } => {
+            temporal::cli::cmd_prune_history(&db, *dry_run);
+            Ok(())
+        }
+        Commands::Retention { set } => {
+            temporal::cli::cmd_retention(&db, set.as_deref());
+            Ok(())
+        }
     }
 }
 
