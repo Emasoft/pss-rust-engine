@@ -7279,6 +7279,18 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         // LOC: Software (from software search)
         "software container", "software-defined networking",
         "software deployment", "software configuration",
+        // CI / GitOps tooling — common prompt phrases the user types
+        // when they're talking about DevOps without saying the word
+        // "devops" or "ci/cd". Without these the unit tests
+        // `test_find_matches_with_synonyms` and `test_confidence_levels`
+        // panic (devops-expert skill gets excluded by domain inference
+        // when the prompt is "help me set up github actions").
+        "github actions", "gitlab ci", "circleci", "jenkins",
+        "travis", "argo cd", "argocd", "argo workflows", "flux cd",
+        "github workflow", "ci pipeline", "cd pipeline",
+        "deploy pipeline", "release pipeline", "build pipeline",
+        "helm chart", "helm", "k8s", "podman", "containerd",
+        "docker compose", "compose file",
     ]),
 
     // LOC: Web site development + Document Object Model + Ajax
@@ -7290,6 +7302,18 @@ const DOMAIN_TAXONOMY: &[(&str, &[&str])] = &[
         "ajax", "web application",
         // LOC: Computer programs
         "browser", "html editor",
+        // SPA framework names — when these appear alone in a prompt,
+        // the user is talking about the frontend even if they never type
+        // "frontend" explicitly. See TRDD-014bcc92 — without these
+        // entries, a prompt like "build react component with hooks"
+        // doesn't get the frontend domain inferred and downstream
+        // filters drop frontend-tagged skills.
+        "react", "vue", "vue.js", "angular", "svelte", "preact",
+        "solid", "solid.js", "ember", "ember.js", "qwik", "lit",
+        "next.js", "nuxt", "remix", "astro", "gatsby",
+        // Frontend toolkit terms commonly seen without "frontend"
+        "jsx", "tsx", "shadcn", "tailwind", "tailwindcss",
+        "storybook", "vite", "esbuild", "rollup",
     ]),
 
     // LOC: Database management + Service-oriented architecture
@@ -7720,10 +7744,23 @@ fn find_matches(
         ("pytorch", "python"), ("pandas", "python"), ("numpy", "python"),
         ("scikit", "python"), ("pytest", "python"), ("ruff", "python"),
         ("jupyter", "python"), ("scipy", "python"), ("matplotlib", "python"),
+        // Major SPA framework names ALONE imply JavaScript/TypeScript
+        // even when the user never types the word "javascript". Without
+        // these entries the LANGUAGE CONFLICT GATE (find_matches around
+        // main.rs:8997) excludes any react/vue/angular skill from
+        // prompts that don't spell out the language. See TRDD-014bcc92.
+        ("react", "javascript"), ("vue", "javascript"),
+        ("angular", "javascript"),
         ("react-native", "javascript"), ("nextjs", "javascript"),
-        ("vuejs", "javascript"), ("angular", "javascript"),
+        ("vuejs", "javascript"),
         ("svelte", "javascript"), ("nestjs", "javascript"),
         ("express-", "javascript"), ("webpack", "javascript"),
+        ("nuxt", "javascript"), ("remix", "javascript"),
+        ("solid", "javascript"), ("astro", "javascript"),
+        ("ember", "javascript"), ("preact", "javascript"),
+        // JSX/TSX file extensions are the strongest "this is a frontend
+        // SPA" signal short of the language name itself.
+        ("jsx", "javascript"), ("tsx", "typescript"),
         ("rails", "ruby"), ("rspec", "ruby"),
         ("cargo", "rust"),
         ("gopls", "go"), ("goroutine", "go"),
@@ -7798,6 +7835,18 @@ fn find_matches(
         // Web (universal — not a filter, just detection)
         ("web-app", "web"), ("webapp", "web"), ("browser", "web"),
         ("pwa", "web"), ("service-worker", "web"),
+        // SPA frameworks imply the web platform. Without these the
+        // PLATFORM CONFLICT GATE silently excludes web-tagged skills
+        // when the user prompts something like "build a react component"
+        // (no explicit "web" / "browser" word). See TRDD-014bcc92.
+        ("react", "web"), ("vue", "web"), ("angular", "web"),
+        ("svelte", "web"), ("preact", "web"), ("solid", "web"),
+        ("ember", "web"), ("astro", "web"), ("remix", "web"),
+        ("nextjs", "web"), ("next.js", "web"),
+        ("nuxt", "web"), ("nuxt.js", "web"),
+        ("gatsby", "web"), ("vite", "web"), ("webpack", "web"),
+        ("jsx", "web"), ("tsx", "web"),
+        ("html", "web"), ("css", "web"), ("dom", "web"),
         // Desktop
         ("electron", "desktop"), ("tauri", "desktop"),
         ("qt", "desktop"), ("gtk", "desktop"), ("wxwidgets", "desktop"),
@@ -9000,6 +9049,10 @@ fn find_matches(
         {
             if expanded_prompt_langs.is_empty() {
                 // No language signal at all — exclude language-specific skills
+                debug!(
+                    "Skill '{}': EXCLUDED by LANGUAGE CONFLICT GATE (skill langs: {:?}, prompt langs: empty)",
+                    name, entry.languages
+                );
                 return None;
             }
             let has_lang_overlap = entry.languages.iter().any(|el| {
@@ -9007,6 +9060,10 @@ fn find_matches(
             });
             if !has_lang_overlap {
                 // Language mismatch — binary exclusion
+                debug!(
+                    "Skill '{}': EXCLUDED by LANGUAGE CONFLICT GATE (skill langs: {:?}, prompt langs: {:?})",
+                    name, entry.languages, expanded_prompt_langs
+                );
                 return None;
             }
         } else if entry.languages.is_empty() && !expanded_prompt_langs.is_empty() {
@@ -9048,6 +9105,10 @@ fn find_matches(
         {
             if expanded_prompt_platforms.is_empty() {
                 // Prompt mentions no platform at all — exclude platform-specific skills
+                debug!(
+                    "Skill '{}': EXCLUDED by PLATFORM CONFLICT GATE (skill platforms: {:?}, prompt platforms: empty)",
+                    name, entry.platforms
+                );
                 return None;
             }
             let has_platform_overlap = entry.platforms.iter().any(|ep| {
@@ -9055,6 +9116,10 @@ fn find_matches(
             });
             if !has_platform_overlap {
                 // Platform mismatch — binary exclusion
+                debug!(
+                    "Skill '{}': EXCLUDED by PLATFORM CONFLICT GATE (skill platforms: {:?}, prompt platforms: {:?})",
+                    name, entry.platforms, expanded_prompt_platforms
+                );
                 return None;
             }
         }
@@ -10796,10 +10861,23 @@ fn run_agent_profile(cli: &Cli, profile_path: &str) -> Result<(), SuggesterError
         ("pytorch", "python"), ("pandas", "python"), ("numpy", "python"),
         ("scikit", "python"), ("pytest", "python"), ("ruff", "python"),
         ("jupyter", "python"), ("scipy", "python"), ("matplotlib", "python"),
+        // Major SPA framework names ALONE imply JavaScript/TypeScript
+        // even when the user never types the word "javascript". Without
+        // these entries the LANGUAGE CONFLICT GATE (find_matches around
+        // main.rs:8997) excludes any react/vue/angular skill from
+        // prompts that don't spell out the language. See TRDD-014bcc92.
+        ("react", "javascript"), ("vue", "javascript"),
+        ("angular", "javascript"),
         ("react-native", "javascript"), ("nextjs", "javascript"),
-        ("vuejs", "javascript"), ("angular", "javascript"),
+        ("vuejs", "javascript"),
         ("svelte", "javascript"), ("nestjs", "javascript"),
         ("express-", "javascript"), ("webpack", "javascript"),
+        ("nuxt", "javascript"), ("remix", "javascript"),
+        ("solid", "javascript"), ("astro", "javascript"),
+        ("ember", "javascript"), ("preact", "javascript"),
+        // JSX/TSX file extensions are the strongest "this is a frontend
+        // SPA" signal short of the language name itself.
+        ("jsx", "javascript"), ("tsx", "typescript"),
         ("rails", "ruby"), ("rspec", "ruby"),
         ("cargo", "rust"),
         ("gopls", "go"),
