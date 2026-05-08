@@ -602,6 +602,168 @@ enum Commands {
         #[arg(long, value_name = "DURATION")]
         set: Option<String>,
     },
+
+    // ---------- Phase-2 secondary lifecycle queries (TRDD §9.1) ----------
+
+    /// Snapshot of an element at a point in time.
+    /// `pss show <ELEMENT_ID> --as-of <DATE>`
+    Show {
+        /// Element id (`<type>:<name>@<scope>:<scope_path_slug>`).
+        element_id: String,
+        /// Date or shorthand (`now`, `yesterday`, `YYYY-MM-DD`, RFC3339).
+        #[arg(long, value_name = "DATE", default_value = "now")]
+        as_of: String,
+    },
+
+    /// File size of an element at a point in time.
+    /// `pss size-at <ELEMENT_ID> --as-of <DATE>`
+    #[command(name = "size-at")]
+    SizeAt {
+        element_id: String,
+        #[arg(long, value_name = "DATE", default_value = "now")]
+        as_of: String,
+    },
+
+    /// Token count of an element at a point in time (cl100k approximation).
+    /// `pss tokens-at <ELEMENT_ID> --as-of <DATE>`
+    #[command(name = "tokens-at")]
+    TokensAt {
+        element_id: String,
+        #[arg(long, value_name = "DATE", default_value = "now")]
+        as_of: String,
+    },
+
+    /// Diff snapshots of an element between two dates.
+    /// `pss diff <ELEMENT_ID> <DATE1> <DATE2>`
+    Diff {
+        element_id: String,
+        date1: String,
+        date2: String,
+    },
+
+    /// Every install event in a time window.
+    /// `pss installed-between <START> <END>`
+    #[command(name = "installed-between")]
+    InstalledBetween {
+        start: String,
+        end: String,
+        /// Optional element-type filter.
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
+    /// Every removal event in a time window.
+    /// `pss removed-between <START> <END>`
+    #[command(name = "removed-between")]
+    RemovedBetween {
+        start: String,
+        end: String,
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
+    /// Elements that ever existed but aren't currently present.
+    /// Synonym: `never-current`. `pss currently-missing-but-once-was`
+    #[command(name = "currently-missing-but-once-was")]
+    CurrentlyMissing {
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
+    /// Alias for `currently-missing-but-once-was`.
+    #[command(name = "never-current")]
+    NeverCurrent {
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
+    /// Find the same name living at multiple scopes simultaneously.
+    /// `pss multi-scope <NAME>`
+    #[command(name = "multi-scope")]
+    MultiScope {
+        name: String,
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+    },
+
+    /// Override start/end events for one element.
+    /// `pss override-history <ELEMENT_ID>`
+    #[command(name = "override-history")]
+    OverrideHistory {
+        element_id: String,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+
+    /// Enable/disable events for one element.
+    /// `pss enable-history <ELEMENT_ID>`
+    #[command(name = "enable-history")]
+    EnableHistory {
+        element_id: String,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+
+    /// Scope_moved events for a name.
+    /// `pss scope-moves <NAME>`
+    #[command(name = "scope-moves")]
+    ScopeMoves {
+        name: String,
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+
+    /// All marketplace_added / marketplace_removed events.
+    /// `pss marketplace-history`
+    #[command(name = "marketplace-history")]
+    MarketplaceHistory {
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
+    /// All events for one plugin name (across versions / scopes).
+    /// `pss plugin-history <PLUGIN_NAME>`
+    #[command(name = "plugin-history")]
+    PluginHistory {
+        plugin_name: String,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
+    /// Read JSONL observations from stdin and emit temporal events.
+    /// One JSON object per line; each line is one observation produced by
+    /// `pss_discover.py --jsonl`. For every observation, this subcommand
+    /// reads `elements_state` for the corresponding element_id, calls
+    /// `compare_and_emit()`, persists any resulting events into the
+    /// `events` table, and refreshes `elements_state`. After the stream
+    /// ends, it issues a single `removed` event per element_id that is
+    /// `exists=true` in `elements_state` for one of the visited
+    /// scope_paths but was NOT observed in this scan. Finally, it records
+    /// a `scan_runs` row.
+    ///
+    /// This is the only writer of the `events` table during normal
+    /// reindex flow. Wired into `pss_reindex.py` after the existing
+    /// merge-queue stage so the JSONL stream is consumed twice (once by
+    /// the legacy skills-table writer, once here).
+    #[command(name = "merge-events")]
+    MergeEvents {
+        /// Read JSONL from stdin (default).
+        #[arg(long, default_value_t = true)]
+        batch_stdin: bool,
+        /// Suppress per-line stats; print only the final scan summary.
+        #[arg(long, default_value_t = false)]
+        quiet: bool,
+    },
 }
 
 // ============================================================================
@@ -14672,6 +14834,73 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
         }
         Commands::PruneHistory { dry_run } => {
             temporal::cli::cmd_prune_history(&db, *dry_run);
+            Ok(())
+        }
+        Commands::Show { element_id, as_of } => {
+            temporal::cli::cmd_show_at(&db, element_id, as_of);
+            Ok(())
+        }
+        Commands::SizeAt { element_id, as_of } => {
+            temporal::cli::cmd_size_at(&db, element_id, as_of);
+            Ok(())
+        }
+        Commands::TokensAt { element_id, as_of } => {
+            temporal::cli::cmd_tokens_at(&db, element_id, as_of);
+            Ok(())
+        }
+        Commands::Diff { element_id, date1, date2 } => {
+            temporal::cli::cmd_diff(&db, element_id, date1, date2);
+            Ok(())
+        }
+        Commands::InstalledBetween { start, end, r#type, limit } => {
+            temporal::cli::cmd_installed_between(
+                &db, start, end, r#type.as_deref(), *limit,
+            );
+            Ok(())
+        }
+        Commands::RemovedBetween { start, end, r#type, limit } => {
+            temporal::cli::cmd_removed_between(
+                &db, start, end, r#type.as_deref(), *limit,
+            );
+            Ok(())
+        }
+        Commands::CurrentlyMissing { r#type, limit }
+        | Commands::NeverCurrent { r#type, limit } => {
+            temporal::cli::cmd_currently_missing(&db, r#type.as_deref(), *limit);
+            Ok(())
+        }
+        Commands::MultiScope { name, r#type } => {
+            temporal::cli::cmd_multi_scope(&db, name, r#type.as_deref());
+            Ok(())
+        }
+        Commands::OverrideHistory { element_id, limit } => {
+            temporal::cli::cmd_override_history(&db, element_id, *limit);
+            Ok(())
+        }
+        Commands::EnableHistory { element_id, limit } => {
+            temporal::cli::cmd_enable_history(&db, element_id, *limit);
+            Ok(())
+        }
+        Commands::ScopeMoves { name, r#type, limit } => {
+            temporal::cli::cmd_scope_moves(&db, name, r#type.as_deref(), *limit);
+            Ok(())
+        }
+        Commands::MarketplaceHistory { limit } => {
+            temporal::cli::cmd_marketplace_history(&db, *limit);
+            Ok(())
+        }
+        Commands::PluginHistory { plugin_name, limit } => {
+            temporal::cli::cmd_plugin_history(&db, plugin_name, *limit);
+            Ok(())
+        }
+        Commands::MergeEvents { batch_stdin: _, quiet } => {
+            // Always reads stdin in this Phase-2 wiring; batch_stdin is the
+            // only mode for now (kept as a flag so future versions can add
+            // file-based input without breaking the CLI surface).
+            if let Err(e) = temporal::cli::cmd_merge_events(&db, *quiet) {
+                eprintln!("merge-events failed: {}", e);
+                std::process::exit(1);
+            }
             Ok(())
         }
         Commands::Retention { set } => {

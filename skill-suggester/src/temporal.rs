@@ -849,22 +849,15 @@ pub mod cli {
         limit: usize,
     ) {
         let cutoff = resolve_date(date);
-        // Strategy: walk events table, find for each element_id the event
-        // with the highest observed_at <= cutoff. If that event was a
-        // `removed`, the element wasn't present at cutoff. Otherwise it
-        // was. Filter by element_type / scope / scope_path if requested.
+        // Strategy: walk elements_state to find every element_id that's
+        // ever existed; for each, look up its latest event at-or-before
+        // cutoff. Two-step query is safer than max() in head — Cozo's
+        // aggregate raises "Evaluation of expression failed" when
+        // combined with non-aggregated columns in some versions.
         let q = r#"
-            ?[element_id, max_observed_at] :=
-                *events{element_id, observed_at},
-                observed_at <= $cutoff,
-                max_observed_at = max(observed_at)
-            :order -max_observed_at
-            :limit $limit
+            ?[element_id] := *elements_state{element_id}
         "#;
-        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
-        params.insert("cutoff".into(), DataValue::Str(cutoff.into()));
-        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
-        let rows = match db.run_script(q, params, ScriptMutability::Immutable) {
+        let rows = match db.run_script(q, BTreeMap::new(), ScriptMutability::Immutable) {
             Ok(r) => r.rows,
             Err(e) => {
                 eprintln!("as-of query failed: {}", e);
@@ -872,29 +865,40 @@ pub mod cli {
                 return;
             }
         };
-        // For each (element_id, max_observed_at), fetch the event row to
-        // see if it was a `removed` and to filter by type/scope.
+        if rows.is_empty() {
+            eprintln!("as-of: elements_state is empty (no elements ever observed)");
+            println!("[]");
+            return;
+        }
+        // Cap to `limit` rows — we may not need all of them.
+        let rows: Vec<_> = rows.into_iter().take(limit).collect();
+        // For each element_id, fetch its latest event at-or-before cutoff
+        // and inspect that. If the event was a `removed`, the element
+        // wasn't present at cutoff. Otherwise it was. Filter by
+        // element_type / scope / scope_path if requested.
         let mut out: Vec<JsonValue> = Vec::new();
         for row in rows {
-            if row.len() < 2 {
+            if row.is_empty() {
                 continue;
             }
             let eid = match &row[0] {
                 DataValue::Str(s) => s.to_string(),
                 _ => continue,
             };
-            let obs_at = match &row[1] {
-                DataValue::Str(s) => s.to_string(),
-                _ => continue,
-            };
             let mut p: BTreeMap<String, DataValue> = BTreeMap::new();
             p.insert("eid".into(), DataValue::Str(eid.clone().into()));
-            p.insert("obs_at".into(), DataValue::Str(obs_at.into()));
+            p.insert("cutoff".into(), DataValue::Str(cutoff.clone().into()));
+            // Cozo requires sort keys to appear in the output projection,
+            // so observed_at is included even though we only need it for
+            // sorting. row[10] is ignored downstream.
             let detail_q = r#"
-                ?[event_type, element_type, element_name, scope, scope_path, path, content_hash, file_size, token_count, enabled] :=
-                    *events{element_id: $eid, observed_at: $obs_at,
+                ?[event_type, element_type, element_name, scope, scope_path, path, content_hash, file_size, token_count, enabled, observed_at] :=
+                    *events{element_id: $eid, observed_at,
                             event_type, element_type, element_name, scope, scope_path,
-                            path, content_hash, file_size, token_count, enabled}
+                            path, content_hash, file_size, token_count, enabled},
+                    observed_at <= $cutoff
+                :order -observed_at
+                :limit 1
             "#;
             if let Ok(d) = db.run_script(detail_q, p, ScriptMutability::Immutable) {
                 if let Some(r) = d.rows.first() {
@@ -1379,6 +1383,1140 @@ pub mod cli {
                 "cutoff": cutoff,
             })
         );
+    }
+
+    // ============================================================
+    // merge-events: the only event writer in the normal reindex flow.
+    // ============================================================
+
+    /// Map a JSONL `type` field to an `ElementType`. Returns None for
+    /// unknown values (the caller skips the row rather than guessing).
+    fn parse_element_type(s: &str) -> Option<ElementType> {
+        match s {
+            "skill" => Some(ElementType::Skill),
+            "agent" => Some(ElementType::Agent),
+            "command" => Some(ElementType::Command),
+            "rule" => Some(ElementType::Rule),
+            "mcp" => Some(ElementType::Mcp),
+            "lsp" => Some(ElementType::Lsp),
+            "hook" => Some(ElementType::Hook),
+            "plugin" => Some(ElementType::Plugin),
+            "channel" => Some(ElementType::Channel),
+            "monitor" => Some(ElementType::Monitor),
+            "output-style" => Some(ElementType::OutputStyle),
+            "theme" => Some(ElementType::Theme),
+            "marketplace" => Some(ElementType::Marketplace),
+            _ => None,
+        }
+    }
+
+    /// Map a discovery `source` field to a canonical scope name.
+    /// `"user"` → `"user"`, `"project"` (or `"project:<name>"`) → `"project"`,
+    /// `"local"` → `"local"`, `"plugin:..."` → `"plugin"`,
+    /// `"marketplace:..."` → `"marketplace"`. Returns the source verbatim
+    /// for unknown forms so we never silently lose data.
+    fn scope_from_discovery_source(source: &str) -> String {
+        if source == "user" || source.starts_with("user:") {
+            "user".to_string()
+        } else if source == "project" || source.starts_with("project:") {
+            "project".to_string()
+        } else if source == "local" || source.starts_with("local:") {
+            "local".to_string()
+        } else if source.starts_with("plugin:") {
+            "plugin".to_string()
+        } else if source.starts_with("marketplace:") {
+            "marketplace".to_string()
+        } else if source == "built-in" {
+            "user".to_string() // LSP servers from the registry
+        } else {
+            source.to_string()
+        }
+    }
+
+    /// For a discovery record, derive the scope_path that goes into the
+    /// element_id. For project-scoped records that include a project
+    /// name (`project:foo`) we use the project name as the slug; for
+    /// plugin-scoped records (`plugin:<marketplace>/<name>`) we use that
+    /// composite. Empty string for global scopes (user, marketplace).
+    fn scope_path_from_discovery_source(source: &str) -> String {
+        if let Some(rest) = source.strip_prefix("project:") {
+            rest.to_string()
+        } else if let Some(rest) = source.strip_prefix("local:") {
+            rest.to_string()
+        } else if let Some(rest) = source.strip_prefix("plugin:") {
+            rest.to_string()
+        } else if let Some(rest) = source.strip_prefix("user:") {
+            rest.to_string()
+        } else if let Some(rest) = source.strip_prefix("marketplace:") {
+            rest.to_string()
+        } else {
+            "".to_string()
+        }
+    }
+
+    /// Compute the canonical content blob for hashing an element. For
+    /// file-based types we return the file bytes. For synthetic types
+    /// (hook / plugin / marketplace / mcp / lsp / channel) we hash a
+    /// canonical JSON of the discovery record so reorders don't fire
+    /// spurious changes but real edits do.
+    fn canonical_content(record: &serde_json::Value, path: &str) -> Vec<u8> {
+        // Strip the JSON-pointer fragment for synthetic locators
+        // (e.g. `/path/to/settings.json#hooks.X[0]`).
+        let real_path = match path.find('#') {
+            Some(idx) => &path[..idx],
+            None => path,
+        };
+        // For file-based elements, hash the actual bytes — a description
+        // tweak in the JSONL record shouldn't fire ContentChanged when
+        // the file is untouched.
+        let is_file_type = matches!(
+            record.get("type").and_then(|v| v.as_str()),
+            Some("skill") | Some("agent") | Some("command") | Some("rule")
+                | Some("output-style") | Some("theme") | Some("monitor")
+        );
+        if is_file_type && !real_path.is_empty() {
+            if let Ok(b) = std::fs::read(real_path) {
+                return b;
+            }
+        }
+        // Synthetic / unreadable: hash a canonical JSON of the record.
+        // We strip volatile fields (description, use_context, preview)
+        // first — those are derived metadata, not the element's
+        // identity. Bumping them shouldn't fire ContentChanged.
+        let mut clone = record.clone();
+        if let Some(obj) = clone.as_object_mut() {
+            for k in &["description", "use_context", "preview", "first_indexed_at",
+                       "last_updated_at", "plugin_installed_at"] {
+                obj.remove(*k);
+            }
+        }
+        let canonical = canonical_json(&clone);
+        canonical.into_bytes()
+    }
+
+    /// Render a JSON value as canonical (sorted-key) string. Recursive,
+    /// stable across runs. Used for synthetic element hashing.
+    fn canonical_json(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let parts: Vec<String> = keys
+                    .into_iter()
+                    .map(|k| format!("{}:{}", k, canonical_json(&map[k])))
+                    .collect();
+                format!("{{{}}}", parts.join(","))
+            }
+            serde_json::Value::Array(arr) => {
+                let parts: Vec<String> = arr.iter().map(canonical_json).collect();
+                format!("[{}]", parts.join(","))
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// Read the full PriorState row for a given element_id from
+    /// elements_state, or None if absent.
+    fn read_prior(db: &DbInstance, element_id: &str) -> Option<PriorState> {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(element_id.into()));
+        let q = r#"
+            ?[current_path, current_hash, current_size, enabled, override_status, exists] :=
+                *elements_state{element_id: $eid, current_path, current_hash,
+                                current_size, enabled, override_status, exists}
+        "#;
+        let rows = db
+            .run_script(q, params, ScriptMutability::Immutable)
+            .ok()?
+            .rows;
+        let r = rows.first()?;
+        Some(PriorState {
+            element_id: element_id.to_string(),
+            current_path: data_str(&r[0]),
+            current_hash: data_str(&r[1]),
+            current_size: r[2].get_int().unwrap_or(-1),
+            enabled: matches!(&r[3], DataValue::Bool(true)),
+            override_status: data_str(&r[4]),
+            exists: !matches!(&r[5], DataValue::Bool(false)),
+        })
+    }
+
+    /// Insert one event row + upsert the corresponding elements_state row.
+    /// The two writes happen sequentially under the caller's lock; the
+    /// merge-events orchestrator never partially commits because the
+    /// transaction is bounded by the binary's lifetime.
+    #[allow(clippy::too_many_arguments)]
+    fn persist_event_and_state(
+        db: &DbInstance,
+        scan_id: &str,
+        observed_at: &str,
+        event_type: EventType,
+        obs: &Observation,
+        diff_json: &str,
+        update_state: bool,
+    ) -> Result<(), String> {
+        use cozo::Num;
+        let event_id = ulid::Ulid::new().to_string();
+        let element_id = obs.element_id();
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("event_id".into(), DataValue::Str(event_id.clone().into()));
+        params.insert("observed_at".into(), DataValue::Str(observed_at.into()));
+        params.insert("scan_id".into(), DataValue::Str(scan_id.into()));
+        params.insert(
+            "event_type".into(),
+            DataValue::Str(event_type.as_str().into()),
+        );
+        params.insert(
+            "element_type".into(),
+            DataValue::Str(obs.element_type.as_str().into()),
+        );
+        params.insert("element_name".into(), DataValue::Str(obs.name.clone().into()));
+        params.insert("element_id".into(), DataValue::Str(element_id.clone().into()));
+        params.insert("scope".into(), DataValue::Str(obs.scope.clone().into()));
+        params.insert("scope_path".into(), DataValue::Str(obs.scope_path.clone().into()));
+        params.insert("source".into(), DataValue::Str(obs.source.clone().into()));
+        params.insert("path".into(), DataValue::Str(obs.path.clone().into()));
+        params.insert(
+            "content_hash".into(),
+            DataValue::Str(obs.content_hash.clone().into()),
+        );
+        params.insert("file_size".into(), DataValue::Num(Num::Int(obs.file_size)));
+        params.insert(
+            "token_count".into(),
+            DataValue::Num(Num::Int(obs.token_count)),
+        );
+        params.insert("enabled".into(), DataValue::Bool(obs.enabled));
+        params.insert("override_status".into(), DataValue::Str("active".into()));
+        params.insert("diff_json".into(), DataValue::Str(diff_json.into()));
+        params.insert("snapshot_ref".into(), DataValue::Str("".into()));
+
+        let event_q = r#"?[event_id, observed_at, scan_id, event_type, element_type, element_name, element_id, scope, scope_path, source, path, content_hash, file_size, token_count, enabled, override_status, diff_json, snapshot_ref] <-
+            [[$event_id, $observed_at, $scan_id, $event_type, $element_type, $element_name, $element_id, $scope, $scope_path, $source, $path, $content_hash, $file_size, $token_count, $enabled, $override_status, $diff_json, $snapshot_ref]]
+           :put events { event_id => observed_at, scan_id, event_type, element_type, element_name, element_id, scope, scope_path, source, path, content_hash, file_size, token_count, enabled, override_status, diff_json, snapshot_ref }"#;
+        db.run_script(event_q, params, ScriptMutability::Mutable)
+            .map_err(|e| format!("event insert failed: {}", e))?;
+
+        if !update_state {
+            return Ok(());
+        }
+        // Upsert elements_state. installed_at: keep prior if any (we read
+        // it back — if the event_type is `removed` or the prior row
+        // existed we preserve installed_at; if this is a new install, we
+        // use observed_at).
+        let prior_installed_at = read_installed_at(db, &element_id)
+            .unwrap_or_else(|| observed_at.to_string());
+        let exists = !matches!(event_type, EventType::Removed);
+        let mut state_params: BTreeMap<String, DataValue> = BTreeMap::new();
+        state_params.insert("element_id".into(), DataValue::Str(element_id.clone().into()));
+        state_params.insert("last_event_id".into(), DataValue::Str(event_id.clone().into()));
+        state_params.insert("current_path".into(), DataValue::Str(obs.path.clone().into()));
+        state_params.insert(
+            "current_hash".into(),
+            DataValue::Str(obs.content_hash.clone().into()),
+        );
+        state_params.insert("current_size".into(), DataValue::Num(Num::Int(obs.file_size)));
+        state_params.insert(
+            "current_token_count".into(),
+            DataValue::Num(Num::Int(obs.token_count)),
+        );
+        state_params.insert("enabled".into(), DataValue::Bool(obs.enabled));
+        state_params.insert("override_status".into(), DataValue::Str("active".into()));
+        state_params.insert("installed_at".into(), DataValue::Str(prior_installed_at.into()));
+        state_params.insert("last_changed_at".into(), DataValue::Str(observed_at.into()));
+        state_params.insert("exists".into(), DataValue::Bool(exists));
+
+        let state_q = r#"?[element_id, last_event_id, current_path, current_hash, current_size, current_token_count, enabled, override_status, installed_at, last_changed_at, exists] <-
+            [[$element_id, $last_event_id, $current_path, $current_hash, $current_size, $current_token_count, $enabled, $override_status, $installed_at, $last_changed_at, $exists]]
+           :put elements_state { element_id => last_event_id, current_path, current_hash, current_size, current_token_count, enabled, override_status, installed_at, last_changed_at, exists }"#;
+        db.run_script(state_q, state_params, ScriptMutability::Mutable)
+            .map_err(|e| format!("state upsert failed: {}", e))?;
+        Ok(())
+    }
+
+    /// Read the installed_at timestamp for an element if present.
+    /// Used to preserve install anchor across content_changed/size_changed
+    /// events without losing it on every upsert.
+    fn read_installed_at(db: &DbInstance, element_id: &str) -> Option<String> {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(element_id.into()));
+        let q = r#"?[installed_at] := *elements_state{element_id: $eid, installed_at}"#;
+        db.run_script(q, params, ScriptMutability::Immutable)
+            .ok()
+            .and_then(|r| r.rows.first().cloned())
+            .and_then(|row| match row.first() {
+                Some(DataValue::Str(s)) => Some(s.to_string()),
+                _ => None,
+            })
+    }
+
+    /// `pss merge-events` — Phase-2 wiring. Reads JSONL observations from
+    /// stdin and emits events. This is the ONLY writer of `events` and
+    /// `elements_state` during normal reindex flow.
+    pub fn cmd_merge_events(db: &DbInstance, quiet: bool) -> Result<(), String> {
+        use std::collections::{HashMap, HashSet};
+        use std::io::{BufRead, BufReader};
+
+        ensure_schema(db)?;
+
+        let scan_id = ulid::Ulid::new().to_string();
+        let started_at = chrono::Utc::now().to_rfc3339();
+        let mut observed_eids: HashSet<String> = HashSet::new();
+        let mut visited_scope_paths: HashSet<String> = HashSet::new();
+        let mut events_emitted: u64 = 0;
+        let mut lines_read: u64 = 0;
+        // Group observations per (element_type, name) so override
+        // resolution sees all candidates before deciding the active row.
+        let mut by_type_and_name: HashMap<(String, String), Vec<Observation>> = HashMap::new();
+
+        let stdin = std::io::stdin();
+        let reader = BufReader::new(stdin.lock());
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => return Err(format!("read line failed: {}", e)),
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            lines_read += 1;
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue, // tolerate malformed lines
+            };
+            let etype_str = value
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let element_type = match parse_element_type(etype_str) {
+                Some(t) => t,
+                None => continue, // unknown type — skip
+            };
+            let name = value
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let source = value
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("user")
+                .to_string();
+            let path = value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let description = value
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let scope = scope_from_discovery_source(&source);
+            let scope_path = scope_path_from_discovery_source(&source);
+
+            // Compute content metrics. canonical_content() handles
+            // file-vs-synthetic logic. token_count is best-effort: only
+            // computed when we have UTF-8 text bytes.
+            let bytes = canonical_content(&value, &path);
+            let file_size = bytes.len() as i64;
+            let content_hash_str = content_hash(&bytes);
+            let token_count = match std::str::from_utf8(&bytes) {
+                Ok(s) => token_count_cl100k(s),
+                Err(_) => -1,
+            };
+
+            let obs = Observation {
+                element_type,
+                name,
+                scope,
+                scope_path: scope_path.clone(),
+                source,
+                path,
+                content_hash: content_hash_str,
+                file_size,
+                token_count,
+                description,
+                enabled: true,
+            };
+            observed_eids.insert(obs.element_id());
+            visited_scope_paths.insert(scope_path);
+            let key = (
+                element_type.as_str().to_string(),
+                obs.name.clone(),
+            );
+            by_type_and_name.entry(key).or_default().push(obs);
+        }
+
+        // Emit events for every observation.
+        for (_, observations) in &by_type_and_name {
+            for obs in observations {
+                let prior = read_prior(db, &obs.element_id());
+                let evts = compare_and_emit(prior.as_ref(), obs);
+                for evt in evts {
+                    let diff = serde_json::json!({
+                        "description": obs.description,
+                        "event": evt.as_str(),
+                    })
+                    .to_string();
+                    persist_event_and_state(
+                        db, &scan_id, &started_at, evt, obs, &diff, true,
+                    )?;
+                    events_emitted += 1;
+                }
+                // If no events fired (unchanged), still refresh
+                // last_changed_at? No — the spec says events table is
+                // append-only and elements_state is materialized FROM
+                // events. Skipping is correct.
+            }
+        }
+
+        // Detect removals: anything in elements_state with exists=true
+        // whose scope_path is in visited_scope_paths but whose
+        // element_id was NOT observed this scan.
+        let prior_active = read_active_in_scope_paths(db, &visited_scope_paths)?;
+        let removed = detect_removals(&prior_active, &observed_eids);
+        for eid in &removed {
+            // Read the prior obs metadata to attach to the removal event.
+            let prior_meta = read_prior_meta_for_removal(db, eid);
+            if let Some(meta) = prior_meta {
+                let diff = serde_json::json!({
+                    "event": "removed",
+                    "previous_path": meta.path,
+                })
+                .to_string();
+                persist_event_and_state(
+                    db,
+                    &scan_id,
+                    &started_at,
+                    EventType::Removed,
+                    &meta,
+                    &diff,
+                    true,
+                )?;
+                events_emitted += 1;
+            }
+        }
+
+        // Record the scan_runs row.
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let scope_paths_json: String = serde_json::to_string(
+            &visited_scope_paths.iter().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+        use cozo::Num;
+        let mut scan_params: BTreeMap<String, DataValue> = BTreeMap::new();
+        scan_params.insert("scan_id".into(), DataValue::Str(scan_id.clone().into()));
+        scan_params.insert("started_at".into(), DataValue::Str(started_at.into()));
+        scan_params.insert("finished_at".into(), DataValue::Str(finished_at.into()));
+        scan_params.insert(
+            "scope_paths_json".into(),
+            DataValue::Str(scope_paths_json.into()),
+        );
+        scan_params.insert(
+            "events_emitted".into(),
+            DataValue::Num(Num::Int(events_emitted as i64)),
+        );
+        scan_params.insert(
+            "rust_binary_version".into(),
+            DataValue::Str(env!("CARGO_PKG_VERSION").into()),
+        );
+        scan_params.insert(
+            "pss_version".into(),
+            DataValue::Str(env!("CARGO_PKG_VERSION").into()),
+        );
+        let scan_q = r#"?[scan_id, started_at, finished_at, scope_paths_json, events_emitted, rust_binary_version, pss_version] <-
+            [[$scan_id, $started_at, $finished_at, $scope_paths_json, $events_emitted, $rust_binary_version, $pss_version]]
+           :put scan_runs { scan_id => started_at, finished_at, scope_paths_json, events_emitted, rust_binary_version, pss_version }"#;
+        db.run_script(scan_q, scan_params, ScriptMutability::Mutable)
+            .map_err(|e| format!("scan_runs insert failed: {}", e))?;
+
+        if !quiet {
+            eprintln!(
+                "[merge-events] scan_id={} lines={} events={} removed={} scopes={}",
+                scan_id,
+                lines_read,
+                events_emitted,
+                removed.len(),
+                visited_scope_paths.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Read element_ids that are currently `exists=true` in the given
+    /// set of scope_paths. Used by removal detection.
+    fn read_active_in_scope_paths(
+        db: &DbInstance,
+        scope_paths: &std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        // We can't parameterise an IN clause in Cozo as cleanly as SQL;
+        // walk the table once and filter in Rust. For ≤100k elements
+        // this is fine.
+        let q = r#"
+            ?[element_id, scope_path] :=
+                *elements_state{element_id, scope_path, exists: true}
+        "#;
+        // Note: scope_path lives in the events table, not elements_state.
+        // elements_state has installed_at + last_changed_at + the latest
+        // hash/size, but no scope_path. We resolve scope_path from the
+        // most recent event for each element_id.
+        let _ = q; // silence unused warning if we change strategy below.
+
+        let q = r#"
+            ?[element_id] := *elements_state{element_id, exists: true}
+        "#;
+        let rows = db
+            .run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+            .map_err(|e| format!("active query failed: {}", e))?
+            .rows;
+        let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in rows {
+            let eid = match row.first() {
+                Some(DataValue::Str(s)) => s.to_string(),
+                _ => continue,
+            };
+            // Resolve scope_path from the most recent event for this eid.
+            // Use :order -observed_at :limit 1 instead of max() so we
+            // handle the empty-result case (no events for this eid) without
+            // raising "Evaluation of expression failed".
+            let mut p: BTreeMap<String, DataValue> = BTreeMap::new();
+            p.insert("eid".into(), DataValue::Str(eid.clone().into()));
+            // Cozo requires sort keys to appear in the output projection.
+            // observed_at is in the head solely for :order — row[1] is
+            // ignored downstream.
+            let scope_q = r#"
+                ?[scope_path, observed_at] :=
+                    *events{element_id: $eid, scope_path, observed_at}
+                :order -observed_at
+                :limit 1
+            "#;
+            if let Ok(r) = db.run_script(scope_q, p, ScriptMutability::Immutable) {
+                if let Some(row) = r.rows.first() {
+                    let sp = data_str(&row[0]);
+                    if scope_paths.contains(&sp) {
+                        out.insert(eid);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read enough metadata about a previously-existing element to emit
+    /// a `removed` event for it. Returns None if no prior event row.
+    /// Uses :order/:limit instead of max() so empty-result cases don't
+    /// raise "Evaluation of expression failed".
+    fn read_prior_meta_for_removal(db: &DbInstance, element_id: &str) -> Option<Observation> {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(element_id.into()));
+        // Cozo requires sort keys to appear in the output projection.
+        // observed_at is included in the head only for :order; downstream
+        // ignores it.
+        let q = r#"
+            ?[element_type, element_name, scope, scope_path, source, path,
+              content_hash, file_size, token_count, observed_at] :=
+                *events{element_id: $eid, observed_at, element_type, element_name,
+                        scope, scope_path, source, path, content_hash,
+                        file_size, token_count}
+            :order -observed_at
+            :limit 1
+        "#;
+        let rows = db.run_script(q, params, ScriptMutability::Immutable).ok()?.rows;
+        let r = rows.first()?;
+        let element_type_str = data_str(&r[0]);
+        let element_type = parse_element_type(&element_type_str)?;
+        Some(Observation {
+            element_type,
+            name: data_str(&r[1]),
+            scope: data_str(&r[2]),
+            scope_path: data_str(&r[3]),
+            source: data_str(&r[4]),
+            path: data_str(&r[5]),
+            content_hash: data_str(&r[6]),
+            file_size: r[7].get_int().unwrap_or(-1),
+            token_count: r[8].get_int().unwrap_or(-1),
+            description: "".to_string(),
+            enabled: true,
+        })
+    }
+
+    // ============================================================
+    // Secondary temporal queries (TRDD §9.1).
+    // All return JSON. All read CozoDB directly — zero LLM calls.
+    // ============================================================
+
+    /// Helper: read the last event for `element_id` whose
+    /// `observed_at <= cutoff`. Returns None if no such event.
+    /// Uses `:order -observed_at :limit 1` instead of an aggregate so
+    /// it works on element_ids that have no events at all (the aggregate
+    /// form raises "Evaluation of expression failed" on empty result).
+    fn read_event_at_or_before(
+        db: &DbInstance,
+        element_id: &str,
+        cutoff: &str,
+    ) -> Option<BTreeMap<String, JsonValue>> {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(element_id.into()));
+        params.insert("cutoff".into(), DataValue::Str(cutoff.into()));
+        let q = r#"
+            ?[event_type, path, content_hash, file_size, token_count, enabled,
+              override_status, observed_at] :=
+                *events{element_id: $eid, observed_at, event_type, path,
+                        content_hash, file_size, token_count, enabled,
+                        override_status},
+                observed_at <= $cutoff
+            :order -observed_at
+            :limit 1
+        "#;
+        let rows = db.run_script(q, params, ScriptMutability::Immutable).ok()?.rows;
+        let r = rows.first()?;
+        let mut out = BTreeMap::new();
+        out.insert("event_type".to_string(), data_to_json(&r[0]));
+        out.insert("path".to_string(), data_to_json(&r[1]));
+        out.insert("content_hash".to_string(), data_to_json(&r[2]));
+        out.insert("file_size".to_string(), data_to_json(&r[3]));
+        out.insert("token_count".to_string(), data_to_json(&r[4]));
+        out.insert("enabled".to_string(), data_to_json(&r[5]));
+        out.insert("override_status".to_string(), data_to_json(&r[6]));
+        out.insert("observed_at".to_string(), data_to_json(&r[7]));
+        Some(out)
+    }
+
+    /// `pss show <ELEMENT_ID> --as-of <DATE>` — full snapshot at a date.
+    pub fn cmd_show_at(db: &DbInstance, element_id: &str, date: &str) {
+        let cutoff = resolve_date(date);
+        match read_event_at_or_before(db, element_id, &cutoff) {
+            Some(snap) => {
+                // If the most recent event was a removal, mark exists=false.
+                let is_removed = matches!(
+                    snap.get("event_type"),
+                    Some(JsonValue::String(s)) if s == "removed"
+                );
+                let mut json: serde_json::Map<String, JsonValue> = serde_json::Map::new();
+                json.insert("element_id".into(), JsonValue::String(element_id.into()));
+                json.insert("as_of".into(), JsonValue::String(cutoff));
+                json.insert("exists".into(), JsonValue::Bool(!is_removed));
+                for (k, v) in snap {
+                    json.insert(k, v);
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&JsonValue::Object(json)).unwrap_or_default()
+                );
+            }
+            None => {
+                println!(
+                    "{}",
+                    json!({
+                        "element_id": element_id,
+                        "as_of": cutoff,
+                        "exists": false,
+                        "note": "no event found at or before this date",
+                    })
+                );
+            }
+        }
+    }
+
+    /// `pss size-at <ELEMENT_ID> --as-of <DATE>` — file_size at a date.
+    pub fn cmd_size_at(db: &DbInstance, element_id: &str, date: &str) {
+        let cutoff = resolve_date(date);
+        let snap = read_event_at_or_before(db, element_id, &cutoff);
+        let size = snap
+            .as_ref()
+            .and_then(|m| m.get("file_size"))
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        let observed_at = snap
+            .as_ref()
+            .and_then(|m| m.get("observed_at"))
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "element_id": element_id,
+                "as_of": cutoff,
+                "file_size": size,
+                "observed_at": observed_at,
+            }))
+            .unwrap_or_default()
+        );
+    }
+
+    /// `pss tokens-at <ELEMENT_ID> --as-of <DATE>` — token_count at a date.
+    pub fn cmd_tokens_at(db: &DbInstance, element_id: &str, date: &str) {
+        let cutoff = resolve_date(date);
+        let snap = read_event_at_or_before(db, element_id, &cutoff);
+        let tokens = snap
+            .as_ref()
+            .and_then(|m| m.get("token_count"))
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        let observed_at = snap
+            .as_ref()
+            .and_then(|m| m.get("observed_at"))
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "element_id": element_id,
+                "as_of": cutoff,
+                "token_count": tokens,
+                "observed_at": observed_at,
+            }))
+            .unwrap_or_default()
+        );
+    }
+
+    /// `pss diff <ELEMENT_ID> <DATE1> <DATE2>` — show the deltas between
+    /// two snapshots of an element.
+    pub fn cmd_diff(db: &DbInstance, element_id: &str, date1: &str, date2: &str) {
+        let c1 = resolve_date(date1);
+        let c2 = resolve_date(date2);
+        let s1 = read_event_at_or_before(db, element_id, &c1);
+        let s2 = read_event_at_or_before(db, element_id, &c2);
+        let mut deltas = serde_json::Map::new();
+        if let (Some(a), Some(b)) = (&s1, &s2) {
+            for k in &["path", "content_hash", "file_size", "token_count", "enabled", "override_status"] {
+                let av = a.get(*k);
+                let bv = b.get(*k);
+                if av != bv {
+                    deltas.insert(
+                        k.to_string(),
+                        json!({"before": av, "after": bv}),
+                    );
+                }
+            }
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "element_id": element_id,
+                "date1": c1,
+                "date2": c2,
+                "snapshot1": s1.as_ref().map(|m| {
+                    let v: serde_json::Map<String, JsonValue> = m.iter()
+                        .map(|(k, v)| (k.clone(), v.clone())).collect();
+                    JsonValue::Object(v)
+                }).unwrap_or(JsonValue::Null),
+                "snapshot2": s2.as_ref().map(|m| {
+                    let v: serde_json::Map<String, JsonValue> = m.iter()
+                        .map(|(k, v)| (k.clone(), v.clone())).collect();
+                    JsonValue::Object(v)
+                }).unwrap_or(JsonValue::Null),
+                "deltas": deltas,
+            }))
+            .unwrap_or_default()
+        );
+    }
+
+    /// `pss installed-between <START> <END> [--type T]` — every install
+    /// event in a time window.
+    pub fn cmd_installed_between(
+        db: &DbInstance,
+        start: &str,
+        end: &str,
+        type_filter: Option<&str>,
+        limit: usize,
+    ) {
+        emit_event_window(db, start, end, "installed", type_filter, limit);
+    }
+
+    /// `pss removed-between <START> <END> [--type T]` — every removal
+    /// event in a time window.
+    pub fn cmd_removed_between(
+        db: &DbInstance,
+        start: &str,
+        end: &str,
+        type_filter: Option<&str>,
+        limit: usize,
+    ) {
+        emit_event_window(db, start, end, "removed", type_filter, limit);
+    }
+
+    /// Internal: filter events table by event_type + window + element_type.
+    fn emit_event_window(
+        db: &DbInstance,
+        start: &str,
+        end: &str,
+        event_type: &str,
+        type_filter: Option<&str>,
+        limit: usize,
+    ) {
+        let s = resolve_date(start);
+        let e = resolve_date(end);
+        let q = r#"
+            ?[observed_at, element_type, element_name, element_id, scope, scope_path,
+              path, content_hash, file_size, token_count] :=
+                *events{observed_at, event_type, element_type, element_name,
+                        element_id, scope, scope_path, path, content_hash,
+                        file_size, token_count},
+                event_type == $etype,
+                observed_at >= $start, observed_at <= $end
+            :order observed_at
+            :limit $limit
+        "#;
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("etype".into(), DataValue::Str(event_type.into()));
+        params.insert("start".into(), DataValue::Str(s.into()));
+        params.insert("end".into(), DataValue::Str(e.into()));
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        match db.run_script(q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let rows: Vec<JsonValue> = r
+                    .rows
+                    .into_iter()
+                    .filter(|row| {
+                        type_filter.is_none_or(|t| {
+                            matches!(&row[1], DataValue::Str(s) if s.as_str() == t)
+                        })
+                    })
+                    .map(|row| {
+                        json!({
+                            "observed_at": data_to_json(&row[0]),
+                            "element_type": data_to_json(&row[1]),
+                            "element_name": data_to_json(&row[2]),
+                            "element_id": data_to_json(&row[3]),
+                            "scope": data_to_json(&row[4]),
+                            "scope_path": data_to_json(&row[5]),
+                            "path": data_to_json(&row[6]),
+                            "content_hash": data_to_json(&row[7]),
+                            "file_size": data_to_json(&row[8]),
+                            "token_count": data_to_json(&row[9]),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                );
+            }
+            Err(err) => eprintln!("event-window query failed: {}", err),
+        }
+    }
+
+    /// `pss currently-missing-but-once-was [--type T]` — element_ids that
+    /// have at least one event but whose elements_state row is
+    /// `exists=false` (or absent). Synonym: `never-current`.
+    ///
+    /// Strategy: walk elements_state for `exists=false` rows, then
+    /// resolve element_type and element_name from the latest event.
+    pub fn cmd_currently_missing(db: &DbInstance, type_filter: Option<&str>, limit: usize) {
+        // Pull element_ids whose elements_state.exists=false. These are
+        // exactly the "once was, currently missing" set.
+        let q = r#"
+            ?[element_id, last_changed_at] :=
+                *elements_state{element_id, exists: false, last_changed_at}
+            :order -last_changed_at
+            :limit $limit
+        "#;
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        let rows = match db.run_script(q, params, ScriptMutability::Immutable) {
+            Ok(r) => r.rows,
+            Err(e) => {
+                eprintln!("currently-missing query failed: {}", e);
+                println!("[]");
+                return;
+            }
+        };
+        let mut out: Vec<JsonValue> = Vec::new();
+        for row in rows {
+            let eid = data_str(&row[0]);
+            let last_seen = data_to_json(&row[1]);
+            // Resolve element_type and element_name from the latest event.
+            let mut p: BTreeMap<String, DataValue> = BTreeMap::new();
+            p.insert("eid".into(), DataValue::Str(eid.clone().into()));
+            // Cozo requires sort keys to appear in the output projection.
+            // observed_at appears in the head solely for :order ordering.
+            let detail_q = r#"
+                ?[element_type, element_name, observed_at] :=
+                    *events{element_id: $eid, element_type, element_name, observed_at}
+                :order -observed_at
+                :limit 1
+            "#;
+            let (etype, ename) = db
+                .run_script(detail_q, p, ScriptMutability::Immutable)
+                .ok()
+                .and_then(|r| r.rows.first().cloned())
+                .map(|row| (data_str(&row[0]), data_to_json(&row[1])))
+                .unwrap_or_else(|| ("".into(), JsonValue::Null));
+            if let Some(t) = type_filter {
+                if etype != t {
+                    continue;
+                }
+            }
+            out.push(json!({
+                "element_id": eid,
+                "element_type": etype,
+                "element_name": ename,
+                "last_seen_at": last_seen,
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&JsonValue::Array(out)).unwrap_or_default()
+        );
+    }
+
+    /// `pss multi-scope <NAME> [--type T]` — find an element name that
+    /// exists at multiple scopes simultaneously.
+    pub fn cmd_multi_scope(
+        db: &DbInstance,
+        name: &str,
+        type_filter: Option<&str>,
+    ) {
+        // Pull every element_id whose name matches AND has elements_state
+        // exists=true. Group by (element_type, name) and emit groups
+        // with size > 1.
+        let q = r#"
+            ?[element_id, element_type, scope, scope_path] :=
+                *events{element_id, element_type, element_name, scope, scope_path,
+                        observed_at},
+                *elements_state{element_id, exists: true},
+                element_name == $name
+        "#;
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        let rows = match db.run_script(q, params, ScriptMutability::Immutable) {
+            Ok(r) => r.rows,
+            Err(e) => {
+                eprintln!("multi-scope query failed: {}", e);
+                println!("[]");
+                return;
+            }
+        };
+        // Dedupe on element_id and group by element_type.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut by_type: std::collections::HashMap<String, Vec<JsonValue>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let eid = data_str(&row[0]);
+            if seen.contains(&eid) {
+                continue;
+            }
+            seen.insert(eid.clone());
+            let etype = data_str(&row[1]);
+            if let Some(t) = type_filter {
+                if etype != t {
+                    continue;
+                }
+            }
+            by_type.entry(etype.clone()).or_default().push(json!({
+                "element_id": eid,
+                "scope": data_to_json(&row[2]),
+                "scope_path": data_to_json(&row[3]),
+            }));
+        }
+        let mut groups: Vec<JsonValue> = Vec::new();
+        for (etype, scopes) in by_type {
+            if scopes.len() > 1 {
+                groups.push(json!({
+                    "element_type": etype,
+                    "name": name,
+                    "scopes": scopes,
+                }));
+            }
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&JsonValue::Array(groups)).unwrap_or_default()
+        );
+    }
+
+    /// `pss override-history <ELEMENT_ID>` — every override_started /
+    /// override_ended event for an element.
+    pub fn cmd_override_history(db: &DbInstance, element_id: &str, limit: usize) {
+        emit_filtered_timeline(
+            db,
+            element_id,
+            &["override_started", "override_ended"],
+            limit,
+        );
+    }
+
+    /// `pss enable-history <ELEMENT_ID>` — every enabled / disabled event.
+    pub fn cmd_enable_history(db: &DbInstance, element_id: &str, limit: usize) {
+        emit_filtered_timeline(db, element_id, &["enabled", "disabled"], limit);
+    }
+
+    /// `pss scope-moves <NAME> [--type T]` — every scope_moved event
+    /// matching a name (and optional element_type).
+    pub fn cmd_scope_moves(
+        db: &DbInstance,
+        name: &str,
+        type_filter: Option<&str>,
+        limit: usize,
+    ) {
+        let q = r#"
+            ?[observed_at, element_type, element_id, scope, scope_path, diff_json] :=
+                *events{event_type: "scope_moved", element_name, observed_at,
+                        element_type, element_id, scope, scope_path, diff_json},
+                element_name == $name
+            :order observed_at
+            :limit $limit
+        "#;
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        match db.run_script(q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let rows: Vec<JsonValue> = r
+                    .rows
+                    .into_iter()
+                    .filter(|row| {
+                        type_filter.is_none_or(|t| {
+                            matches!(&row[1], DataValue::Str(s) if s.as_str() == t)
+                        })
+                    })
+                    .map(|row| {
+                        json!({
+                            "observed_at": data_to_json(&row[0]),
+                            "element_type": data_to_json(&row[1]),
+                            "element_id": data_to_json(&row[2]),
+                            "scope": data_to_json(&row[3]),
+                            "scope_path": data_to_json(&row[4]),
+                            "diff_json": data_to_json(&row[5]),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                );
+            }
+            Err(e) => eprintln!("scope-moves query failed: {}", e),
+        }
+    }
+
+    /// `pss marketplace-history` — all marketplace_added / marketplace_removed
+    /// events. Optionally filter by date window.
+    pub fn cmd_marketplace_history(db: &DbInstance, limit: usize) {
+        let q = r#"
+            ?[observed_at, event_type, element_name, element_id, diff_json] :=
+                *events{event_type, element_type: "marketplace", observed_at,
+                        element_name, element_id, diff_json},
+                or(event_type == "marketplace_added",
+                   event_type == "marketplace_removed",
+                   event_type == "installed",
+                   event_type == "removed")
+            :order observed_at
+            :limit $limit
+        "#;
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        match db.run_script(q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let rows: Vec<JsonValue> = r
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        json!({
+                            "observed_at": data_to_json(&row[0]),
+                            "event_type": data_to_json(&row[1]),
+                            "element_name": data_to_json(&row[2]),
+                            "element_id": data_to_json(&row[3]),
+                            "diff_json": data_to_json(&row[4]),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                );
+            }
+            Err(e) => eprintln!("marketplace-history query failed: {}", e),
+        }
+    }
+
+    /// `pss plugin-history <PLUGIN_NAME>` — every event whose
+    /// element_type=="plugin" AND element_name matches.
+    pub fn cmd_plugin_history(db: &DbInstance, plugin_name: &str, limit: usize) {
+        let q = r#"
+            ?[observed_at, event_type, element_name, element_id, scope, diff_json] :=
+                *events{event_type, element_type: "plugin", observed_at,
+                        element_name, element_id, scope, diff_json},
+                element_name == $name
+            :order observed_at
+            :limit $limit
+        "#;
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(plugin_name.into()));
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        match db.run_script(q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let rows: Vec<JsonValue> = r
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        json!({
+                            "observed_at": data_to_json(&row[0]),
+                            "event_type": data_to_json(&row[1]),
+                            "element_name": data_to_json(&row[2]),
+                            "element_id": data_to_json(&row[3]),
+                            "scope": data_to_json(&row[4]),
+                            "diff_json": data_to_json(&row[5]),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                );
+            }
+            Err(e) => eprintln!("plugin-history query failed: {}", e),
+        }
+    }
+
+    /// Internal: events for one element_id matching one of `event_types`.
+    fn emit_filtered_timeline(
+        db: &DbInstance,
+        element_id: &str,
+        event_types: &[&str],
+        limit: usize,
+    ) {
+        // Cozo has no easy "in-list" predicate; we OR them.
+        let q = r#"
+            ?[event_id, observed_at, event_type, diff_json] :=
+                *events{element_id: $eid, event_id, observed_at, event_type, diff_json}
+            :order observed_at
+            :limit $limit
+        "#;
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(element_id.into()));
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        match db.run_script(q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let allowed: std::collections::HashSet<&str> =
+                    event_types.iter().copied().collect();
+                let rows: Vec<JsonValue> = r
+                    .rows
+                    .into_iter()
+                    .filter(|row| {
+                        matches!(&row[2], DataValue::Str(s) if allowed.contains(s.as_str()))
+                    })
+                    .map(|row| {
+                        json!({
+                            "event_id": data_to_json(&row[0]),
+                            "observed_at": data_to_json(&row[1]),
+                            "event_type": data_to_json(&row[2]),
+                            "diff_json": data_to_json(&row[3]),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                );
+            }
+            Err(e) => eprintln!("filtered timeline query failed: {}", e),
+        }
     }
 
     /// `pss retention [--set <DURATION>]` — read or write retention
