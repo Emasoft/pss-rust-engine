@@ -14678,11 +14678,48 @@ fn load_candidates_from_db(
     };
 
     let mut skills: HashMap<String, SkillEntry> = HashMap::new();
+    // DI-6 (audit 20260514): the previous 19× `unwrap_or_default()` chain
+    // silently absorbed corrupt JSON in any of the 19 _json columns —
+    // turning a real bug-hiding parse error into "empty Vec" and producing
+    // "no match" with no warning. Per fail-fast, we now count corrupt
+    // columns, log per-skill (stderr), and emit an aggregate WARN at
+    // end-of-load so the user actually SEES the corruption.
+    let mut total_corrupt_columns: usize = 0;
+    let mut rows_with_corruption: usize = 0;
+
+    // Helper: parse JSON column, log on failure, return Default. Increments
+    // *corrupt_count when the raw value was non-empty but didn't parse —
+    // that's the case the silent unwrap_or_default used to hide.
+    fn parse_json_col<T: serde::de::DeserializeOwned + Default>(
+        raw: &str,
+        col_name: &str,
+        skill_name: &str,
+        corrupt_count: &mut usize,
+    ) -> T {
+        match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(parse_err) => {
+                // Empty string is legit empty (Cozo default for unwritten
+                // _json columns); only non-empty + unparseable = corrupt.
+                if !raw.is_empty() {
+                    eprintln!(
+                        "[pss-load] WARN: corrupt JSON in skills.{} for '{}' \
+                         (parse error: {}). Treating column as empty.",
+                        col_name, skill_name, parse_err
+                    );
+                    *corrupt_count += 1;
+                }
+                T::default()
+            }
+        }
+    }
+
     for row in &main_result.rows {
         if row.len() < 32 { continue; }
         let name = dv_str(&row[0]);
         let source = dv_str(&row[3]);
         let entry_id = make_entry_id(&name, &source);
+        let mut corrupt_in_row: usize = 0;
         let entry = SkillEntry {
             name: name.clone(),
             path: dv_str(&row[1]),
@@ -14694,30 +14731,42 @@ fn load_candidates_from_db(
             category: dv_str(&row[7]),
             server_type: dv_str(&row[8]),
             server_command: dv_str(&row[9]),
-            server_args: serde_json::from_str(&dv_str(&row[10])).unwrap_or_default(),
-            language_ids: serde_json::from_str(&dv_str(&row[11])).unwrap_or_default(),
-            negative_keywords: serde_json::from_str(&dv_str(&row[12])).unwrap_or_default(),
-            patterns: serde_json::from_str(&dv_str(&row[13])).unwrap_or_default(),
-            directories: serde_json::from_str(&dv_str(&row[14])).unwrap_or_default(),
-            path_patterns: serde_json::from_str(&dv_str(&row[15])).unwrap_or_default(),
-            use_cases: serde_json::from_str(&dv_str(&row[16])).unwrap_or_default(),
-            co_usage: serde_json::from_str(&dv_str(&row[17])).unwrap_or_default(),
-            alternatives: serde_json::from_str(&dv_str(&row[18])).unwrap_or_default(),
-            domain_gates: serde_json::from_str(&dv_str(&row[19])).unwrap_or_default(),
-            file_types: serde_json::from_str(&dv_str(&row[20])).unwrap_or_default(),
-            keywords: serde_json::from_str(&dv_str(&row[21])).unwrap_or_default(),
-            intents: serde_json::from_str(&dv_str(&row[22])).unwrap_or_default(),
-            tools: serde_json::from_str(&dv_str(&row[23])).unwrap_or_default(),
-            services: serde_json::from_str(&dv_str(&row[24])).unwrap_or_default(),
-            frameworks: serde_json::from_str(&dv_str(&row[25])).unwrap_or_default(),
-            languages: serde_json::from_str(&dv_str(&row[26])).unwrap_or_default(),
-            platforms: serde_json::from_str(&dv_str(&row[27])).unwrap_or_default(),
-            domains: serde_json::from_str(&dv_str(&row[28])).unwrap_or_default(),
-            path_gates: serde_json::from_str(&dv_str(&row[29])).unwrap_or_default(),
+            server_args: parse_json_col(&dv_str(&row[10]), "server_args_json", &name, &mut corrupt_in_row),
+            language_ids: parse_json_col(&dv_str(&row[11]), "language_ids_json", &name, &mut corrupt_in_row),
+            negative_keywords: parse_json_col(&dv_str(&row[12]), "negative_kw_json", &name, &mut corrupt_in_row),
+            patterns: parse_json_col(&dv_str(&row[13]), "patterns_json", &name, &mut corrupt_in_row),
+            directories: parse_json_col(&dv_str(&row[14]), "directories_json", &name, &mut corrupt_in_row),
+            path_patterns: parse_json_col(&dv_str(&row[15]), "path_patterns_json", &name, &mut corrupt_in_row),
+            use_cases: parse_json_col(&dv_str(&row[16]), "use_cases_json", &name, &mut corrupt_in_row),
+            co_usage: parse_json_col(&dv_str(&row[17]), "co_usage_json", &name, &mut corrupt_in_row),
+            alternatives: parse_json_col(&dv_str(&row[18]), "alternatives_json", &name, &mut corrupt_in_row),
+            domain_gates: parse_json_col(&dv_str(&row[19]), "domain_gates_json", &name, &mut corrupt_in_row),
+            file_types: parse_json_col(&dv_str(&row[20]), "file_types_json", &name, &mut corrupt_in_row),
+            keywords: parse_json_col(&dv_str(&row[21]), "keywords_json", &name, &mut corrupt_in_row),
+            intents: parse_json_col(&dv_str(&row[22]), "intents_json", &name, &mut corrupt_in_row),
+            tools: parse_json_col(&dv_str(&row[23]), "tools_json", &name, &mut corrupt_in_row),
+            services: parse_json_col(&dv_str(&row[24]), "services_json", &name, &mut corrupt_in_row),
+            frameworks: parse_json_col(&dv_str(&row[25]), "frameworks_json", &name, &mut corrupt_in_row),
+            languages: parse_json_col(&dv_str(&row[26]), "languages_json", &name, &mut corrupt_in_row),
+            platforms: parse_json_col(&dv_str(&row[27]), "platforms_json", &name, &mut corrupt_in_row),
+            domains: parse_json_col(&dv_str(&row[28]), "domains_json", &name, &mut corrupt_in_row),
+            path_gates: parse_json_col(&dv_str(&row[29]), "path_gates_json", &name, &mut corrupt_in_row),
             first_indexed_at: dv_str(&row[30]),
             last_updated_at: dv_str(&row[31]),
         };
+        if corrupt_in_row > 0 {
+            rows_with_corruption += 1;
+            total_corrupt_columns += corrupt_in_row;
+        }
         skills.insert(entry_id, entry);
+    }
+
+    if total_corrupt_columns > 0 {
+        eprintln!(
+            "[pss-load] WARN: {} corrupt JSON column(s) across {} skill row(s) — \
+             run /pss-reindex-skills to rebuild the index.",
+            total_corrupt_columns, rows_with_corruption
+        );
     }
 
     let skills_count = skills.len();
@@ -14753,8 +14802,32 @@ fn open_db_for_query(cli: &Cli) -> Result<DbInstance, SuggesterError> {
     Ok(db)
 }
 
-/// Valid entry types — whitelist for --type filter.
-const VALID_TYPES: &[&str] = &["skill", "agent", "command", "rule", "mcp", "lsp"];
+/// Valid entry types — whitelist for --type filter. Per COR-4 (audit 20260514)
+/// this now covers all 12 element types PSS discovers, not just the legacy 6
+/// that live in the `skills` table. The 6 new types (hook/plugin/marketplace/
+/// monitor/output-style/theme) live only in `elements_state` — `cmd_list` and
+/// `cmd_search` detect them via `NEW_ELEMENT_TYPES` below and route to the
+/// elements-state-backed helper.
+const VALID_TYPES: &[&str] = &[
+    // Legacy 6 (skills table — full keyword/domain/aux indexing).
+    "skill", "agent", "command", "rule", "mcp", "lsp",
+    // New 6 (elements_state only — basic name/scope/path).
+    "hook", "plugin", "marketplace", "monitor", "output-style", "theme",
+];
+
+/// Subset of `VALID_TYPES` whose rows live in `elements_state` only — no
+/// matching row in the legacy `skills` table. Queries against these types
+/// must go through `cmd_list_elements_state` (COR-4 — audit 20260514).
+const NEW_ELEMENT_TYPES: &[&str] = &[
+    "hook", "plugin", "marketplace", "monitor", "output-style", "theme",
+];
+
+/// True if `type_filter` (if Some) is in `NEW_ELEMENT_TYPES` — caller should
+/// route the query to `cmd_list_elements_state` instead of the legacy
+/// skills-table path.
+fn is_new_element_type(type_filter: Option<&str>) -> bool {
+    matches!(type_filter, Some(t) if NEW_ELEMENT_TYPES.contains(&t))
+}
 
 /// Validate --type filter against whitelist.
 /// Returns error if the value is not a known type. Prevents Datalog injection
@@ -14766,6 +14839,81 @@ fn validate_type_filter(t: Option<&str>) -> Result<(), SuggesterError> {
                 "Invalid type '{}'. Valid types: {}", t, VALID_TYPES.join(", ")
             )));
         }
+    }
+    Ok(())
+}
+
+/// List rows of a given element type from `elements_state` joined against
+/// the latest event (for element_name + scope_path). Per COR-4: this is the
+/// elements-state-backed path that handles `hook`, `plugin`, `marketplace`,
+/// `monitor`, `output-style`, `theme` — types that have no row in the legacy
+/// `skills` table.
+///
+/// Optional `name_substring` filters by case-insensitive substring match on
+/// element_name — used by `cmd_search` to approximate keyword search against
+/// new types (which have no keyword aux table).
+///
+/// Only returns rows where `exists = true` (currently-present elements).
+fn cmd_list_elements_state(
+    db: &DbInstance,
+    type_filter: &str,
+    name_substring: Option<&str>,
+    top: usize,
+    format: &str,
+) -> Result<(), SuggesterError> {
+    let top = top.min(10000);
+    let q = r#"
+        ?[element_name, element_type, scope, scope_path, current_path, last_changed_at] :=
+            *elements_state{element_id, last_event_id, current_path, last_changed_at, exists: true},
+            *events{event_id: last_event_id, element_type, element_name, scope, scope_path},
+            element_type = $ftype
+        :order element_name
+        :limit $top
+    "#;
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("ftype".into(), DataValue::Str(type_filter.into()));
+    params.insert("top".into(), DataValue::Num(cozo::Num::Int(top as i64)));
+
+    let result = db.run_script(q, params, ScriptMutability::Immutable)
+        .map_err(|e| SuggesterError::IndexParse(format!(
+            "elements_state list query failed: {}", e
+        )))?;
+
+    let needle = name_substring.map(|s| s.to_lowercase());
+    let entries: Vec<serde_json::Value> = result.rows.iter()
+        .filter(|r| {
+            // Apply name-substring filter if provided.
+            match &needle {
+                None => true,
+                Some(n) => dv_to_string(&r[0]).to_lowercase().contains(n),
+            }
+        })
+        .map(|r| serde_json::json!({
+            "id": dv_to_string(&r[0]),
+            "name": dv_to_string(&r[0]),
+            "type": dv_to_string(&r[1]),
+            "scope": dv_to_string(&r[2]),
+            "scope_path": dv_to_string(&r[3]),
+            "path": dv_to_string(&r[4]),
+            "last_changed_at": dv_to_string(&r[5]),
+            // Legacy field names for compatibility with skills-table output:
+            "category": "",
+            "description": "",
+            "source": dv_to_string(&r[2]),  // alias scope→source for new types
+        }))
+        .collect();
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&entries).unwrap_or_default());
+    } else {
+        print_table(&["NAME", "TYPE", "SCOPE", "SCOPE_PATH", "PATH"],
+            &entries.iter().map(|e| vec![
+                e["name"].as_str().unwrap_or("").to_string(),
+                e["type"].as_str().unwrap_or("").to_string(),
+                e["scope"].as_str().unwrap_or("").to_string(),
+                e["scope_path"].as_str().unwrap_or("").chars().take(30).collect::<String>(),
+                e["path"].as_str().unwrap_or("").chars().take(60).collect::<String>(),
+            ]).collect::<Vec<_>>());
     }
     Ok(())
 }
@@ -15307,6 +15455,58 @@ fn cmd_vocab(db: &DbInstance, field: &str, type_filter: Option<&str>, top: usize
     validate_type_filter(type_filter)?;
     let top = top.min(10000);
 
+    // COR-4 (audit 20260514): new element types have no aux-table coverage.
+    // Most vocab fields (languages/frameworks/domains/tools/...) are simply
+    // empty for hook/plugin/etc. Only "types" and "scopes" are meaningful
+    // — both queryable from `events`/`elements_state`.
+    if is_new_element_type(type_filter) {
+        let t = type_filter.unwrap();
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("ftype".into(), DataValue::Str(t.into()));
+        params.insert("top".into(), DataValue::Num(cozo::Num::Int(top as i64)));
+        let q = match field {
+            "scopes" => Some(
+                "?[value, count(element_id)] := \
+                 *elements_state{element_id, last_event_id, exists: true}, \
+                 *events{event_id: last_event_id, element_type, scope: value}, \
+                 element_type = $ftype \
+                 :order -count(element_id) :limit $top"
+            ),
+            "types" => Some(
+                "?[value, count(element_id)] := \
+                 *elements_state{element_id, last_event_id, exists: true}, \
+                 *events{event_id: last_event_id, element_type: value}, \
+                 element_type = $ftype \
+                 :order -count(element_id) :limit $top"
+            ),
+            _ => None,
+        };
+        let entries: Vec<(String, i64)> = match q {
+            Some(qs) => {
+                let result = db.run_script(qs, params, ScriptMutability::Immutable)
+                    .map_err(|e| SuggesterError::IndexParse(format!(
+                        "vocab query failed: {}", e
+                    )))?;
+                result.rows.iter()
+                    .map(|r| (dv_to_string(&r[0]), dv_to_i64(&r[1])))
+                    .collect()
+            }
+            None => Vec::new(),  // aux fields aren't tracked for new types
+        };
+        if format == "json" {
+            let arr: Vec<serde_json::Value> = entries.iter()
+                .map(|(v, c)| serde_json::json!({"value": v, "count": c}))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        } else {
+            println!("  {} ({} distinct values)", field.to_uppercase(), entries.len());
+            print_table(&["VALUE", "COUNT"], &entries.iter()
+                .map(|(v, c)| vec![v.clone(), c.to_string()])
+                .collect::<Vec<_>>());
+        }
+        return Ok(());
+    }
+
     // Map field name to the appropriate CozoDB table or parametrized query
     let (query, params) = match field {
         "languages" => build_vocab_query("skill_languages", type_filter, top),
@@ -15436,6 +15636,17 @@ fn cmd_list(db: &DbInstance, type_filter: Option<&str>, domain: Option<&str>,
     validate_type_filter(type_filter)?;
     if let Some(c) = category { validate_filter_value("category", c)?; }
 
+    // COR-4 (audit 20260514): if the user asked for a new element type that
+    // lives only in elements_state (hook/plugin/marketplace/...), route to
+    // the elements-state-backed helper. The aux-table filters (domain,
+    // language, framework, etc.) don't apply to new types — skills aux
+    // tables are populated only for the legacy 6.
+    if is_new_element_type(type_filter) {
+        let _ = (sort, domain, language, framework, tool, category,
+                 file_type, keyword, platform); // intentionally unused for new types
+        return cmd_list_elements_state(db, type_filter.unwrap(), None, top, format);
+    }
+
     // Build Datalog query with AND-combined filters via parametrized queries
     let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
     // Scalar filters use parametrized binding ($param), never format!() interpolation
@@ -15514,6 +15725,17 @@ fn cmd_search(db: &DbInstance, query: &str, type_filter: Option<&str>, domain: O
     // Validate inputs — reject injection attempts before building any query
     validate_type_filter(type_filter)?;
     if let Some(c) = category { validate_filter_value("category", c)?; }
+
+    // COR-4 (audit 20260514): new element types live in elements_state and
+    // have no aux-table keyword indexing. Approximate `search <q> --type X`
+    // for new types as "list elements where name contains <q>".
+    if is_new_element_type(type_filter) {
+        let _ = (domain, language, framework, tool, category, file_type,
+                 keyword, platform); // intentionally unused for new types
+        return cmd_list_elements_state(
+            db, type_filter.unwrap(), Some(query), top, format
+        );
+    }
 
     let query_lower = query.to_lowercase();
     let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
@@ -16435,6 +16657,42 @@ fn cmd_coverage(db: &DbInstance, type_filter: Option<&str>, format: &str) -> Res
     // Validate type filter against whitelist to prevent injection
     validate_type_filter(type_filter)?;
 
+    // COR-4 (audit 20260514): new element types live in elements_state with
+    // no aux-table coverage. Emit a basic-shape coverage report (just the
+    // total count) — the language/framework/domain breakdowns are empty
+    // because those aux tables aren't populated for new types.
+    if is_new_element_type(type_filter) {
+        let t = type_filter.unwrap();
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("ftype".into(), DataValue::Str(t.into()));
+        let total_result = db.run_script(
+            "?[count(element_id)] := \
+             *elements_state{element_id, last_event_id, exists: true}, \
+             *events{event_id: last_event_id, element_type}, \
+             element_type = $ftype",
+            params,
+            ScriptMutability::Immutable,
+        ).map_err(|e| SuggesterError::IndexParse(format!(
+            "coverage query (elements_state) failed: {}", e
+        )))?;
+        let total = total_result.rows.first().map(|r| dv_to_i64(&r[0])).unwrap_or(0);
+        if format == "json" {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "type": t,
+                "total": total,
+                "note": "new element types (hook/plugin/marketplace/monitor/output-style/theme) live in elements_state only — no aux-table breakdowns",
+                "languages": {}, "frameworks": {}, "domains": {},
+                "tools": {}, "services": {}, "platforms": {},
+                "language_count": 0, "framework_count": 0, "domain_count": 0,
+            })).unwrap_or_default());
+        } else {
+            println!("━━━ COVERAGE: {} ━━━", t);
+            println!("  Total entries: {}", total);
+            println!("  (new element types have no aux-table breakdowns)");
+        }
+        return Ok(());
+    }
+
     // Build parametrized queries — never interpolate user input into Datalog
     let mut total_params: BTreeMap<String, DataValue> = BTreeMap::new();
     let total_query = match type_filter {
@@ -16528,22 +16786,41 @@ fn cmd_coverage(db: &DbInstance, type_filter: Option<&str>, format: &str) -> Res
 // CLI without requiring Python. They mirror the helpers in
 // `scripts/pss_cozodb.py` byte-for-byte semantically, but run faster.
 //
-// Datetime formats accepted by parse_datetime_arg:
+// Datetime formats accepted by parse_date (unified per COR-7 — audit 20260514):
 //   - RFC 3339 strings:  "2026-04-16T22:12:27Z" or "2026-04-16T22:12:27+00:00"
-//   - Date only:         "2026-04-16" (interpreted as midnight UTC)
+//   - Date only:         "2026-04-16" (interpreted as 23:59:59 UTC end-of-day)
 //   - Relative to now:   "1d", "2w", "24h", "30m", "120s"
+//   - Keywords:          "now", "yesterday"
 
 /// Parse a user-supplied datetime string into an RFC 3339 UTC string matching
 /// the format stored in CozoDB (via Rust's `to_rfc3339_opts(Secs, true)`).
 ///
 /// Fail-fast on invalid input — callers are scripts/power-users who want
-/// clear errors, not silent fallbacks.
-fn parse_datetime_arg(arg: &str) -> Result<String, SuggesterError> {
+/// clear errors, not silent fallbacks. Per COR-2 (audit 20260514): garbage
+/// inputs like "tomorrow" or "2026/05/14" now produce a clear error instead
+/// of being silently passed through to CozoDB and matching every row.
+///
+/// Per COR-7: this is the SINGLE date parser shared by every PSS subcommand
+/// — both the legacy `list-added-since` family and the temporal `as-of` /
+/// `timeline` / `diff` family. `temporal::cli::resolve_date` is a thin
+/// wrapper that converts the SuggesterError to a String.
+pub(crate) fn parse_date(arg: &str) -> Result<String, SuggesterError> {
     let arg = arg.trim();
     if arg.is_empty() {
         return Err(SuggesterError::IndexParse(
             "empty datetime argument".to_string(),
         ));
+    }
+
+    // Keyword shortcuts. "now" matches current instant; "yesterday" matches
+    // 24h ago. Both produced as RFC 3339 with seconds precision so they
+    // string-compare correctly against stored event timestamps.
+    if arg == "now" {
+        return Ok(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+    if arg == "yesterday" {
+        let dt = Utc::now() - chrono::Duration::days(1);
+        return Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     }
 
     // Try relative shorthand first (cheapest to check): N<unit> where unit is s/m/h/d/w
@@ -16576,9 +16853,11 @@ fn parse_datetime_arg(arg: &str) -> Result<String, SuggesterError> {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     }
 
-    // Try date-only (YYYY-MM-DD → midnight UTC)
+    // Try date-only (YYYY-MM-DD → 23:59:59 UTC end-of-day). Using end-of-day
+    // matches the prior `resolve_date` semantics so `as-of 2026-04-16`
+    // captures everything that happened that day.
     if let Ok(date) = chrono::NaiveDate::parse_from_str(arg, "%Y-%m-%d") {
-        if let Some(ndt) = date.and_hms_opt(0, 0, 0) {
+        if let Some(ndt) = date.and_hms_opt(23, 59, 59) {
             let dt = ndt.and_utc();
             return Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         }
@@ -16592,7 +16871,8 @@ fn parse_datetime_arg(arg: &str) -> Result<String, SuggesterError> {
 
     Err(SuggesterError::IndexParse(format!(
         "Invalid datetime {:?}. Expected RFC 3339 (2026-04-16T22:12:27Z), \
-         date-only (2026-04-16), or relative shorthand (1d, 2w, 24h, 30m, 120s).",
+         date-only (2026-04-16), relative shorthand (1d, 2w, 24h, 30m, 120s), \
+         or keyword ('now', 'yesterday').",
         arg
     )))
 }
@@ -16910,7 +17190,7 @@ fn cmd_list_added_since(
     limit: usize,
     json: bool,
 ) -> Result<(), SuggesterError> {
-    let iso = parse_datetime_arg(when)?;
+    let iso = parse_date(when)?;
     let limit = limit.min(10000);
     let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
     params.insert("since".into(), DataValue::Str(iso.clone().into()));
@@ -16945,8 +17225,8 @@ fn cmd_list_added_between(
     limit: usize,
     json: bool,
 ) -> Result<(), SuggesterError> {
-    let start_iso = parse_datetime_arg(start)?;
-    let end_iso = parse_datetime_arg(end)?;
+    let start_iso = parse_date(start)?;
+    let end_iso = parse_date(end)?;
     let limit = limit.min(10000);
     let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
     params.insert("start".into(), DataValue::Str(start_iso.clone().into()));
@@ -16981,7 +17261,7 @@ fn cmd_list_updated_since(
     limit: usize,
     json: bool,
 ) -> Result<(), SuggesterError> {
-    let iso = parse_datetime_arg(when)?;
+    let iso = parse_date(when)?;
     let limit = limit.min(10000);
     let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
     params.insert("since".into(), DataValue::Str(iso.clone().into()));
@@ -17283,11 +17563,29 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
     debug!("Received input: {}", input_json);
 
     // Parse input
-    let input: HookInput = serde_json::from_str(&input_json)?;
+    let mut input: HookInput = serde_json::from_str(&input_json)?;
 
-    // Skip processing for certain prompts
-    let prompt_lower = input.prompt.to_lowercase();
-    if is_skip_prompt(&prompt_lower) {
+    // PERF-1 (audit 20260514): strip <system-reminder> blocks BEFORE skip
+    // detection so legitimate <system-reminder> tags aren't matched as skip
+    // signals. Idempotent — safe to call on already-cleaned prompts from
+    // the legacy Python wrapper path.
+    let cleaned = strip_system_reminders(&input.prompt);
+    if cleaned != input.prompt {
+        input.prompt = cleaned;
+    }
+
+    // PERF-1: augment short prompts with the previous user message from the
+    // transcript (Python used to do this before invoking the binary). Cap at
+    // 4 000 chars total to match the Python pipeline's MAX_PROMPT_CHARS.
+    if !input.transcript_path.is_empty() {
+        let augmented = augment_prompt_if_short(&input.prompt, &input.transcript_path, 4000);
+        if augmented != input.prompt {
+            input.prompt = augmented;
+        }
+    }
+
+    // Skip processing for certain prompts.
+    if is_skip_prompt(&input.prompt) {
         debug!("Skipping prompt: {}", &input.prompt[..input.prompt.len().min(50)]);
         let output = HookOutput::empty();
         println!("{}", serde_json::to_string(&output)?);
@@ -17784,20 +18082,139 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
 }
 
 /// Check if prompt should be skipped (simple words, task notifications)
+/// Strip `<system-reminder>...</system-reminder>` blocks from prompt text.
+///
+/// PERF-1 (audit 20260514): ported from `scripts/pss_hook.py:_strip_system_reminders`.
+/// Linear-time find/skip loop (no regex backtracking) — critical for 200 KB
+/// prompts where `re.DOTALL` would add >1s of overhead. The function is
+/// idempotent: applying it twice produces the same result, so it's safe to
+/// call from both the legacy Python wrapper path and a direct-binary path.
+fn strip_system_reminders(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    while pos < text.len() {
+        match text[pos..].find(OPEN) {
+            None => {
+                out.push_str(&text[pos..]);
+                break;
+            }
+            Some(rel_start) => {
+                let start = pos + rel_start;
+                if start > pos {
+                    out.push_str(&text[pos..start]);
+                }
+                let after_open = start + OPEN.len();
+                match text[after_open..].find(CLOSE) {
+                    None => break, // unclosed tag — discard rest (contains system content)
+                    Some(rel_end) => {
+                        pos = after_open + rel_end + CLOSE.len();
+                    }
+                }
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Decide whether a prompt should skip skill suggestion entirely.
+///
+/// PERF-1 (audit 20260514): ported from `scripts/pss_hook.py:should_skip_prompt`.
+/// Matches the Python implementation including slash-command prefix, system
+/// tag detection, release-notes pattern, and the simple-word allowlist. Called
+/// AFTER `strip_system_reminders` so we don't see legitimate <system-reminder>
+/// tags as triggers.
 fn is_skip_prompt(prompt: &str) -> bool {
-    // Skip task notifications
-    if prompt.contains("<task-notification>") {
+    if prompt.is_empty() {
+        return true;
+    }
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
         return true;
     }
 
-    // Skip simple words
-    let simple_words = [
-        "continue", "yes", "no", "ok", "okay", "thanks", "sure", "done", "stop", "got it",
-        "y", "n", "yep", "nope", "thank you", "thx", "ty", "next", "go", "proceed",
-    ];
+    // Slash commands like /plugin, /help, /exit
+    if trimmed.starts_with('/') || trimmed.starts_with("<command-name>/") {
+        return true;
+    }
 
-    let trimmed = prompt.trim().to_lowercase();
-    simple_words.contains(&trimmed.as_str())
+    // System-generated content tags (system-reminder is already stripped
+    // earlier; these are the remaining tags Python skips).
+    if trimmed.contains("<task-notification>")
+        || trimmed.contains("<local-command-caveat>")
+        || trimmed.contains("<local-command-stdout>")
+    {
+        return true;
+    }
+
+    // /release-notes paste: starts with "Version " and contains "\n• "
+    // within the first 500 chars.
+    if trimmed.starts_with("Version ") {
+        let head_end = trimmed.len().min(500);
+        if trimmed[..head_end].contains("\n• ") {
+            return true;
+        }
+    }
+
+    // Simple one-word / short-phrase confirmations.
+    let lower = trimmed.to_lowercase();
+    matches!(lower.as_str(),
+        "continue" | "yes" | "no" | "ok" | "okay" | "thanks" | "sure"
+        | "done" | "stop" | "y" | "n" | "yep" | "nope" | "thx" | "ty"
+        | "next" | "go" | "proceed" | "k" | "yea" | "yeah" | "nah"
+        | "good" | "great" | "perfect" | "fine" | "cool" | "nice"
+        // Two-word phrases
+        | "got it" | "thank you" | "thanks!" | "ok thanks" | "okay thanks"
+        | "sounds good" | "go ahead" | "do it" | "looks good" | "that works"
+        | "yes please" | "no thanks" | "i see" | "i understand"
+        | "makes sense" | "all good" | "thank you!"
+    )
+}
+
+/// Augment a short prompt with the previous user message from the transcript.
+///
+/// PERF-1 (audit 20260514): ported from `scripts/pss_hook.py:augment_prompt_with_context`.
+/// Only augments when the current prompt has fewer than 30 non-trivial chars
+/// (alphanumeric only) — longer prompts already carry enough signal, and
+/// prepending unrelated history pollutes scoring. Total output capped at
+/// `max_prompt_chars` to keep stdin small.
+fn augment_prompt_if_short(prompt: &str, transcript_path: &str, max_prompt_chars: usize) -> String {
+    let stripped = prompt.trim();
+    let stripped = if stripped.len() > max_prompt_chars {
+        &stripped[..max_prompt_chars]
+    } else {
+        stripped
+    };
+
+    // Count alphanumeric chars; skip augmentation if prompt has ≥30.
+    let non_trivial: usize = stripped.chars().filter(|c| c.is_alphanumeric()).count();
+    if non_trivial >= 30 {
+        return stripped.to_string();
+    }
+
+    if transcript_path.is_empty() {
+        return stripped.to_string();
+    }
+
+    let prev_msg = extract_prev_user_message(transcript_path);
+    if prev_msg.is_empty() {
+        return stripped.to_string();
+    }
+
+    // Cap prev_msg so total stays under max_prompt_chars (with 1-char separator).
+    let budget = max_prompt_chars
+        .saturating_sub(stripped.len())
+        .saturating_sub(1);
+    if budget <= 200 {
+        return stripped.to_string();
+    }
+    let prev_capped = if prev_msg.len() > budget {
+        &prev_msg[..budget]
+    } else {
+        prev_msg.as_str()
+    };
+    format!("{} {}", prev_capped, stripped)
 }
 
 // ============================================================================
@@ -20237,5 +20654,234 @@ mediapipe>=0.10
             agent_pos.unwrap(),
             command_pos.unwrap()
         );
+    }
+
+    // ====================================================================
+    // Phase 1.1 — audit 20260514 (COR-2, COR-4, COR-7)
+    // ====================================================================
+
+    #[test]
+    fn parse_date_accepts_now_keyword() {
+        // COR-2 + COR-7: "now" returns current time as RFC3339.
+        let result = parse_date("now").expect("'now' must parse");
+        assert!(result.contains('T'), "RFC3339 has T separator: {}", result);
+        assert!(result.ends_with('Z'), "UTC suffix: {}", result);
+    }
+
+    #[test]
+    fn parse_date_accepts_yesterday_keyword() {
+        // COR-2: "yesterday" used to fall through and become a literal string
+        // that string-compared against every event. Now it produces a real
+        // timestamp 24h before now.
+        let result = parse_date("yesterday").expect("'yesterday' must parse");
+        assert!(result.contains('T'));
+        assert!(result.ends_with('Z'));
+    }
+
+    #[test]
+    fn parse_date_accepts_relative_shorthand() {
+        // COR-7: relative shorthand is the legacy parse_datetime_arg shape.
+        for s in &["1d", "2w", "24h", "30m", "120s"] {
+            let r = parse_date(s).unwrap_or_else(|e| panic!("{} should parse: {:?}", s, e));
+            assert!(r.contains('T'), "{} → {}", s, r);
+        }
+    }
+
+    #[test]
+    fn parse_date_accepts_iso_date() {
+        // YYYY-MM-DD now produces 23:59:59 end-of-day (matches the prior
+        // resolve_date semantics so as-of YYYY-MM-DD captures the full day).
+        let r = parse_date("2026-04-16").expect("date-only must parse");
+        assert!(r.starts_with("2026-04-16T23:59:59"), "got {}", r);
+    }
+
+    #[test]
+    fn parse_date_accepts_rfc3339() {
+        let r = parse_date("2026-04-16T22:12:27Z").expect("RFC3339 must parse");
+        assert_eq!(r, "2026-04-16T22:12:27Z");
+    }
+
+    #[test]
+    fn parse_date_rejects_tomorrow() {
+        // COR-2 (audit 20260514): "tomorrow" used to be silently passed
+        // through and produced 9131 rows on `pss as-of 'tomorrow'`. Now
+        // it's a clear error.
+        let r = parse_date("tomorrow");
+        assert!(r.is_err(), "'tomorrow' must be rejected, got {:?}", r);
+    }
+
+    #[test]
+    fn parse_date_rejects_garbage() {
+        // COR-2: random strings rejected.
+        for s in &["asdf", "not-a-date", "2026/05/14", "13/45/2026", ""] {
+            let r = parse_date(s);
+            assert!(r.is_err(), "{:?} must be rejected, got {:?}", s, r);
+        }
+    }
+
+    #[test]
+    fn valid_types_covers_all_twelve() {
+        // COR-4 (audit 20260514): expanded from 6 to 12 types.
+        for t in &[
+            "skill", "agent", "command", "rule", "mcp", "lsp",
+            "hook", "plugin", "marketplace", "monitor", "output-style", "theme",
+        ] {
+            assert!(VALID_TYPES.contains(t), "VALID_TYPES must include {}", t);
+        }
+        assert_eq!(VALID_TYPES.len(), 12, "exactly 12 types");
+    }
+
+    #[test]
+    fn validate_type_accepts_new_types() {
+        // COR-4: `pss list --type plugin` used to error out at validation.
+        for t in &["hook", "plugin", "marketplace", "monitor", "output-style", "theme"] {
+            validate_type_filter(Some(t))
+                .unwrap_or_else(|e| panic!("validate({}) should pass: {:?}", t, e));
+        }
+    }
+
+    #[test]
+    fn validate_type_rejects_unknown() {
+        // Injection attempts and typos still rejected.
+        for t in &["plugins", "Plugin", "drop_table", "channel"] {
+            assert!(validate_type_filter(Some(t)).is_err(), "{} must be rejected", t);
+        }
+    }
+
+    #[test]
+    fn is_new_element_type_partitions_correctly() {
+        // COR-4: legacy 6 → false; new 6 → true; None → false.
+        for legacy in &["skill", "agent", "command", "rule", "mcp", "lsp"] {
+            assert!(!is_new_element_type(Some(legacy)),
+                    "{} is legacy, must route to skills", legacy);
+        }
+        for new in &["hook", "plugin", "marketplace", "monitor", "output-style", "theme"] {
+            assert!(is_new_element_type(Some(new)),
+                    "{} is new, must route to elements_state", new);
+        }
+        assert!(!is_new_element_type(None));
+    }
+
+    // ====================================================================
+    // PERF-1 — hook helper functions (audit 20260514)
+    // ====================================================================
+
+    #[test]
+    fn strip_system_reminders_removes_block() {
+        let input = "before<system-reminder>banner content</system-reminder>after";
+        assert_eq!(strip_system_reminders(input), "beforeafter");
+    }
+
+    #[test]
+    fn strip_system_reminders_removes_multiple_blocks() {
+        let input = "a<system-reminder>x</system-reminder>b<system-reminder>y</system-reminder>c";
+        assert_eq!(strip_system_reminders(input), "abc");
+    }
+
+    #[test]
+    fn strip_system_reminders_handles_no_blocks() {
+        let input = "plain user prompt with no system tags";
+        assert_eq!(strip_system_reminders(input), input);
+    }
+
+    #[test]
+    fn strip_system_reminders_empty_input() {
+        assert_eq!(strip_system_reminders(""), "");
+    }
+
+    #[test]
+    fn strip_system_reminders_handles_unclosed_tag() {
+        // Unclosed system-reminder: discard everything from the open tag on
+        // (it contains system content the user didn't author).
+        let input = "real prompt<system-reminder>system content with no close";
+        assert_eq!(strip_system_reminders(input), "real prompt");
+    }
+
+    #[test]
+    fn strip_system_reminders_is_idempotent() {
+        // Critical invariant: applying twice gives the same result. This is
+        // what makes it safe to call from both the legacy Python wrapper
+        // path AND a direct-binary path without double-processing risk.
+        let input = "before<system-reminder>x</system-reminder>after";
+        let once = strip_system_reminders(input);
+        let twice = strip_system_reminders(&once);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn is_skip_prompt_rejects_empty() {
+        assert!(is_skip_prompt(""));
+        assert!(is_skip_prompt("   "));
+        assert!(is_skip_prompt("\n\t"));
+    }
+
+    #[test]
+    fn is_skip_prompt_skips_slash_commands() {
+        assert!(is_skip_prompt("/help"));
+        assert!(is_skip_prompt("/plugin install foo"));
+        assert!(is_skip_prompt("<command-name>/exit"));
+    }
+
+    #[test]
+    fn is_skip_prompt_skips_system_tags() {
+        assert!(is_skip_prompt("<task-notification>hi</task-notification>"));
+        assert!(is_skip_prompt("text with <local-command-caveat> embedded"));
+        assert!(is_skip_prompt("<local-command-stdout>output</local-command-stdout>"));
+    }
+
+    #[test]
+    fn is_skip_prompt_skips_release_notes() {
+        let notes = "Version 2.1.142 release notes\n• fix A\n• fix B\n";
+        assert!(is_skip_prompt(notes));
+    }
+
+    #[test]
+    fn is_skip_prompt_skips_simple_words() {
+        for w in &["yes", "no", "ok", "thanks", "continue", "go", "proceed", "got it", "thank you"] {
+            assert!(is_skip_prompt(w), "{:?} must be skipped", w);
+            // Case-insensitive
+            assert!(is_skip_prompt(&w.to_uppercase()), "{:?} (upper) must be skipped", w);
+        }
+    }
+
+    #[test]
+    fn is_skip_prompt_accepts_real_prompts() {
+        for p in &[
+            "how do I add tests to this project?",
+            "implement the new authentication flow",
+            "fix the bug in pss_discover.py",
+            "going to refactor the cozodb module",  // starts with "go" but isn't bare "go"
+        ] {
+            assert!(!is_skip_prompt(p), "{:?} must NOT be skipped", p);
+        }
+    }
+
+    #[test]
+    fn augment_prompt_skips_long_prompts() {
+        // ≥30 alphanumeric chars → no augmentation, transcript untouched.
+        let prompt = "this is a long enough prompt to skip augmentation";
+        let result = augment_prompt_if_short(prompt, "/nonexistent.jsonl", 4000);
+        assert_eq!(result.trim(), prompt);
+    }
+
+    #[test]
+    fn augment_prompt_short_input_no_transcript() {
+        let result = augment_prompt_if_short("hi", "", 4000);
+        assert_eq!(result, "hi");
+    }
+
+    #[test]
+    fn augment_prompt_short_missing_transcript() {
+        // Missing file → return prompt unchanged.
+        let result = augment_prompt_if_short("hi", "/tmp/totally-missing.jsonl", 4000);
+        assert_eq!(result, "hi");
+    }
+
+    #[test]
+    fn augment_prompt_caps_at_max_chars() {
+        // Long prompt > max → truncate to max.
+        let prompt = "x".repeat(5000);
+        let result = augment_prompt_if_short(&prompt, "", 4000);
+        assert_eq!(result.len(), 4000);
     }
 }
