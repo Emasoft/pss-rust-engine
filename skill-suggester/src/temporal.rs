@@ -1301,6 +1301,86 @@ pub mod cli {
         }
     }
 
+    /// `pss scope-diff <SCOPE1> <SCOPE2>` (Phase 3 Tier A — F-6, audit 20260514)
+    ///
+    /// Show elements present in one scope but not the other. Output is
+    /// a JSON object with three keys:
+    ///   - `only_in_scope1`: list of element_names present in scope1 but not scope2
+    ///   - `only_in_scope2`: list of element_names present in scope2 but not scope1
+    ///   - `shared`: list of element_names present in both
+    /// All comparisons are by (element_type, element_name) tuple so a
+    /// rule and a skill with the same name don't collide.
+    pub fn cmd_scope_diff(
+        db: &DbInstance,
+        scope1: &str,
+        scope2: &str,
+        type_filter: Option<&str>,
+        limit: usize,
+    ) {
+        // Helper: fetch all (element_type, element_name) tuples for a scope.
+        let load_scope = |scope: &str| -> Result<std::collections::HashSet<(String, String)>, String> {
+            let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+            params.insert("scope".into(), DataValue::Str(scope.into()));
+            let mut filters = String::new();
+            if let Some(t) = type_filter {
+                filters.push_str(", element_type = $f_type");
+                params.insert("f_type".into(), DataValue::Str(t.into()));
+            }
+            let q = format!(
+                r#"?[element_type, element_name] :=
+                    *elements_state{{element_id, last_event_id, exists: true}},
+                    *events{{event_id: last_event_id, element_type, element_name, scope}},
+                    scope = $scope{filters}"#,
+                filters = filters
+            );
+            let r = db.run_script(&q, params, ScriptMutability::Immutable)
+                .map_err(|e| e.to_string())?;
+            Ok(r.rows.iter().filter_map(|row| {
+                let etype = if let DataValue::Str(s) = &row[0] { s.to_string() } else { return None };
+                let ename = if let DataValue::Str(s) = &row[1] { s.to_string() } else { return None };
+                Some((etype, ename))
+            }).collect())
+        };
+
+        let set1 = match load_scope(scope1) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("scope-diff query failed (scope1): {}", e); println!("{{}}"); return; }
+        };
+        let set2 = match load_scope(scope2) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("scope-diff query failed (scope2): {}", e); println!("{{}}"); return; }
+        };
+
+        let to_json = |tuples: &std::collections::HashSet<(String, String)>| -> Vec<JsonValue> {
+            let mut sorted: Vec<(String, String)> = tuples.iter().cloned().collect();
+            sorted.sort();
+            sorted.into_iter().take(limit).map(|(t, n)| {
+                json!({"element_type": t, "element_name": n})
+            }).collect()
+        };
+
+        let only1: std::collections::HashSet<(String, String)> =
+            set1.difference(&set2).cloned().collect();
+        let only2: std::collections::HashSet<(String, String)> =
+            set2.difference(&set1).cloned().collect();
+        let shared: std::collections::HashSet<(String, String)> =
+            set1.intersection(&set2).cloned().collect();
+
+        let output = json!({
+            "scope1": scope1,
+            "scope2": scope2,
+            "only_in_scope1": to_json(&only1),
+            "only_in_scope2": to_json(&only2),
+            "shared": to_json(&shared),
+            "counts": {
+                "only_in_scope1": only1.len(),
+                "only_in_scope2": only2.len(),
+                "shared": shared.len(),
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+    }
+
     /// `pss changes-summary --window <DURATION>` (Phase 3 Tier A)
     ///
     /// Count events by `event_type` in the time window before now. Reads
@@ -4236,6 +4316,112 @@ mod tests {
         }
         let rows_skill = by_marketplace_rows_for_test(&db, "emasoft-plugins", Some("skill"));
         assert!(rows_skill.is_empty(), "no skills in seeded marketplace data");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // F-6 (audit 20260514): scope-diff
+    // ────────────────────────────────────────────────────────────────────
+
+    fn build_test_db_with_two_scopes() -> DbInstance {
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+
+        // user scope has skills "a" and "b"; project scope has "b" and "c".
+        // Expected diff: only_user=["a"], only_project=["c"], shared=["b"].
+        let seed = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["e1", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "a", "skill:a@user:_home", "user", "/home", "user",
+                 "/home/a.md", "h1", 100, 50, true, "active", "{}", ""],
+                ["e2", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "b", "skill:b@user:_home", "user", "/home", "user",
+                 "/home/b.md", "h2", 100, 50, true, "active", "{}", ""],
+                ["e3", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "b", "skill:b@project:demo", "project", "demo", "project:demo",
+                 "/proj/b.md", "h3", 100, 50, true, "active", "{}", ""],
+                ["e4", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "c", "skill:c@project:demo", "project", "demo", "project:demo",
+                 "/proj/c.md", "h4", 100, 50, true, "active", "{}", ""]
+              ]
+            :put events { event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }
+        "#;
+        db.run_script(seed, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed events");
+
+        let seed_state = r#"
+            ?[element_id, last_event_id, current_path, current_hash,
+              current_size, current_token_count, enabled, override_status,
+              installed_at, last_changed_at, exists] <- [
+                ["skill:a@user:_home", "e1", "/home/a.md", "h1", 100, 50, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["skill:b@user:_home", "e2", "/home/b.md", "h2", 100, 50, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["skill:b@project:demo", "e3", "/proj/b.md", "h3", 100, 50, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["skill:c@project:demo", "e4", "/proj/c.md", "h4", 100, 50, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true]
+              ]
+            :put elements_state { element_id =>
+              last_event_id, current_path, current_hash, current_size,
+              current_token_count, enabled, override_status, installed_at,
+              last_changed_at, exists }
+        "#;
+        db.run_script(seed_state, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed elements_state");
+        db
+    }
+
+    /// Helper that runs the scope-diff core query (without the println).
+    fn scope_diff_for_test(
+        db: &DbInstance,
+        scope: &str,
+    ) -> std::collections::HashSet<(String, String)> {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("scope".into(), DataValue::Str(scope.into()));
+        let q = r#"?[element_type, element_name] :=
+            *elements_state{element_id, last_event_id, exists: true},
+            *events{event_id: last_event_id, element_type, element_name, scope},
+            scope = $scope"#;
+        let r = db.run_script(q, params, ScriptMutability::Immutable)
+            .expect("scope query");
+        r.rows.iter().filter_map(|row| {
+            let etype = if let DataValue::Str(s) = &row[0] { s.to_string() } else { return None };
+            let ename = if let DataValue::Str(s) = &row[1] { s.to_string() } else { return None };
+            Some((etype, ename))
+        }).collect()
+    }
+
+    #[test]
+    fn cmd_scope_diff_user_vs_project() {
+        let db = build_test_db_with_two_scopes();
+        let user_set = scope_diff_for_test(&db, "user");
+        let proj_set = scope_diff_for_test(&db, "project");
+        let only_user: Vec<(String, String)> = user_set.difference(&proj_set).cloned().collect();
+        let only_proj: Vec<(String, String)> = proj_set.difference(&user_set).cloned().collect();
+        let shared: Vec<(String, String)> = user_set.intersection(&proj_set).cloned().collect();
+
+        let only_user_names: Vec<&str> = only_user.iter().map(|(_, n)| n.as_str()).collect();
+        let only_proj_names: Vec<&str> = only_proj.iter().map(|(_, n)| n.as_str()).collect();
+        let shared_names: Vec<&str> = shared.iter().map(|(_, n)| n.as_str()).collect();
+
+        assert_eq!(only_user_names, vec!["a"]);
+        assert_eq!(only_proj_names, vec!["c"]);
+        assert_eq!(shared_names, vec!["b"]);
+    }
+
+    #[test]
+    fn cmd_scope_diff_returns_empty_for_unknown_scope() {
+        let db = build_test_db_with_two_scopes();
+        let bogus = scope_diff_for_test(&db, "nonexistent");
+        assert!(bogus.is_empty());
     }
 
     #[test]

@@ -867,6 +867,24 @@ enum Commands {
         limit: usize,
     },
 
+    /// F-6 (audit 20260514): show elements present in `scope1` but not
+    /// `scope2`, and vice versa. Useful for "what does the user scope
+    /// have that the project scope doesn't?" or "what plugin elements
+    /// am I missing in my project?". Both scopes are matched against
+    /// the `scope` column (user/project/local/plugin/marketplace).
+    #[command(name = "scope-diff")]
+    ScopeDiff {
+        /// First scope to compare.
+        scope1: String,
+        /// Second scope to compare.
+        scope2: String,
+        /// Optional element-type filter (e.g. `--type skill`).
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
     /// Count events by event_type in a recent time window.
     /// `pss changes-summary --window 7d` → installed: 12, content_changed: 4, removed: 1.
     /// Accepts the same date shorthand as `as-of` / `list-added-since`.
@@ -15307,6 +15325,10 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             temporal::cli::cmd_by_marketplace(&db, name, r#type.as_deref(), *limit);
             Ok(())
         }
+        Commands::ScopeDiff { scope1, scope2, r#type, limit } => {
+            temporal::cli::cmd_scope_diff(&db, scope1, scope2, r#type.as_deref(), *limit);
+            Ok(())
+        }
         Commands::ChangesSummary { window, r#type } => {
             temporal::cli::cmd_changes_summary(&db, window, r#type.as_deref());
             Ok(())
@@ -16814,6 +16836,24 @@ fn cmd_compare(db: &DbInstance, ref1: &str, ref2: &str, format: &str) -> Result<
     let bb = scalars_b["boost"].as_i64().unwrap_or(0);
     if ba != bb { scalar_diffs.insert("boost".into(), serde_json::json!([ba, bb])); }
 
+    // UX-6 (audit 20260514): Jaccard similarity across all aux-table
+    // fields combined. `|A ∩ B| / |A ∪ B|` summed across every field,
+    // weighted equally per field. Ranges 0.0 (no overlap) → 1.0
+    // (identical aux signature). Empty fields contribute 0 to both
+    // numerator and denominator → don't drag the score down to 0.
+    let similarity = {
+        let mut total_inter: usize = 0;
+        let mut total_union: usize = 0;
+        for field in &fields {
+            let empty = HashSet::new();
+            let a = sets_a.get(*field).unwrap_or(&empty);
+            let b = sets_b.get(*field).unwrap_or(&empty);
+            total_inter += a.intersection(b).count();
+            total_union += a.union(b).count();
+        }
+        if total_union == 0 { 0.0 } else { total_inter as f64 / total_union as f64 }
+    };
+
     if format == "json" {
         let output = serde_json::json!({
             "entry_a": {"name": name1, "scalars": scalars_a},
@@ -16822,10 +16862,12 @@ fn cmd_compare(db: &DbInstance, ref1: &str, ref2: &str, format: &str) -> Result<
             "unique_a": serde_json::Value::Object(unique_a),
             "unique_b": serde_json::Value::Object(unique_b),
             "scalar_diffs": serde_json::Value::Object(scalar_diffs),
+            "similarity": (similarity * 10000.0).round() / 10000.0,
         });
         println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
     } else {
-        println!("━━━ COMPARISON: {} vs {} ━━━", name1, name2);
+        println!("━━━ COMPARISON: {} vs {}  (similarity: {:.2}%) ━━━",
+                 name1, name2, similarity * 100.0);
         println!("\n  {} ({})", name1, scalars_a["type"].as_str().unwrap_or(""));
         println!("    {}", scalars_a["description"].as_str().unwrap_or(""));
         println!("\n  {} ({})", name2, scalars_b["type"].as_str().unwrap_or(""));
