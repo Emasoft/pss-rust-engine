@@ -180,6 +180,21 @@ pub fn content_hash(bytes: &[u8]) -> String {
     hex_lower(&result)
 }
 
+/// DI-1 wave 1 (audit 20260514): a stable 32-char hex digest of an
+/// element's `description` field, used by the description_changed
+/// detector. Empty descriptions hash to the well-known empty-SHA-256
+/// prefix `"e3b0c44298fc1c14"` (16 bytes), which still differs from
+/// `""` — so a transition `<no description>` ↔ `"foo"` is detectable.
+pub fn description_hash(desc: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(desc.as_bytes());
+    let result = hasher.finalize();
+    // 16 bytes = 32 hex chars: collision-safe for ~10k elements and
+    // half the storage cost of a full 64-char SHA-256.
+    let truncated = &result[..16];
+    hex_lower(truncated)
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -356,6 +371,22 @@ const TEMPORAL_DDL: &[&str] = &[
     r#"::index create events:by_event_type { event_type }"#,
     r#"::index create events:by_scope { scope }"#,
     r#"::index create events:by_element_name { element_name }"#,
+    // DI-1 wave 1 (audit 20260514): per-element description tracking so
+    // the writer can detect description_changed events without touching
+    // the elements_state schema (which would force a v2→v3 migration).
+    // The hash is a hex-encoded 16-byte truncated SHA-256 of the raw
+    // description text; storing the text alongside lets us emit a
+    // crisp diff into events.diff_json (and enables a future
+    // `pss description-history` subcommand).
+    //
+    // Storage cost: ~9k rows × (~64 hash + ~200 text) ≈ 2.4 MB at
+    // current scale. Acceptable — events table is already ~12 MB.
+    r#":create element_descriptions {
+        element_id: String =>
+        description_hash: String,
+        description_text: String default "",
+        last_updated_at: String,
+    }"#,
 ];
 
 /// Migrate a legacy v1 DB to v2 (event-sourced) schema. Idempotent —
@@ -1984,6 +2015,60 @@ pub mod cli {
         })
     }
 
+    /// DI-1 wave 1 (audit 20260514): read the prior description hash
+    /// from `element_descriptions`. Returns None when the element has
+    /// never been observed before (first install — no prior to compare
+    /// against). The side-table approach avoids an elements_state
+    /// schema migration.
+    fn read_prior_description_hash(db: &DbInstance, element_id: &str) -> Option<String> {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(element_id.into()));
+        let q = r#"
+            ?[description_hash] :=
+                *element_descriptions{element_id: $eid, description_hash}
+        "#;
+        let rows = db
+            .run_script(q, params, ScriptMutability::Immutable)
+            .ok()?
+            .rows;
+        let r = rows.first()?;
+        match &r[0] {
+            DataValue::Str(s) => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
+    /// DI-1 wave 1: upsert the (element_id, description_hash,
+    /// description_text, last_updated_at) row. Called once per
+    /// observation in merge-events. Idempotent — same hash → identical
+    /// row → no-op semantically.
+    fn upsert_element_description(
+        db: &DbInstance,
+        element_id: &str,
+        description: &str,
+        description_hash: &str,
+        observed_at: &str,
+    ) -> Result<(), String> {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(element_id.into()));
+        params.insert("hash".into(), DataValue::Str(description_hash.into()));
+        // Truncate to 200 chars to bound storage; the full description
+        // lives in skills.description anyway.
+        let truncated: String = description.chars().take(200).collect();
+        params.insert("text".into(), DataValue::Str(truncated.into()));
+        params.insert("ts".into(), DataValue::Str(observed_at.into()));
+        let q = r#"
+            ?[element_id, description_hash, description_text, last_updated_at] <-
+                [[$eid, $hash, $text, $ts]]
+            :put element_descriptions {
+                element_id => description_hash, description_text, last_updated_at
+            }
+        "#;
+        db.run_script(q, params, ScriptMutability::Mutable)
+            .map(|_| ())
+            .map_err(|e| format!("upsert_element_description failed: {}", e))
+    }
+
     /// Insert one event row + upsert the corresponding elements_state row.
     /// The two writes happen sequentially under the caller's lock; the
     /// merge-events orchestrator never partially commits because the
@@ -2248,7 +2333,8 @@ pub mod cli {
         // Emit events for every observation.
         for (_, observations) in &by_type_and_name {
             for obs in observations {
-                let prior = read_prior(db, &obs.element_id());
+                let element_id = obs.element_id();
+                let prior = read_prior(db, &element_id);
                 let evts = compare_and_emit(prior.as_ref(), obs);
                 for evt in evts {
                     let diff = serde_json::json!({
@@ -2271,6 +2357,50 @@ pub mod cli {
                     )?;
                     events_emitted += 1;
                 }
+
+                // DI-1 wave 1 (audit 20260514): description change
+                // detection. Read the prior description_hash from the
+                // side table, compute the new one, and emit a
+                // DescriptionChanged event when they differ AND the
+                // element wasn't just installed (an Installed event
+                // already implies the description is "new"). Skip the
+                // comparison when there's no prior row at all (first
+                // observation — Installed event fired above).
+                let new_desc_hash = description_hash(&obs.description);
+                let prior_desc_hash = read_prior_description_hash(db, &element_id);
+                let element_existed = prior.as_ref().map(|p| p.exists).unwrap_or(false);
+                if let Some(prior_hash) = &prior_desc_hash {
+                    if element_existed && prior_hash != &new_desc_hash {
+                        let diff = serde_json::json!({
+                            "previous_description_hash": prior_hash,
+                            "new_description_hash": new_desc_hash,
+                            "new_description": obs.description.chars().take(200).collect::<String>(),
+                            "event": EventType::DescriptionChanged.as_str(),
+                        })
+                        .to_string();
+                        persist_event_and_state(
+                            db,
+                            &scan_id,
+                            &started_at,
+                            EventType::DescriptionChanged,
+                            obs,
+                            &diff,
+                            obs.enabled,
+                            "active",
+                        )?;
+                        events_emitted += 1;
+                    }
+                }
+                // Always upsert so subsequent observations have a prior
+                // to compare against. The upsert is idempotent — same
+                // hash → no behavioural change.
+                upsert_element_description(
+                    db,
+                    &element_id,
+                    &obs.description,
+                    &new_desc_hash,
+                    &started_at,
+                )?;
                 // If no events fired (unchanged), still refresh
                 // last_changed_at? No — the spec says events table is
                 // append-only and elements_state is materialized FROM
@@ -4079,5 +4209,150 @@ mod tests {
             -1
         };
         assert_eq!(count, 0, "single-scope element must not produce override_started");
+    }
+
+    // ========================================================================
+    // DI-1 wave 1 (audit 20260514): description_changed event tests
+    // ========================================================================
+
+    /// DI-1 wave 1: the description-hash helper is deterministic and
+    /// collision-resistant for typical inputs. Empty input still hashes
+    /// (not the empty string) so empty-vs-non-empty transitions are
+    /// detectable.
+    #[test]
+    fn description_hash_basic_properties() {
+        let a = description_hash("Run security audit");
+        let b = description_hash("Run security audit");
+        assert_eq!(a, b, "same input → same hash");
+        let c = description_hash("Run security audit.");
+        assert_ne!(a, c, "trailing period must change the hash");
+        let empty = description_hash("");
+        assert_eq!(empty.len(), 32, "16-byte truncated SHA-256 = 32 hex chars");
+        assert_ne!(empty, a, "empty must differ from non-empty");
+    }
+
+    /// DI-1 wave 1: changing the description on a subsequent scan emits
+    /// a description_changed event. First scan produces Installed +
+    /// stores the hash; second scan with a different description must
+    /// emit DescriptionChanged.
+    #[test]
+    fn cmd_merge_events_emits_description_changed() {
+        use std::io::Cursor;
+
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+
+        // First scan: install with description "v1".
+        let scan1 = r#"{"_pss_manifest": true, "visited_scope_paths": ["/home"]}
+{"type": "skill", "name": "foo", "source": "user", "path": "/home/foo.md", "description": "v1 description", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan1), true)
+            .expect("first merge-events");
+
+        // Second scan: same element, new description.
+        let scan2 = r#"{"_pss_manifest": true, "visited_scope_paths": ["/home"]}
+{"type": "skill", "name": "foo", "source": "user", "path": "/home/foo.md", "description": "v2 description", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan2), true)
+            .expect("second merge-events");
+
+        let q = r#"
+            ?[event_type, diff_json] :=
+                *events{event_type, diff_json},
+                event_type = "description_changed"
+        "#;
+        let r = db.run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+            .expect("query events");
+        assert_eq!(r.rows.len(), 1, "expected exactly one description_changed event");
+        let diff = match &r.rows[0][1] {
+            DataValue::Str(s) => s.to_string(),
+            _ => String::new(),
+        };
+        assert!(diff.contains("previous_description_hash"));
+        assert!(diff.contains("new_description_hash"));
+        assert!(diff.contains("v2 description"));
+    }
+
+    /// DI-1 wave 1: a re-scan with the SAME description must NOT emit
+    /// description_changed (negative case — false-positive guard).
+    #[test]
+    fn cmd_merge_events_skips_description_unchanged() {
+        use std::io::Cursor;
+
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+
+        let scan = r#"{"_pss_manifest": true, "visited_scope_paths": ["/home"]}
+{"type": "skill", "name": "foo", "source": "user", "path": "/home/foo.md", "description": "unchanged", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan), true)
+            .expect("first merge-events");
+        // Same input, same hash → no DescriptionChanged.
+        cli::merge_events_from_reader(&db, Cursor::new(scan), true)
+            .expect("second merge-events");
+
+        let q = r#"
+            ?[count(event_id)] :=
+                *events{event_id, event_type},
+                event_type = "description_changed"
+        "#;
+        let r = db.run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+            .expect("query events");
+        let count = if let DataValue::Num(Num::Int(n)) = &r.rows[0][0] {
+            *n
+        } else {
+            -1
+        };
+        assert_eq!(count, 0, "same description must not produce description_changed");
+    }
+
+    /// DI-1 wave 1: first observation never emits description_changed
+    /// (no prior to compare against). Installed event covers it.
+    #[test]
+    fn cmd_merge_events_first_install_no_description_changed() {
+        use std::io::Cursor;
+
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+
+        let scan = r#"{"_pss_manifest": true, "visited_scope_paths": ["/home"]}
+{"type": "skill", "name": "fresh", "source": "user", "path": "/home/fresh.md", "description": "brand new", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan), true)
+            .expect("merge-events");
+
+        let q = r#"
+            ?[event_type, count(event_id)] :=
+                *events{event_id, event_type}
+        "#;
+        let r = db.run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+            .expect("query events");
+        // Expect exactly one Installed event, no DescriptionChanged.
+        let mut found_installed = false;
+        for row in &r.rows {
+            if let DataValue::Str(s) = &row[0] {
+                if s.as_str() == "installed" {
+                    found_installed = true;
+                }
+                assert_ne!(
+                    s.as_str(),
+                    "description_changed",
+                    "first install must NOT emit description_changed"
+                );
+            }
+        }
+        assert!(found_installed, "expected installed event for first scan");
     }
 }
