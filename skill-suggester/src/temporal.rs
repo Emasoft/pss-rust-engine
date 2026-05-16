@@ -1614,19 +1614,102 @@ pub mod cli {
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     }
 
-    /// `pss reindex` — placeholder; full implementation in Phase 4.
-    /// For now, prints a message instructing the user to use the legacy
-    /// `pss-reindex-skills` slash command until Phase 4 wires the new
-    /// event-emission orchestration.
+    /// `pss reindex` — COR-8 (audit 20260514): the placeholder that
+    /// referenced "Phase 4 deliverable" has been replaced with a real
+    /// orchestrator wrapper. We execute `scripts/pss_reindex.py` (the
+    /// canonical Python orchestrator that already wires discover →
+    /// enrich → merge-events → temporal merge-events) and surface its
+    /// exit code verbatim. The placeholder lived since v3.3.0 against
+    /// the original TRDD §9.2 promise; surfacing the real path keeps
+    /// the CLI surface honest and lets `pss reindex` work from scripts
+    /// without needing the `/pss-reindex-skills` slash command.
+    ///
+    /// Resolution order for the orchestrator script:
+    ///   1. $CLAUDE_PLUGIN_ROOT/scripts/pss_reindex.py — production
+    ///      (when launched inside Claude Code).
+    ///   2. Sibling `scripts/pss_reindex.py` relative to the Rust
+    ///      binary's parent's parent — dev path so `cargo run` works
+    ///      without env vars.
     pub fn cmd_reindex(_db: &DbInstance, dry_run: bool) {
-        let msg = if dry_run {
-            "pss reindex --dry-run is a Phase 4 deliverable. \
-             Use `/pss-reindex-skills` for now (no event emission yet)."
-        } else {
-            "pss reindex is a Phase 4 deliverable. \
-             Use `/pss-reindex-skills` for now (no event emission yet)."
+        use std::path::PathBuf;
+
+        let script = (|| -> Option<PathBuf> {
+            if let Ok(plugin_root) = std::env::var("CLAUDE_PLUGIN_ROOT") {
+                let p = PathBuf::from(plugin_root).join("scripts/pss_reindex.py");
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                // bin/pss-darwin-arm64 → up 1 = bin/ → up 1 = repo root.
+                let candidate = exe
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|root| root.join("scripts/pss_reindex.py"));
+                if let Some(c) = candidate {
+                    if c.is_file() {
+                        return Some(c);
+                    }
+                }
+                // Fallback: cargo target/release/pss → up 3 = repo root.
+                let alt = exe
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                    .map(|root| root.join("scripts/pss_reindex.py"));
+                if let Some(c) = alt {
+                    if c.is_file() {
+                        return Some(c);
+                    }
+                }
+            }
+            None
+        })();
+
+        let script_path = match script {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "pss reindex: cannot locate scripts/pss_reindex.py. \
+                     Set CLAUDE_PLUGIN_ROOT or run from the plugin's repo."
+                );
+                std::process::exit(2);
+            }
         };
-        eprintln!("{}", msg);
+
+        if dry_run {
+            eprintln!(
+                "pss reindex --dry-run: would invoke {} (use without --dry-run to execute)",
+                script_path.display()
+            );
+            return;
+        }
+
+        let status = std::process::Command::new("uv")
+            .arg("run")
+            .arg("--script")
+            .arg(&script_path)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!(
+                    "pss reindex: orchestrator exited with status {} (script: {})",
+                    s.code().unwrap_or(-1),
+                    script_path.display()
+                );
+                std::process::exit(s.code().unwrap_or(1));
+            }
+            Err(e) => {
+                eprintln!(
+                    "pss reindex: failed to spawn `uv run --script {}`: {}",
+                    script_path.display(),
+                    e
+                );
+                std::process::exit(2);
+            }
+        }
     }
 
     /// Parse a retention duration string. Accepts ISO 8601 ("P9M",

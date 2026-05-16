@@ -441,7 +441,9 @@ enum Commands {
     /// Find entries whose name contains the given substring (case-insensitive).
     #[command(name = "find-by-name")]
     FindByName {
-        /// Substring to match (case-insensitive).
+        /// Substring to match (case-insensitive). With `--regex` this is
+        /// instead a Rust regex pattern, anchored partially (matches
+        /// anywhere unless the pattern includes `^` / `$`).
         substring: String,
 
         /// Maximum number of rows (default: 50).
@@ -451,6 +453,13 @@ enum Commands {
         /// Output as JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// UX-5 (audit 20260514): treat `substring` as a Rust regex
+        /// pattern instead of a case-insensitive substring. Regex is
+        /// applied to the lowercased name. Invalid pattern → exit 2
+        /// with a parse-error line on stderr (fail-fast).
+        #[arg(long, default_value_t = false)]
+        regex: bool,
     },
 
     /// Find entries with an exact keyword match via skill_keywords.
@@ -15084,8 +15093,8 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             cmd_list_added_between(&db, start, end, *limit, *json),
         Commands::ListUpdatedSince { when, limit, json } =>
             cmd_list_updated_since(&db, when, *limit, *json),
-        Commands::FindByName { substring, limit, json } =>
-            cmd_find_by_name(&db, substring, *limit, *json),
+        Commands::FindByName { substring, limit, json, regex } =>
+            cmd_find_by_name(&db, substring, *limit, *json, *regex),
         Commands::FindByKeyword { keyword, limit, json } =>
             cmd_find_by_auxiliary(&db, "skill_keywords", keyword, *limit, *json),
         Commands::FindByDomain { domain, limit, json } =>
@@ -17387,30 +17396,80 @@ fn cmd_list_updated_since(
 
 // --- cmd_find_by_name ---
 
-/// Case-insensitive substring match over the `name` column.
+/// Case-insensitive substring match over the `name` column. With
+/// `regex=true` (UX-5, audit 20260514) the substring is compiled as a
+/// Rust regex and applied to lowercased names — Cozo has no native
+/// regex support, so we fetch all rows and filter in Rust. The query
+/// is bounded by `limit` post-filter.
 fn cmd_find_by_name(
     db: &DbInstance,
     substring: &str,
     limit: usize,
     json: bool,
+    use_regex: bool,
 ) -> Result<(), SuggesterError> {
-    let needle = substring.to_lowercase();
     let limit = limit.min(10000);
-    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
-    params.insert("q".into(), DataValue::Str(needle.into()));
-    let query = format!(
-        "?[name, skill_type, source, path, description] := \
-         *skills{{ name, skill_type, source, path, description }}, \
-         str_includes(lowercase(name), $q) \
-         :order name \
-         :limit {}",
-        limit
-    );
-    let result = db
-        .run_script(&query, params, ScriptMutability::Immutable)
-        .map_err(|e| SuggesterError::IndexParse(format!("find-by-name query failed: {}", e)))?;
-    let entries: Vec<serde_json::Value> = result
-        .rows
+
+    let rows = if use_regex {
+        // UX-5: regex path. Compile pattern (case-insensitive) and
+        // post-filter all skills. We fetch all names with their
+        // metadata, then run the regex in Rust. Invalid patterns
+        // fail loud (exit non-zero).
+        let pattern = match regex::RegexBuilder::new(substring)
+            .case_insensitive(true)
+            .size_limit(1 << 20) // 1 MB compiled-DFA cap
+            .build()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(SuggesterError::IndexParse(format!(
+                    "find-by-name --regex: invalid pattern {:?}: {}",
+                    substring, e
+                )));
+            }
+        };
+        let result = db
+            .run_script(
+                "?[name, skill_type, source, path, description] := \
+                 *skills{ name, skill_type, source, path, description } \
+                 :order name",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                SuggesterError::IndexParse(format!("find-by-name query failed: {}", e))
+            })?;
+        result
+            .rows
+            .into_iter()
+            .filter(|r| {
+                let name = dv_to_string(&r[0]);
+                pattern.is_match(&name)
+            })
+            .take(limit)
+            .collect::<Vec<_>>()
+    } else {
+        // Original case-insensitive substring path.
+        let needle = substring.to_lowercase();
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("q".into(), DataValue::Str(needle.into()));
+        let query = format!(
+            "?[name, skill_type, source, path, description] := \
+             *skills{{ name, skill_type, source, path, description }}, \
+             str_includes(lowercase(name), $q) \
+             :order name \
+             :limit {}",
+            limit
+        );
+        let result = db
+            .run_script(&query, params, ScriptMutability::Immutable)
+            .map_err(|e| {
+                SuggesterError::IndexParse(format!("find-by-name query failed: {}", e))
+            })?;
+        result.rows
+    };
+
+    let entries: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
             serde_json::json!({
@@ -21002,5 +21061,46 @@ mediapipe>=0.10
         let prompt = "x".repeat(5000);
         let result = augment_prompt_if_short(&prompt, "", 4000);
         assert_eq!(result.len(), 4000);
+    }
+
+    // ========================================================================
+    // UX-5 (audit 20260514): --regex flag on find-by-name
+    // ========================================================================
+
+    #[test]
+    fn find_by_name_regex_pattern_invalid_returns_error() {
+        // Unbalanced bracket — regex compilation fails. We don't have a
+        // live db, but we can exercise the pattern build directly: the
+        // function uses regex::RegexBuilder, so it must reject ill-formed
+        // patterns at compile time, not silently match nothing.
+        let bad = regex::RegexBuilder::new("[unbalanced")
+            .case_insensitive(true)
+            .build();
+        assert!(bad.is_err(), "invalid regex must fail to compile");
+    }
+
+    #[test]
+    fn find_by_name_regex_pattern_matches_anywhere() {
+        // Smoke test for the regex semantics we promise: pattern is
+        // applied with case_insensitive(true), partial (no implicit
+        // anchors), against the lowercased name.
+        let re = regex::RegexBuilder::new("foo.*bar")
+            .case_insensitive(true)
+            .build()
+            .expect("compile");
+        assert!(re.is_match("xfoozyzbar"));
+        assert!(re.is_match("FoOBaR"));
+        assert!(!re.is_match("only-foo"));
+    }
+
+    #[test]
+    fn find_by_name_regex_pattern_anchored_with_caret() {
+        // User can opt into anchoring with `^` / `$`.
+        let re = regex::RegexBuilder::new("^pss-")
+            .case_insensitive(true)
+            .build()
+            .expect("compile");
+        assert!(re.is_match("pss-suggest"));
+        assert!(!re.is_match("my-pss-suggest"));
     }
 }
