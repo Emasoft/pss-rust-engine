@@ -803,6 +803,22 @@ enum Commands {
         #[arg(long, value_name = "TYPE")]
         r#type: Option<String>,
     },
+
+    /// Find (element_type, element_name) pairs that appear in 2+ scopes.
+    /// Helps catch accidental duplicates between user/project/plugin
+    /// installations of the same skill or agent — the audit's "dedup
+    /// candidates" pattern (Tier A F-8).
+    #[command(name = "dedup-candidates")]
+    DedupCandidates {
+        /// Minimum number of scopes for a name to be reported (default 2).
+        #[arg(long, default_value_t = 2)]
+        min_count: usize,
+        /// Optional element-type filter (e.g. `--type skill`).
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
 }
 
 // ============================================================================
@@ -15183,6 +15199,12 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
         }
         Commands::EnabledWhere { name, r#type } => {
             temporal::cli::cmd_enabled_where(&db, name, r#type.as_deref());
+            Ok(())
+        }
+        Commands::DedupCandidates { min_count, r#type, limit } => {
+            temporal::cli::cmd_dedup_candidates(
+                &db, *min_count, r#type.as_deref(), *limit,
+            );
             Ok(())
         }
     }

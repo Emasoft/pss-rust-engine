@@ -1320,6 +1320,61 @@ pub mod cli {
         }
     }
 
+    /// `pss dedup-candidates [--min-count N] [--type T]` (Phase 3 Tier A F-8)
+    ///
+    /// Group currently-active elements by `(element_type, element_name)` and
+    /// return groups whose distinct-scope count is ≥ `min_count`. Highlights
+    /// accidental duplicates between user/project/plugin installations of
+    /// the same name — exactly the "is this skill installed twice?" question
+    /// the audit identified as missing.
+    pub fn cmd_dedup_candidates(
+        db: &DbInstance,
+        min_count: usize,
+        type_filter: Option<&str>,
+        limit: usize,
+    ) {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("min".into(), DataValue::Num(Num::Int(min_count as i64)));
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        let mut filter_clauses = String::new();
+        if let Some(t) = type_filter {
+            filter_clauses.push_str(", etype = $f_type");
+            params.insert("f_type".into(), DataValue::Str(t.into()));
+        }
+        // Two-rule Datalog: count distinct element_ids per (type, name),
+        // then filter for count >= min_count.
+        let q = format!(
+            r#"
+            counts[etype, ename, count(eid)] :=
+                *elements_state{{element_id: eid, last_event_id, exists: true}},
+                *events{{event_id: last_event_id, element_type: etype, element_name: ename}}
+
+            ?[etype, ename, c] :=
+                counts[etype, ename, c],
+                c >= $min{filters}
+            :order -c, etype, ename
+            :limit $limit
+            "#,
+            filters = filter_clauses
+        );
+        match db.run_script(&q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let out: Vec<JsonValue> = r.rows.iter().map(|row| {
+                    json!({
+                        "element_type": data_to_json(&row[0]),
+                        "element_name": data_to_json(&row[1]),
+                        "scope_count": data_to_json(&row[2]),
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&JsonValue::Array(out)).unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("dedup-candidates query failed: {}", e);
+                println!("[]");
+            }
+        }
+    }
+
     /// `pss removed-since <DATE>`
     pub fn cmd_removed_since(db: &DbInstance, date: &str, limit: usize) {
         let cutoff = match resolve_date(date) {
@@ -1898,6 +1953,22 @@ pub mod cli {
                 Ok(v) => v,
                 Err(_) => continue, // tolerate malformed lines
             };
+            // DI-4 (audit 20260514): leading manifest line lists every
+            // scope_path the discoverer walked, even those with zero
+            // observations. Without this, a plugin uninstall that left
+            // zero observations for its scope_path was never detected
+            // as a removal (visited_scope_paths populated only from
+            // successful observations missed the dead plugin's path).
+            if value.get("_pss_manifest").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if let Some(arr) = value.get("visited_scope_paths").and_then(|v| v.as_array()) {
+                    for sp in arr {
+                        if let Some(s) = sp.as_str() {
+                            visited_scope_paths.insert(s.to_string());
+                        }
+                    }
+                }
+                continue; // manifest line consumed — don't try to parse as observation
+            }
             let etype_str = value
                 .get("type")
                 .and_then(|v| v.as_str())
@@ -3526,6 +3597,89 @@ mod tests {
         let db = build_test_db_with_plugin_sources();
         let rows = by_plugin_rows_for_test(&db, "nonexistent-plugin", None);
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn cmd_dedup_candidates_finds_duplicate_names() {
+        // F-8 (audit 20260514): dedup-candidates must find element names
+        // that appear in 2+ scopes. We seed a duplicate (same name "foo",
+        // different scopes) and expect it back; a unique name must NOT
+        // appear when --min-count=2.
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+
+        // Seed events: "foo" skill in user + plugin scopes (DUPLICATE),
+        // "bar" skill in user only (UNIQUE).
+        let seed = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["e1", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "foo", "skill:foo@user:_home", "user", "/home", "user",
+                 "/home/foo.md", "h1", 100, 50, true, "active", "{}", ""],
+                ["e2", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "foo", "skill:foo@plugin:p", "plugin", "p", "plugin:p",
+                 "/p/foo.md", "h2", 100, 50, true, "active", "{}", ""],
+                ["e3", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "bar", "skill:bar@user:_home", "user", "/home", "user",
+                 "/home/bar.md", "h3", 100, 50, true, "active", "{}", ""]
+              ]
+            :put events { event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }
+        "#;
+        db.run_script(seed, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed events");
+        let seed_state = r#"
+            ?[element_id, last_event_id, current_path, current_hash,
+              current_size, current_token_count, enabled, override_status,
+              installed_at, last_changed_at, exists] <- [
+                ["skill:foo@user:_home", "e1", "/home/foo.md", "h1", 100, 50, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["skill:foo@plugin:p",  "e2", "/p/foo.md",    "h2", 100, 50, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["skill:bar@user:_home", "e3", "/home/bar.md", "h3", 100, 50, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true]
+              ]
+            :put elements_state { element_id =>
+              last_event_id, current_path, current_hash, current_size,
+              current_token_count, enabled, override_status, installed_at,
+              last_changed_at, exists }
+        "#;
+        db.run_script(seed_state, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed elements_state");
+
+        // Run the same query the cmd_dedup_candidates impl uses.
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("min".into(), DataValue::Num(Num::Int(2)));
+        let q = r#"
+            counts[etype, ename, count(eid)] :=
+                *elements_state{element_id: eid, last_event_id, exists: true},
+                *events{event_id: last_event_id, element_type: etype, element_name: ename}
+
+            ?[etype, ename, c] :=
+                counts[etype, ename, c],
+                c >= $min
+            :order -c, etype, ename
+        "#;
+        let r = db.run_script(q, params, ScriptMutability::Immutable)
+            .expect("dedup query must run");
+        // Expected: ("skill", "foo", 2) appears; "bar" does not.
+        let mut found_foo = false;
+        for row in &r.rows {
+            if let DataValue::Str(name) = &row[1] {
+                if name.as_str() == "foo" {
+                    found_foo = true;
+                }
+                assert_ne!(name.as_str(), "bar", "unique name must not appear");
+            }
+        }
+        assert!(found_foo, "duplicate skill 'foo' must be detected");
     }
 
     #[test]
