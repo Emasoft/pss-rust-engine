@@ -742,8 +742,16 @@ enum Commands {
 
     /// All events for one plugin name (across versions / scopes).
     /// `pss plugin-history <PLUGIN_NAME>`
+    ///
+    /// DI-9 (audit 20260514): plugins are stored as the composite
+    /// `<name>@<marketplace>` (e.g. `perfect-skill-suggester@emasoft-plugins`).
+    /// You can pass either form:
+    ///   • the full `<name>@<marketplace>` for an exact match, or
+    ///   • just `<name>` to find the plugin across all marketplaces.
     #[command(name = "plugin-history")]
     PluginHistory {
+        /// Either `<plugin>@<marketplace>` (exact) or `<plugin>`
+        /// (matches across all marketplaces).
         plugin_name: String,
         #[arg(long, default_value_t = 500)]
         limit: usize,

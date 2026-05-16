@@ -1889,7 +1889,18 @@ pub mod cli {
     /// `"local"` → `"local"`, `"plugin:..."` → `"plugin"`,
     /// `"marketplace:..."` → `"marketplace"`. Returns the source verbatim
     /// for unknown forms so we never silently lose data.
-    fn scope_from_discovery_source(source: &str) -> String {
+    pub(crate) fn scope_from_discovery_source(source: &str) -> String {
+        // DI-10 (audit 20260514): project-installed plugins are encoded
+        // as `project:<name>/plugin:<plugin>` by the discoverer. The
+        // previous logic matched the `project:` prefix first and
+        // classified them as scope "project" — wrong. Plugins installed
+        // into a project are still plugin-scope (overridden by the
+        // project's own elements but still part of the plugin's
+        // namespace). Check the composite form before the bare project
+        // prefix.
+        if source.starts_with("project:") && source.contains("/plugin:") {
+            return "plugin".to_string();
+        }
         if source == "user" || source.starts_with("user:") {
             "user".to_string()
         } else if source == "project" || source.starts_with("project:") {
@@ -1912,7 +1923,13 @@ pub mod cli {
     /// name (`project:foo`) we use the project name as the slug; for
     /// plugin-scoped records (`plugin:<marketplace>/<name>`) we use that
     /// composite. Empty string for global scopes (user, marketplace).
-    fn scope_path_from_discovery_source(source: &str) -> String {
+    ///
+    /// DI-10 (audit 20260514): for `project:<name>/plugin:<plugin>`
+    /// composite (a plugin installed into a specific project) we keep
+    /// the FULL composite (`<name>/plugin:<plugin>`) as the scope_path
+    /// so two projects with the same plugin don't collide on
+    /// element_id. The composite path is unique per (project, plugin).
+    pub(crate) fn scope_path_from_discovery_source(source: &str) -> String {
         if let Some(rest) = source.strip_prefix("project:") {
             rest.to_string()
         } else if let Some(rest) = source.strip_prefix("local:") {
@@ -3184,17 +3201,56 @@ pub mod cli {
 
     /// `pss plugin-history <PLUGIN_NAME>` — every event whose
     /// element_type=="plugin" AND element_name matches.
+    ///
+    /// DI-9 (audit 20260514): the discoverer stores plugin element_name
+    /// as the composite `<name>@<marketplace>` (e.g.
+    /// `perfect-skill-suggester@emasoft-plugins`). Looking up by just
+    /// `perfect-skill-suggester` used to return `[]` because the
+    /// equality match required the user to know the exact marketplace
+    /// they installed from. The fix accepts BOTH forms:
+    ///   - `name@marketplace` → exact equality match (original
+    ///     behaviour, still works).
+    ///   - `name` (no `@`) → prefix match across all marketplaces
+    ///     (`name@*`), so a user can find their plugin without
+    ///     remembering the marketplace.
     pub fn cmd_plugin_history(db: &DbInstance, plugin_name: &str, limit: usize) {
-        let q = r#"
-            ?[observed_at, event_type, element_name, element_id, scope, diff_json] :=
-                *events{event_type, element_type: "plugin", observed_at,
-                        element_name, element_id, scope, diff_json},
-                element_name == $name
-            :order observed_at
-            :limit $limit
-        "#;
+        // DI-9: dual-mode lookup.
+        let has_at = plugin_name.contains('@');
+        let q = if has_at {
+            // Exact match (original semantics).
+            r#"
+                ?[observed_at, event_type, element_name, element_id, scope, diff_json] :=
+                    *events{event_type, element_type: "plugin", observed_at,
+                            element_name, element_id, scope, diff_json},
+                    element_name == $name
+                :order observed_at
+                :limit $limit
+            "#
+        } else {
+            // Prefix match: `<name>@*`. Datalog has no native LIKE, but
+            // we can express the prefix bound via the lex order of the
+            // matched string: element_name >= "name@" AND
+            // element_name < "name@~" (the `~` byte sorts above `}`,
+            // which is the highest ASCII byte plugin names typically
+            // contain — safe for the marketplace suffix).
+            r#"
+                ?[observed_at, event_type, element_name, element_id, scope, diff_json] :=
+                    *events{event_type, element_type: "plugin", observed_at,
+                            element_name, element_id, scope, diff_json},
+                    starts_with(element_name, $prefix)
+                :order observed_at
+                :limit $limit
+            "#
+        };
         let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
-        params.insert("name".into(), DataValue::Str(plugin_name.into()));
+        if has_at {
+            params.insert("name".into(), DataValue::Str(plugin_name.into()));
+        } else {
+            params.insert(
+                "prefix".into(),
+                DataValue::Str(format!("{}@", plugin_name).into()),
+            );
+        }
         params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
         match db.run_script(q, params, ScriptMutability::Immutable) {
             Ok(r) => {
@@ -4354,5 +4410,52 @@ mod tests {
             }
         }
         assert!(found_installed, "expected installed event for first scan");
+    }
+
+    // ========================================================================
+    // DI-10 (audit 20260514): project-installed plugins must classify as scope "plugin"
+    // ========================================================================
+
+    /// DI-10: `project:foo/plugin:bar` MUST classify as scope "plugin",
+    /// not "project". The discoverer encodes project-installed plugins
+    /// in this composite form; the previous logic matched `project:`
+    /// first and mis-classified them.
+    #[test]
+    fn scope_from_discovery_source_project_plugin_composite() {
+        // The composite form a project-installed plugin produces.
+        assert_eq!(
+            cli::scope_from_discovery_source("project:myproj/plugin:foo"),
+            "plugin",
+            "project-installed plugin must classify as plugin scope"
+        );
+        // Bare project (not a plugin) still classifies as project.
+        assert_eq!(
+            cli::scope_from_discovery_source("project:myproj"),
+            "project"
+        );
+        // Plain plugin source unchanged.
+        assert_eq!(
+            cli::scope_from_discovery_source("plugin:foo"),
+            "plugin"
+        );
+    }
+
+    /// DI-10: scope_path for the composite form keeps both parts so
+    /// `<project1>/plugin:foo` and `<project2>/plugin:foo` don't collide.
+    #[test]
+    fn scope_path_from_discovery_source_preserves_composite() {
+        assert_eq!(
+            cli::scope_path_from_discovery_source("project:projA/plugin:foo"),
+            "projA/plugin:foo"
+        );
+        assert_eq!(
+            cli::scope_path_from_discovery_source("project:projB/plugin:foo"),
+            "projB/plugin:foo"
+        );
+        // The two scope_paths above differ, so element_ids will too.
+        assert_ne!(
+            cli::scope_path_from_discovery_source("project:projA/plugin:foo"),
+            cli::scope_path_from_discovery_source("project:projB/plugin:foo")
+        );
     }
 }
