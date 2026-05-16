@@ -1301,6 +1301,114 @@ pub mod cli {
         }
     }
 
+    /// F-17 (audit 20260514): list every event from a specific scan_id.
+    pub fn cmd_changes_in_batch(db: &DbInstance, scan_id: &str, limit: usize) {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("scan_id".into(), DataValue::Str(scan_id.into()));
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        let q = r#"
+            ?[observed_at, event_type, element_type, element_name, element_id, scope, diff_json] :=
+                *events{event_id, scan_id, observed_at, event_type,
+                        element_type, element_name, element_id, scope, diff_json},
+                scan_id = $scan_id
+            :order observed_at, element_name
+            :limit $limit
+        "#;
+        match db.run_script(q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let rows: Vec<JsonValue> = r.rows.into_iter().map(|row| {
+                    json!({
+                        "observed_at": data_to_json(&row[0]),
+                        "event_type": data_to_json(&row[1]),
+                        "element_type": data_to_json(&row[2]),
+                        "element_name": data_to_json(&row[3]),
+                        "element_id": data_to_json(&row[4]),
+                        "scope": data_to_json(&row[5]),
+                        "diff_json": data_to_json(&row[6]),
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("changes-in-batch query failed: {}", e);
+                println!("[]");
+            }
+        }
+    }
+
+    /// F-18 (audit 20260514): emit every event from the most recent scan.
+    pub fn cmd_last_changes(db: &DbInstance, limit: usize) {
+        // Find the latest scan_id by `started_at` from scan_runs.
+        let latest_q = r#"
+            ?[scan_id, started_at] :=
+                *scan_runs{scan_id, started_at}
+            :order -started_at
+            :limit 1
+        "#;
+        let latest = match db.run_script(latest_q, BTreeMap::new(), ScriptMutability::Immutable) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("last-changes: scan_runs query failed: {}", e);
+                println!("[]");
+                return;
+            }
+        };
+        let scan_id = match latest.rows.first().and_then(|r| r.first()) {
+            Some(DataValue::Str(s)) => s.to_string(),
+            _ => {
+                eprintln!("last-changes: no scan_runs found");
+                println!("[]");
+                return;
+            }
+        };
+        cmd_changes_in_batch(db, &scan_id, limit);
+    }
+
+    /// F-19 (audit 20260514): count elements per scope, optionally
+    /// filtered by element_type. Reads `elements_state` joined against
+    /// `events.scope` via last_event_id.
+    pub fn cmd_stats_by_scope(db: &DbInstance, type_filter: Option<&str>) {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        let mut filters = String::new();
+        if let Some(t) = type_filter {
+            filters.push_str(", element_type = $f_type");
+            params.insert("f_type".into(), DataValue::Str(t.into()));
+        }
+        let q = format!(
+            r#"?[scope, element_type, count(element_id)] :=
+                *elements_state{{element_id, last_event_id, exists: true}},
+                *events{{event_id: last_event_id, scope, element_type}}{filters}
+            :order scope, element_type"#,
+            filters = filters
+        );
+        match db.run_script(&q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let mut by_scope: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>> =
+                    std::collections::BTreeMap::new();
+                let mut total: i64 = 0;
+                for row in &r.rows {
+                    let scope = if let DataValue::Str(s) = &row[0] { s.to_string() } else { continue };
+                    let etype = if let DataValue::Str(s) = &row[1] { s.to_string() } else { continue };
+                    let count = match &row[2] {
+                        DataValue::Num(Num::Int(n)) => *n,
+                        _ => 0,
+                    };
+                    by_scope.entry(scope).or_default().insert(etype, count);
+                    total += count;
+                }
+                let output = json!({
+                    "by_scope": by_scope,
+                    "total_elements": total,
+                });
+                println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("stats-by-scope query failed: {}", e);
+                println!("{{}}");
+            }
+        }
+    }
+
     /// `pss scope-diff <SCOPE1> <SCOPE2>` (Phase 3 Tier A — F-6, audit 20260514)
     ///
     /// Show elements present in one scope but not the other. Output is
@@ -4422,6 +4530,51 @@ mod tests {
         let db = build_test_db_with_two_scopes();
         let bogus = scope_diff_for_test(&db, "nonexistent");
         assert!(bogus.is_empty());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // F-19 (audit 20260514): stats-by-scope query
+    // ────────────────────────────────────────────────────────────────────
+
+    /// F-19: count elements per scope. We can run the Datalog directly
+    /// against the same seed data used by scope-diff tests.
+    #[test]
+    fn cmd_stats_by_scope_counts_per_scope() {
+        let db = build_test_db_with_two_scopes();
+        // user has 2 (a, b); project has 2 (b, c).
+        let q = r#"?[scope, count(element_id)] :=
+            *elements_state{element_id, last_event_id, exists: true},
+            *events{event_id: last_event_id, scope}
+            :order scope"#;
+        let r = db.run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+            .expect("query");
+        let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        for row in &r.rows {
+            let scope = if let DataValue::Str(s) = &row[0] { s.to_string() } else { continue };
+            let n = if let DataValue::Num(Num::Int(n)) = &row[1] { *n } else { 0 };
+            counts.insert(scope, n);
+        }
+        assert_eq!(counts.get("user").copied(), Some(2));
+        assert_eq!(counts.get("project").copied(), Some(2));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // F-17 (audit 20260514): changes-in-batch
+    // ────────────────────────────────────────────────────────────────────
+
+    /// F-17: lookup events by scan_id should return all 4 seeded events.
+    #[test]
+    fn cmd_changes_in_batch_finds_events_for_scan_id() {
+        let db = build_test_db_with_two_scopes();
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("scan_id".into(), DataValue::Str("s1".into()));
+        let q = r#"?[count(event_id)] :=
+            *events{event_id, scan_id},
+            scan_id = $scan_id"#;
+        let r = db.run_script(q, params, ScriptMutability::Immutable)
+            .expect("query");
+        let count = if let DataValue::Num(Num::Int(n)) = &r.rows[0][0] { *n } else { -1 };
+        assert_eq!(count, 4, "expected 4 events for scan_id=s1");
     }
 
     #[test]

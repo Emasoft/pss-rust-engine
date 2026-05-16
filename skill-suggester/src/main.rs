@@ -885,6 +885,34 @@ enum Commands {
         limit: usize,
     },
 
+    /// F-17 (audit 20260514): list every event from a specific scan_id.
+    /// Useful for "what happened during this reindex?" — you can read
+    /// the scan_id from `pss scan-log` or from any event row.
+    #[command(name = "changes-in-batch")]
+    ChangesInBatch {
+        /// ULID-format scan_id (from scan_runs / events.scan_id).
+        scan_id: String,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
+    /// F-18 (audit 20260514): emit every event from the most recent
+    /// scan. Shortcut for `changes-in-batch $(pss scan-log | latest)`.
+    #[command(name = "last-changes")]
+    LastChanges {
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
+    /// F-19 (audit 20260514): count elements per scope (and per type
+    /// within each scope). Output is a JSON object keyed by scope.
+    #[command(name = "stats-by-scope")]
+    StatsByScope {
+        /// Optional element-type filter; without it counts every type.
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+    },
+
     /// Count events by event_type in a recent time window.
     /// `pss changes-summary --window 7d` → installed: 12, content_changed: 4, removed: 1.
     /// Accepts the same date shorthand as `as-of` / `list-added-since`.
@@ -15327,6 +15355,18 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
         }
         Commands::ScopeDiff { scope1, scope2, r#type, limit } => {
             temporal::cli::cmd_scope_diff(&db, scope1, scope2, r#type.as_deref(), *limit);
+            Ok(())
+        }
+        Commands::ChangesInBatch { scan_id, limit } => {
+            temporal::cli::cmd_changes_in_batch(&db, scan_id, *limit);
+            Ok(())
+        }
+        Commands::LastChanges { limit } => {
+            temporal::cli::cmd_last_changes(&db, *limit);
+            Ok(())
+        }
+        Commands::StatsByScope { r#type } => {
+            temporal::cli::cmd_stats_by_scope(&db, r#type.as_deref());
             Ok(())
         }
         Commands::ChangesSummary { window, r#type } => {
