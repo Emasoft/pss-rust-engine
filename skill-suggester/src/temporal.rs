@@ -1906,6 +1906,7 @@ pub mod cli {
     /// merge-events orchestrator never partially commits because the
     /// transaction is bounded by the binary's lifetime.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn persist_event_and_state(
         db: &DbInstance,
         scan_id: &str,
@@ -1914,6 +1915,16 @@ pub mod cli {
         obs: &Observation,
         diff_json: &str,
         update_state: bool,
+        // DI-2 (audit 20260514): the writer previously hard-coded
+        // `override_status: "active"` for every event, so multi-scope
+        // override resolution (resolve_overrides() — defined since v3.4.0
+        // but never invoked) could never see real status. Adding an
+        // explicit parameter (with a default of "active" supplied by
+        // every existing caller) keeps the prior behavior intact while
+        // letting the new override-resolution pass below the main loop
+        // emit OverrideStarted/OverrideEnded events with the right
+        // values.
+        override_status: &str,
     ) -> Result<(), String> {
         use cozo::Num;
         let event_id = ulid::Ulid::new().to_string();
@@ -1946,7 +1957,7 @@ pub mod cli {
             DataValue::Num(Num::Int(obs.token_count)),
         );
         params.insert("enabled".into(), DataValue::Bool(obs.enabled));
-        params.insert("override_status".into(), DataValue::Str("active".into()));
+        params.insert("override_status".into(), DataValue::Str(override_status.into()));
         params.insert("diff_json".into(), DataValue::Str(diff_json.into()));
         params.insert("snapshot_ref".into(), DataValue::Str("".into()));
 
@@ -1980,7 +1991,7 @@ pub mod cli {
             DataValue::Num(Num::Int(obs.token_count)),
         );
         state_params.insert("enabled".into(), DataValue::Bool(obs.enabled));
-        state_params.insert("override_status".into(), DataValue::Str("active".into()));
+        state_params.insert("override_status".into(), DataValue::Str(override_status.into()));
         state_params.insert("installed_at".into(), DataValue::Str(prior_installed_at.into()));
         state_params.insert("last_changed_at".into(), DataValue::Str(observed_at.into()));
         state_params.insert("exists".into(), DataValue::Bool(exists));
@@ -2013,8 +2024,22 @@ pub mod cli {
     /// stdin and emits events. This is the ONLY writer of `events` and
     /// `elements_state` during normal reindex flow.
     pub fn cmd_merge_events(db: &DbInstance, quiet: bool) -> Result<(), String> {
+        use std::io::BufReader;
+        let stdin = std::io::stdin();
+        let reader = BufReader::new(stdin.lock());
+        merge_events_from_reader(db, reader, quiet)
+    }
+
+    /// Reader-driven variant of [`cmd_merge_events`] so tests can pipe a
+    /// `Cursor<&str>` without touching stdin. Production code always goes
+    /// through `cmd_merge_events`, which builds the reader from
+    /// `std::io::stdin()` and delegates here.
+    pub fn merge_events_from_reader<R: std::io::BufRead>(
+        db: &DbInstance,
+        reader: R,
+        quiet: bool,
+    ) -> Result<(), String> {
         use std::collections::{HashMap, HashSet};
-        use std::io::{BufRead, BufReader};
 
         ensure_schema(db)?;
 
@@ -2028,8 +2053,6 @@ pub mod cli {
         // resolution sees all candidates before deciding the active row.
         let mut by_type_and_name: HashMap<(String, String), Vec<Observation>> = HashMap::new();
 
-        let stdin = std::io::stdin();
-        let reader = BufReader::new(stdin.lock());
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
@@ -2157,6 +2180,11 @@ pub mod cli {
                     // says enabled=true.
                     persist_event_and_state(
                         db, &scan_id, &started_at, evt, obs, &diff, obs.enabled,
+                        // Per-observation events default to "active" — the
+                        // override-resolution pass below this loop emits
+                        // separate Override* events with the resolved
+                        // status when scopes actually conflict.
+                        "active",
                     )?;
                     events_emitted += 1;
                 }
@@ -2164,6 +2192,76 @@ pub mod cli {
                 // last_changed_at? No — the spec says events table is
                 // append-only and elements_state is materialized FROM
                 // events. Skipping is correct.
+            }
+        }
+
+        // DI-2 (audit 20260514): override resolution pass. For each
+        // (element_type, name) group with multiple scope candidates, run
+        // resolve_overrides() to determine the effective active row, then
+        // compare against each candidate's prior override_status. If the
+        // status differs, emit an OverrideStarted (becoming overridden) or
+        // OverrideEnded (no longer overridden) event. This finally
+        // surfaces the resolver that has been defined and unit-tested but
+        // never wired into the writer (audit §4.B DI-2).
+        for ((etype_str, _name), observations) in by_type_and_name.iter() {
+            // Single-scope groups don't have override decisions — skip.
+            if observations.len() <= 1 {
+                continue;
+            }
+            let element_type = match parse_element_type(etype_str) {
+                Some(t) => t,
+                None => continue,
+            };
+            if !element_type.has_override_precedence() {
+                continue; // hooks / mcp / lsp don't override by file precedence
+            }
+            let candidates: Vec<(String, String)> = observations
+                .iter()
+                .map(|o| (o.element_id(), o.scope.clone()))
+                .collect();
+            let resolved = resolve_overrides(element_type, &candidates);
+            for (eid, new_status) in &resolved {
+                // What did elements_state say BEFORE this scan?
+                let prior_status = read_prior(db, eid)
+                    .map(|p| p.override_status)
+                    .unwrap_or_else(|| "active".to_string());
+                if new_status == &prior_status {
+                    continue; // unchanged — no event needed
+                }
+                // Find the matching observation so we can persist with the
+                // right scope/path/hash metadata.
+                let obs = match observations.iter().find(|o| o.element_id() == *eid) {
+                    Some(o) => o,
+                    None => continue,
+                };
+                // Decide event direction: was-active → now-not = Override
+                // started; was-not-active → now-active = Override ended.
+                let evt = if prior_status == "active" {
+                    EventType::OverrideStarted
+                } else if new_status == "active" {
+                    EventType::OverrideEnded
+                } else {
+                    // Both non-active but different (e.g. overridden_by
+                    // pointer changed). Treat as Started for clarity.
+                    EventType::OverrideStarted
+                };
+                let diff = serde_json::json!({
+                    "previous_override_status": prior_status,
+                    "new_override_status": new_status,
+                    "event": evt.as_str(),
+                })
+                .to_string();
+                persist_event_and_state(
+                    db,
+                    &scan_id,
+                    &started_at,
+                    evt,
+                    obs,
+                    &diff,
+                    obs.enabled,
+                    new_status,
+                )?;
+                events_emitted += 1;
             }
         }
 
@@ -2189,6 +2287,8 @@ pub mod cli {
                     &meta,
                     &diff,
                     true,
+                    // Removal events: override_status no longer relevant.
+                    "active",
                 )?;
                 events_emitted += 1;
             }
@@ -3797,5 +3897,104 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(installed_count, 3, "expected 3 installed events");
+    }
+
+    /// DI-2 (audit 20260514): when the merge-events writer sees the same
+    /// (element_type, name) coming from BOTH a user scope and a plugin
+    /// scope, the override resolver must run and emit an
+    /// `override_started` event for the lower-priority candidate. Prior
+    /// to v3.6.4 the resolver existed but was never wired, so this case
+    /// silently produced `override_status: "active"` on both rows.
+    #[test]
+    fn cmd_merge_events_wires_override_resolver() {
+        use std::io::Cursor;
+
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+
+        // Two observations of the SAME skill name "shared" — one from
+        // user scope (higher priority), one from a plugin (lower).
+        // resolve_overrides() should mark the plugin one as
+        // `overridden_by:skill:shared@user:_home` and the user one as
+        // `overrides:skill:shared@plugin:foo`.
+        let jsonl = r#"{"_pss_manifest": true, "visited_scope_paths": ["/home", "foo/skills"]}
+{"type": "skill", "name": "shared", "source": "user", "path": "/home/shared.md", "description": "user scope", "enabled": true}
+{"type": "skill", "name": "shared", "source": "plugin:foo", "path": "foo/skills/shared.md", "description": "plugin scope", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(jsonl), true)
+            .expect("merge-events must succeed");
+
+        // Verify both override-resolution events were emitted with the
+        // RIGHT override_status (not the placeholder "active").
+        let q = r#"
+            ?[element_id, event_type, override_status] :=
+                *events{element_id, event_type, override_status},
+                event_type = "override_started"
+        "#;
+        let r = db.run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+            .expect("query events");
+        assert!(
+            !r.rows.is_empty(),
+            "DI-2 wiring must emit override_started events when 2+ scopes share a name; got 0 rows"
+        );
+
+        // Inspect every override_started row: status must NOT be the
+        // pre-v3.6.4 placeholder "active".
+        for row in &r.rows {
+            let status = if let DataValue::Str(s) = &row[2] {
+                s.as_str().to_string()
+            } else {
+                String::new()
+            };
+            assert_ne!(
+                status, "active",
+                "override_started row must carry a real override_status (overrides:/overridden_by:); got 'active'"
+            );
+            assert!(
+                status.starts_with("overrides:") || status.starts_with("overridden_by:"),
+                "expected resolver-marker prefix, got: {}",
+                status
+            );
+        }
+    }
+
+    /// DI-2: when only ONE scope reports the element, the resolver must
+    /// NOT emit an override_started event (single-scope = no override
+    /// decision to make). Negative test guarding against false positives.
+    #[test]
+    fn cmd_merge_events_skips_override_for_single_scope() {
+        use std::io::Cursor;
+
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+
+        // One observation only — resolver must skip.
+        let jsonl = r#"{"_pss_manifest": true, "visited_scope_paths": ["/home"]}
+{"type": "skill", "name": "solo", "source": "user", "path": "/home/solo.md", "description": "only here", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(jsonl), true)
+            .expect("merge-events must succeed");
+
+        let q = r#"
+            ?[count(event_id)] :=
+                *events{event_id, event_type},
+                event_type = "override_started"
+        "#;
+        let r = db.run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+            .expect("query events");
+        let count = if let DataValue::Num(Num::Int(n)) = &r.rows[0][0] {
+            *n
+        } else {
+            -1
+        };
+        assert_eq!(count, 0, "single-scope element must not produce override_started");
     }
 }
