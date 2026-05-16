@@ -804,6 +804,23 @@ enum Commands {
         r#type: Option<String>,
     },
 
+    /// Diff two point-in-time snapshots — returns `only_at_date1`,
+    /// `only_at_date2`, and `common_count`. Useful for "what got installed
+    /// vs removed between last week and now?" audits. (Tier A F-5.)
+    #[command(name = "compare-snapshots")]
+    CompareSnapshots {
+        /// First snapshot date (RFC 3339, YYYY-MM-DD, relative shorthand, or 'now'/'yesterday').
+        date1: String,
+        /// Second snapshot date (same formats).
+        date2: String,
+        /// Optional element-type filter.
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        /// Cap total elements scanned per snapshot (default 5000).
+        #[arg(long, default_value_t = 5000)]
+        limit: usize,
+    },
+
     /// Find (element_type, element_name) pairs that appear in 2+ scopes.
     /// Helps catch accidental duplicates between user/project/plugin
     /// installations of the same skill or agent — the audit's "dedup
@@ -15204,6 +15221,12 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
         Commands::DedupCandidates { min_count, r#type, limit } => {
             temporal::cli::cmd_dedup_candidates(
                 &db, *min_count, r#type.as_deref(), *limit,
+            );
+            Ok(())
+        }
+        Commands::CompareSnapshots { date1, date2, r#type, limit } => {
+            temporal::cli::cmd_compare_snapshots(
+                &db, date1, date2, r#type.as_deref(), *limit,
             );
             Ok(())
         }

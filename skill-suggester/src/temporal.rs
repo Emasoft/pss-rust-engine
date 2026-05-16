@@ -1320,6 +1320,97 @@ pub mod cli {
         }
     }
 
+    /// `pss compare-snapshots <DATE1> <DATE2>` (Phase 3 Tier A F-5)
+    ///
+    /// Diff the active-element sets at two points in time. Reuses the same
+    /// dedup-by-element_id pattern as `cmd_as_of` (Cozo can't `max()` on
+    /// RFC3339 strings, so we sort+dedupe in Rust). Output is a structured
+    /// JSON object with `only_at_date1`, `only_at_date2`, and
+    /// `common_count` — enabling "what changed?" audits between two
+    /// arbitrary historical snapshots.
+    pub fn cmd_compare_snapshots(
+        db: &DbInstance,
+        date1: &str,
+        date2: &str,
+        type_filter: Option<&str>,
+        limit: usize,
+    ) {
+        let c1 = match resolve_date(date1) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Invalid date1 '{}': {}", date1, e);
+                println!("null");
+                return;
+            }
+        };
+        let c2 = match resolve_date(date2) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Invalid date2 '{}': {}", date2, e);
+                println!("null");
+                return;
+            }
+        };
+        // Helper closure: run the same sorted-dedupe query as cmd_as_of
+        // and return the set of element_ids that were present at cutoff.
+        let present_at = |cutoff: &str| -> std::collections::HashSet<String> {
+            use std::collections::HashSet;
+            let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+            params.insert("cutoff".into(), DataValue::Str(cutoff.into()));
+            let mut filter_clauses = String::new();
+            if let Some(t) = type_filter {
+                filter_clauses.push_str(", element_type = $f_type");
+                params.insert("f_type".into(), DataValue::Str(t.into()));
+            }
+            let q = format!(
+                r#"?[element_id, observed_at, event_type] :=
+                    *events{{element_id, observed_at, event_type, element_type}},
+                    observed_at <= $cutoff{filters}
+                :order element_id, -observed_at"#,
+                filters = filter_clauses
+            );
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut present: HashSet<String> = HashSet::new();
+            if let Ok(r) = db.run_script(&q, params, ScriptMutability::Immutable) {
+                for row in r.rows.iter() {
+                    let eid = if let DataValue::Str(s) = &row[0] {
+                        s.to_string()
+                    } else { continue };
+                    if !seen.insert(eid.clone()) { continue; }
+                    let etype = if let DataValue::Str(s) = &row[2] {
+                        s.to_string()
+                    } else { String::new() };
+                    if etype != "removed" {
+                        present.insert(eid);
+                    }
+                    if present.len() >= limit { break; }
+                }
+            }
+            present
+        };
+
+        let s1 = present_at(&c1);
+        let s2 = present_at(&c2);
+        let only_1: Vec<String> = s1.difference(&s2).cloned().collect();
+        let only_2: Vec<String> = s2.difference(&s1).cloned().collect();
+        let common_count = s1.intersection(&s2).count();
+        let mut only_1_sorted = only_1;
+        only_1_sorted.sort();
+        let mut only_2_sorted = only_2;
+        only_2_sorted.sort();
+        let out = json!({
+            "date1": c1,
+            "date2": c2,
+            "type_filter": type_filter,
+            "only_at_date1": only_1_sorted,
+            "only_at_date2": only_2_sorted,
+            "common_count": common_count,
+            "added_between_count": only_2_sorted.len(),
+            "removed_between_count": only_1_sorted.len(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    }
+
     /// `pss dedup-candidates [--min-count N] [--type T]` (Phase 3 Tier A F-8)
     ///
     /// Group currently-active elements by `(element_type, element_name)` and
