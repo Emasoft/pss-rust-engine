@@ -853,6 +853,20 @@ enum Commands {
         limit: usize,
     },
 
+    /// F-2 (audit 20260514): list every currently-active element whose
+    /// `source` starts with `marketplace:<name>` — i.e. installed from
+    /// the given marketplace.
+    #[command(name = "by-marketplace")]
+    ByMarketplace {
+        /// Marketplace name (the `<name>` part of `marketplace:<name>` in events.source).
+        name: String,
+        /// Optional element-type filter (e.g. `--type plugin`).
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
     /// Count events by event_type in a recent time window.
     /// `pss changes-summary --window 7d` → installed: 12, content_changed: 4, removed: 1.
     /// Accepts the same date shorthand as `as-of` / `list-added-since`.
@@ -15287,6 +15301,10 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
         // ─── Phase 3 Tier A new query subcommands (audit 20260514) ─────
         Commands::ByPlugin { name, r#type, limit } => {
             temporal::cli::cmd_by_plugin(&db, name, r#type.as_deref(), *limit);
+            Ok(())
+        }
+        Commands::ByMarketplace { name, r#type, limit } => {
+            temporal::cli::cmd_by_marketplace(&db, name, r#type.as_deref(), *limit);
             Ok(())
         }
         Commands::ChangesSummary { window, r#type } => {

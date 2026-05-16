@@ -1247,6 +1247,60 @@ pub mod cli {
         }
     }
 
+    /// `pss by-marketplace <NAME>` (Phase 3 Tier A — F-2, audit 20260514)
+    ///
+    /// List every currently-active element whose `source` starts with
+    /// `marketplace:<NAME>` — i.e. installed from the given marketplace.
+    /// The discoverer encodes marketplace-installed plugins with
+    /// `source = "marketplace:<name>"` so we match on a prefix here.
+    /// Reads from `elements_state` joined against `events.source` via
+    /// last_event_id.
+    pub fn cmd_by_marketplace(
+        db: &DbInstance,
+        marketplace_name: &str,
+        type_filter: Option<&str>,
+        limit: usize,
+    ) {
+        let prefix = format!("marketplace:{}", marketplace_name);
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("prefix".into(), DataValue::Str(prefix.into()));
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        let mut filter_clauses = String::new();
+        if let Some(t) = type_filter {
+            filter_clauses.push_str(", element_type = $f_type");
+            params.insert("f_type".into(), DataValue::Str(t.into()));
+        }
+        let q = format!(
+            r#"?[element_id, element_type, element_name, scope_path, current_path, last_changed_at, source] :=
+                *elements_state{{element_id, last_event_id, current_path, last_changed_at, exists: true}},
+                *events{{event_id: last_event_id, element_type, element_name, scope_path, source}},
+                starts_with(source, $prefix){filters}
+            :order element_type, element_name
+            :limit $limit"#,
+            filters = filter_clauses
+        );
+        match db.run_script(&q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let out: Vec<JsonValue> = r.rows.iter().map(|row| {
+                    json!({
+                        "element_id": data_to_json(&row[0]),
+                        "element_type": data_to_json(&row[1]),
+                        "element_name": data_to_json(&row[2]),
+                        "scope_path": data_to_json(&row[3]),
+                        "path": data_to_json(&row[4]),
+                        "last_changed_at": data_to_json(&row[5]),
+                        "source": data_to_json(&row[6]),
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&JsonValue::Array(out)).unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("by-marketplace query failed: {}", e);
+                println!("[]");
+            }
+        }
+    }
+
     /// `pss changes-summary --window <DURATION>` (Phase 3 Tier A)
     ///
     /// Count events by `event_type` in the time window before now. Reads
@@ -4057,6 +4111,131 @@ mod tests {
         let db = build_test_db_with_plugin_sources();
         let rows = by_plugin_rows_for_test(&db, "nonexistent-plugin", None);
         assert!(rows.is_empty());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // F-2 (audit 20260514): by-marketplace
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Helper: emulate cmd_by_marketplace's underlying query for testing.
+    fn by_marketplace_rows_for_test(
+        db: &DbInstance,
+        marketplace_name: &str,
+        type_filter: Option<&str>,
+    ) -> Vec<(String, String, String)> {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        let prefix = format!("marketplace:{}", marketplace_name);
+        params.insert("prefix".into(), DataValue::Str(prefix.into()));
+        let mut filters = String::new();
+        if let Some(t) = type_filter {
+            filters.push_str(", element_type = $f_type");
+            params.insert("f_type".into(), DataValue::Str(t.into()));
+        }
+        let q = format!(
+            r#"?[element_id, element_type, source] :=
+                *elements_state{{element_id, last_event_id, exists: true}},
+                *events{{event_id: last_event_id, element_type, source}},
+                starts_with(source, $prefix){filters}"#,
+            filters = filters
+        );
+        let r = db.run_script(&q, params, ScriptMutability::Immutable)
+            .expect("by-marketplace query must run");
+        r.rows.iter().filter_map(|row| {
+            let eid = if let DataValue::Str(s) = &row[0] { s.to_string() } else { return None };
+            let etype = if let DataValue::Str(s) = &row[1] { s.to_string() } else { return None };
+            let src = if let DataValue::Str(s) = &row[2] { s.to_string() } else { return None };
+            Some((eid, etype, src))
+        }).collect()
+    }
+
+    fn build_test_db_with_marketplace_sources() -> DbInstance {
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+
+        // Three events: pluginA from marketplace "emasoft-plugins",
+        // pluginB from same marketplace, pluginC from "other-mp".
+        let seed = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["e1", "2026-01-01T00:00:00Z", "s1", "installed", "plugin",
+                 "pluginA@emasoft-plugins", "plugin:pluginA@marketplace:emasoft-plugins",
+                 "marketplace", "emasoft-plugins", "marketplace:emasoft-plugins",
+                 "/mp/pluginA.json", "h1", 100, 50, true, "active", "{}", ""],
+                ["e2", "2026-01-01T00:00:00Z", "s1", "installed", "plugin",
+                 "pluginB@emasoft-plugins", "plugin:pluginB@marketplace:emasoft-plugins",
+                 "marketplace", "emasoft-plugins", "marketplace:emasoft-plugins",
+                 "/mp/pluginB.json", "h2", 200, 80, true, "active", "{}", ""],
+                ["e3", "2026-01-01T00:00:00Z", "s1", "installed", "plugin",
+                 "pluginC@other-mp", "plugin:pluginC@marketplace:other-mp",
+                 "marketplace", "other-mp", "marketplace:other-mp",
+                 "/mp/pluginC.json", "h3", 50, 25, true, "active", "{}", ""]
+              ]
+            :put events { event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }
+        "#;
+        db.run_script(seed, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed events");
+
+        let seed_state = r#"
+            ?[element_id, last_event_id, current_path, current_hash,
+              current_size, current_token_count, enabled, override_status,
+              installed_at, last_changed_at, exists] <- [
+                ["plugin:pluginA@marketplace:emasoft-plugins", "e1", "/mp/pluginA.json", "h1", 100, 50, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["plugin:pluginB@marketplace:emasoft-plugins", "e2", "/mp/pluginB.json", "h2", 200, 80, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["plugin:pluginC@marketplace:other-mp", "e3", "/mp/pluginC.json", "h3", 50, 25, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true]
+              ]
+            :put elements_state { element_id =>
+              last_event_id, current_path, current_hash, current_size,
+              current_token_count, enabled, override_status, installed_at,
+              last_changed_at, exists }
+        "#;
+        db.run_script(seed_state, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed elements_state");
+        db
+    }
+
+    #[test]
+    fn cmd_by_marketplace_filters_by_source_prefix() {
+        // F-2: by-marketplace must find every element from a given marketplace.
+        let db = build_test_db_with_marketplace_sources();
+        let rows = by_marketplace_rows_for_test(&db, "emasoft-plugins", None);
+        assert_eq!(rows.len(), 2, "emasoft-plugins provides pluginA + pluginB");
+        for (_, _, src) in &rows {
+            assert!(src.starts_with("marketplace:emasoft-plugins"));
+        }
+        let other = by_marketplace_rows_for_test(&db, "other-mp", None);
+        assert_eq!(other.len(), 1, "other-mp provides pluginC");
+    }
+
+    #[test]
+    fn cmd_by_marketplace_returns_empty_for_unknown_marketplace() {
+        // F-2: unknown marketplace returns empty, no error.
+        let db = build_test_db_with_marketplace_sources();
+        let rows = by_marketplace_rows_for_test(&db, "nonexistent-mp", None);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn cmd_by_marketplace_respects_type_filter() {
+        // F-2: --type plugin must filter to plugin elements only.
+        let db = build_test_db_with_marketplace_sources();
+        let rows = by_marketplace_rows_for_test(&db, "emasoft-plugins", Some("plugin"));
+        assert_eq!(rows.len(), 2);
+        for (_, etype, _) in &rows {
+            assert_eq!(etype, "plugin");
+        }
+        let rows_skill = by_marketplace_rows_for_test(&db, "emasoft-plugins", Some("skill"));
+        assert!(rows_skill.is_empty(), "no skills in seeded marketplace data");
     }
 
     #[test]
