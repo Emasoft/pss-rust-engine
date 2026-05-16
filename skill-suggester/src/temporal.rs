@@ -1301,6 +1301,57 @@ pub mod cli {
         }
     }
 
+    /// F-12 (audit 20260514): version-history view — same signal as
+    /// `timeline` but filtered to the events that actually represent a
+    /// version transition: installed, content_changed,
+    /// description_changed, removed. Skips noise events (enabled,
+    /// disabled, size_changed-without-hash-change, override_started,
+    /// override_ended) so callers can reconstruct the version chain
+    /// without manually filtering.
+    pub fn cmd_version_history(db: &DbInstance, element_id: &str, limit: usize) {
+        // Cozo's predicate language uses `or(...)` — no native IN keyword.
+        let q = r#"
+            ?[event_id, observed_at, event_type, content_hash, file_size, diff_json] :=
+                *events{element_id: $eid, event_id, observed_at, event_type,
+                        content_hash, file_size, diff_json},
+                or(
+                    event_type == "installed",
+                    event_type == "content_changed",
+                    event_type == "description_changed",
+                    event_type == "removed"
+                )
+            :order observed_at
+            :limit $limit
+        "#;
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(element_id.into()));
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        match db.run_script(q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let rows: Vec<JsonValue> = r.rows.into_iter().map(|row| {
+                    json!({
+                        "event_id": data_to_json(&row[0]),
+                        "observed_at": data_to_json(&row[1]),
+                        "event_type": data_to_json(&row[2]),
+                        "content_hash": data_to_json(&row[3]),
+                        "file_size": data_to_json(&row[4]),
+                        "diff_json": data_to_json(&row[5]),
+                    })
+                }).collect();
+                let output = json!({
+                    "element_id": element_id,
+                    "version_count": rows.len(),
+                    "versions": rows,
+                });
+                println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("version-history query failed: {}", e);
+                println!("{{}}");
+            }
+        }
+    }
+
     /// F-17 (audit 20260514): list every event from a specific scan_id.
     pub fn cmd_changes_in_batch(db: &DbInstance, scan_id: &str, limit: usize) {
         let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
@@ -4575,6 +4626,82 @@ mod tests {
             .expect("query");
         let count = if let DataValue::Num(Num::Int(n)) = &r.rows[0][0] { *n } else { -1 };
         assert_eq!(count, 4, "expected 4 events for scan_id=s1");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // F-12 (audit 20260514): version-history filter
+    // ────────────────────────────────────────────────────────────────────
+
+    /// F-12: the filter must only return installed/content_changed/
+    /// description_changed/removed events, NOT enable/disable noise.
+    #[test]
+    fn cmd_version_history_filters_to_signal_events() {
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+
+        // Seed: one element with 4 events — 3 signal + 1 noise.
+        let seed = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["e1", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "v", "skill:v@user:_home", "user", "/home", "user",
+                 "/home/v.md", "h1", 100, 50, true, "active", "{}", ""],
+                ["e2", "2026-01-02T00:00:00Z", "s2", "content_changed", "skill",
+                 "v", "skill:v@user:_home", "user", "/home", "user",
+                 "/home/v.md", "h2", 110, 55, true, "active", "{}", ""],
+                ["e3", "2026-01-03T00:00:00Z", "s3", "enabled", "skill",
+                 "v", "skill:v@user:_home", "user", "/home", "user",
+                 "/home/v.md", "h2", 110, 55, true, "active", "{}", ""],
+                ["e4", "2026-01-04T00:00:00Z", "s4", "description_changed", "skill",
+                 "v", "skill:v@user:_home", "user", "/home", "user",
+                 "/home/v.md", "h2", 110, 55, true, "active", "{}", ""]
+              ]
+            :put events { event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }
+        "#;
+        db.run_script(seed, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed");
+
+        // Inline the version-history query so we can assert on rows.
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str("skill:v@user:_home".into()));
+        let q = r#"
+            ?[event_type] :=
+                *events{element_id: $eid, event_type},
+                or(
+                    event_type == "installed",
+                    event_type == "content_changed",
+                    event_type == "description_changed",
+                    event_type == "removed"
+                )
+            :order event_type
+        "#;
+        let r = db.run_script(q, params, ScriptMutability::Immutable)
+            .expect("version-history query");
+        // Expected: 3 signal events (installed, content_changed,
+        // description_changed) — NOT enabled.
+        assert_eq!(r.rows.len(), 3, "expected 3 signal events");
+        let types: Vec<String> = r.rows.iter().filter_map(|row| {
+            if let DataValue::Str(s) = &row[0] {
+                Some(s.to_string())
+            } else { None }
+        }).collect();
+        for t in &types {
+            assert_ne!(t, "enabled", "enabled is noise; must be filtered");
+        }
+        assert!(types.contains(&"installed".to_string()));
+        assert!(types.contains(&"content_changed".to_string()));
+        assert!(types.contains(&"description_changed".to_string()));
     }
 
     #[test]

@@ -913,6 +913,23 @@ enum Commands {
         r#type: Option<String>,
     },
 
+    /// F-12 (audit 20260514): focused "what versions has this element
+    /// gone through?" history. Where `pss timeline` shows every event
+    /// (including size/enabled noise), version-history filters to the
+    /// signal events: installed, content_changed, description_changed,
+    /// removed. Each row carries the content hash and (where present)
+    /// the diff JSON so callers can reconstruct the version chain.
+    ///
+    /// Builds on DI-1 wave 1 (description_changed) shipped in v3.6.6
+    /// and DI-2 (override events) shipped in v3.6.4.
+    #[command(name = "version-history")]
+    VersionHistory {
+        /// Element ID (use `pss show <name>` to discover it).
+        element_id: String,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
     /// Count events by event_type in a recent time window.
     /// `pss changes-summary --window 7d` → installed: 12, content_changed: 4, removed: 1.
     /// Accepts the same date shorthand as `as-of` / `list-added-since`.
@@ -15367,6 +15384,10 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
         }
         Commands::StatsByScope { r#type } => {
             temporal::cli::cmd_stats_by_scope(&db, r#type.as_deref());
+            Ok(())
+        }
+        Commands::VersionHistory { element_id, limit } => {
+            temporal::cli::cmd_version_history(&db, element_id, *limit);
             Ok(())
         }
         Commands::ChangesSummary { window, r#type } => {
