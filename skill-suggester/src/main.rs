@@ -764,6 +764,45 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         quiet: bool,
     },
+
+    // ─── Phase 3 Tier A — new query subcommands (audit 20260514) ────────
+    /// List every currently-active element whose `source` is `plugin:<name>`.
+    /// E.g. `pss by-plugin perfect-skill-suggester` lists every skill / agent /
+    /// command / hook PSS itself provides.
+    #[command(name = "by-plugin")]
+    ByPlugin {
+        /// Plugin name (the `<name>` part of `plugin:<name>` in events.source).
+        name: String,
+        /// Optional element-type filter (e.g. `--type skill`).
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+
+    /// Count events by event_type in a recent time window.
+    /// `pss changes-summary --window 7d` → installed: 12, content_changed: 4, removed: 1.
+    /// Accepts the same date shorthand as `as-of` / `list-added-since`.
+    #[command(name = "changes-summary")]
+    ChangesSummary {
+        /// Time window before now (default: 24h).
+        #[arg(long, default_value = "24h")]
+        window: String,
+        /// Optional element-type filter.
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+    },
+
+    /// List the scopes where the given element name is currently enabled
+    /// (one row per scope/scope_path where exists=true AND enabled=true).
+    #[command(name = "enabled-where")]
+    EnabledWhere {
+        /// Element name (or composite `<plugin>@<marketplace>` for plugins).
+        name: String,
+        /// Optional element-type filter.
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+    },
 }
 
 // ============================================================================
@@ -15133,6 +15172,19 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             temporal::cli::cmd_retention(&db, set.as_deref());
             Ok(())
         }
+        // ─── Phase 3 Tier A new query subcommands (audit 20260514) ─────
+        Commands::ByPlugin { name, r#type, limit } => {
+            temporal::cli::cmd_by_plugin(&db, name, r#type.as_deref(), *limit);
+            Ok(())
+        }
+        Commands::ChangesSummary { window, r#type } => {
+            temporal::cli::cmd_changes_summary(&db, window, r#type.as_deref());
+            Ok(())
+        }
+        Commands::EnabledWhere { name, r#type } => {
+            temporal::cli::cmd_enabled_where(&db, name, r#type.as_deref());
+            Ok(())
+        }
     }
 }
 
@@ -17556,14 +17608,28 @@ fn main() {
 }
 
 fn run(cli: &Cli) -> Result<(), SuggesterError> {
+    // PERF-1 (audit 20260514): gated profiling. Set PSS_PERF_DEBUG=1 to emit
+    // per-section timings to stderr — used to identify the cost split between
+    // stdin/parse, typo/synonym lazy_static init, DB open, candidate load,
+    // and find_matches. Off by default (zero overhead unless env var is set).
+    let perf_debug = std::env::var_os("PSS_PERF_DEBUG").is_some();
+    let perf_t0 = Instant::now();
+    let perf_log = |label: &str, t0: Instant| {
+        if perf_debug {
+            eprintln!("[pss-perf] +{:>5}ms  {}", t0.elapsed().as_millis(), label);
+        }
+    };
+
     // Read input from stdin
     let mut input_json = String::new();
     io::stdin().read_to_string(&mut input_json)?;
+    perf_log("stdin read", perf_t0);
 
     debug!("Received input: {}", input_json);
 
     // Parse input
     let mut input: HookInput = serde_json::from_str(&input_json)?;
+    perf_log("json parse", perf_t0);
 
     // PERF-1 (audit 20260514): strip <system-reminder> blocks BEFORE skip
     // detection so legitimate <system-reminder> tags aren't matched as skip
@@ -17613,11 +17679,14 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
             }
         }
     });
+    perf_log("db open", perf_t0);
 
     // Extract prompt words early for CozoDB pre-filtering.
     // Apply typo correction + synonym expansion so pre-filter catches the same terms as scoring.
     let corrected_for_filter = correct_typos(&input.prompt);
+    perf_log("correct_typos (first call — lazy_static init)", perf_t0);
     let expanded_for_filter = expand_synonyms(&corrected_for_filter);
+    perf_log("expand_synonyms (first call — lazy_static init)", perf_t0);
     let filter_words: Vec<String> = expanded_for_filter
         .split_whitespace()
         .filter(|w| w.len() >= 2)
@@ -17664,6 +17733,7 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
             Err(e) => return Err(e),
         }
     };
+    perf_log(&format!("load_candidates_from_db ({} skills)", index.skills.len()), perf_t0);
     info!("Loaded {} skills from index", index.skills.len());
 
     // Load and merge PSS files only if --load-pss flag is passed
@@ -17719,10 +17789,12 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
     // the complete picture — not the raw prompt alone.
     // ========================================================================
 
+    perf_log("registry load", perf_t0);
     // 1a. Scan project directory for languages/frameworks/tools from config files.
     // This runs in Rust (not in the Python hook) because project contents can
     // change at any time and must be detected fresh on every invocation.
     let project_scan = scan_project_context(&input.cwd);
+    perf_log("scan_project_context", perf_t0);
     if !project_scan.languages.is_empty() || !project_scan.tools.is_empty() {
         debug!(
             "Project scan: languages={:?}, frameworks={:?}, platforms={:?}, tools={:?}, file_types={:?}",
@@ -17902,6 +17974,7 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
         }
     }
 
+    perf_log("decompose_tasks + setup", perf_t0);
     // Score all skills with the unchanged find_matches() algorithm
     // (index was loaded from CozoDB or JSON above — scoring is identical either way)
     let matches = if is_multi_task {
@@ -17917,6 +17990,7 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
     } else {
         find_matches(&corrected_prompt, &expanded_prompt, &index, &input.cwd, &context, cli.incomplete_mode, &detected_domains, registry.as_ref())
     };
+    perf_log(&format!("find_matches ({} matches)", matches.len()), perf_t0);
 
     if matches.is_empty() {
         debug!("No matches found");

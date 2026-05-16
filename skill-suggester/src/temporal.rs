@@ -1166,6 +1166,160 @@ pub mod cli {
         }
     }
 
+    /// `pss by-plugin <NAME>` (Phase 3 Tier A — audit 20260514)
+    ///
+    /// List every currently-active element whose `source` is exactly
+    /// `plugin:<NAME>` — i.e. provided by the given plugin. Reads from
+    /// `elements_state` joined against `events.source` via last_event_id.
+    pub fn cmd_by_plugin(
+        db: &DbInstance,
+        plugin_name: &str,
+        type_filter: Option<&str>,
+        limit: usize,
+    ) {
+        let needle = format!("plugin:{}", plugin_name);
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("source".into(), DataValue::Str(needle.into()));
+        params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
+        let mut filter_clauses = String::new();
+        if let Some(t) = type_filter {
+            filter_clauses.push_str(", element_type = $f_type");
+            params.insert("f_type".into(), DataValue::Str(t.into()));
+        }
+        let q = format!(
+            r#"?[element_id, element_type, element_name, scope_path, current_path, last_changed_at] :=
+                *elements_state{{element_id, last_event_id, current_path, last_changed_at, exists: true}},
+                *events{{event_id: last_event_id, element_type, element_name, scope_path, source}},
+                source = $source{filters}
+            :order element_type, element_name
+            :limit $limit"#,
+            filters = filter_clauses
+        );
+        match db.run_script(&q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let out: Vec<JsonValue> = r.rows.iter().map(|row| {
+                    json!({
+                        "element_id": data_to_json(&row[0]),
+                        "element_type": data_to_json(&row[1]),
+                        "element_name": data_to_json(&row[2]),
+                        "scope_path": data_to_json(&row[3]),
+                        "path": data_to_json(&row[4]),
+                        "last_changed_at": data_to_json(&row[5]),
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&JsonValue::Array(out)).unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("by-plugin query failed: {}", e);
+                println!("[]");
+            }
+        }
+    }
+
+    /// `pss changes-summary --window <DURATION>` (Phase 3 Tier A)
+    ///
+    /// Count events by `event_type` in the time window before now. Reads
+    /// from `events` with an observed_at >= cutoff filter. Output is a JSON
+    /// object: `{"event_type": count, ...}` plus a `window` field for
+    /// audit. Uses the unified `crate::parse_date` helper so the same date
+    /// shorthand (`24h`, `7d`, `2w`, RFC3339, `yesterday`) is accepted as
+    /// every other temporal subcommand.
+    pub fn cmd_changes_summary(
+        db: &DbInstance,
+        window: &str,
+        type_filter: Option<&str>,
+    ) {
+        let cutoff = match resolve_date(window) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Invalid --window '{}': {}", window, e);
+                println!("{{}}");
+                return;
+            }
+        };
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("cutoff".into(), DataValue::Str(cutoff.clone().into()));
+        let mut filter_clauses = String::new();
+        if let Some(t) = type_filter {
+            filter_clauses.push_str(", element_type = $f_type");
+            params.insert("f_type".into(), DataValue::Str(t.into()));
+        }
+        let q = format!(
+            r#"?[event_type, count(event_id)] :=
+                *events{{event_id, observed_at, event_type, element_type}},
+                observed_at >= $cutoff{filters}"#,
+            filters = filter_clauses
+        );
+        match db.run_script(&q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let mut counts = serde_json::Map::new();
+                for row in &r.rows {
+                    let etype = data_to_json(&row[0]);
+                    let count = data_to_json(&row[1]);
+                    if let JsonValue::String(s) = etype {
+                        counts.insert(s, count);
+                    }
+                }
+                let out = json!({
+                    "window": window,
+                    "cutoff": cutoff,
+                    "type_filter": type_filter,
+                    "counts": JsonValue::Object(counts),
+                });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("changes-summary query failed: {}", e);
+                println!("{{}}");
+            }
+        }
+    }
+
+    /// `pss enabled-where <NAME>` (Phase 3 Tier A)
+    ///
+    /// Return every (scope, scope_path) tuple where the given element_name
+    /// is currently present (`exists=true`) AND enabled (`enabled=true`).
+    /// Useful for "is plugin X actually on anywhere?" or detecting a
+    /// half-disabled-half-enabled scope drift.
+    pub fn cmd_enabled_where(
+        db: &DbInstance,
+        name: &str,
+        type_filter: Option<&str>,
+    ) {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        let mut filter_clauses = String::new();
+        if let Some(t) = type_filter {
+            filter_clauses.push_str(", element_type = $f_type");
+            params.insert("f_type".into(), DataValue::Str(t.into()));
+        }
+        let q = format!(
+            r#"?[element_id, element_type, scope, scope_path] :=
+                *elements_state{{element_id, last_event_id, exists: true, enabled: true}},
+                *events{{event_id: last_event_id, element_type, element_name, scope, scope_path}},
+                element_name = $name{filters}
+            :order scope, scope_path"#,
+            filters = filter_clauses
+        );
+        match db.run_script(&q, params, ScriptMutability::Immutable) {
+            Ok(r) => {
+                let out: Vec<JsonValue> = r.rows.iter().map(|row| {
+                    json!({
+                        "element_id": data_to_json(&row[0]),
+                        "element_type": data_to_json(&row[1]),
+                        "scope": data_to_json(&row[2]),
+                        "scope_path": data_to_json(&row[3]),
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&JsonValue::Array(out)).unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("enabled-where query failed: {}", e);
+                println!("[]");
+            }
+        }
+    }
+
     /// `pss removed-since <DATE>`
     pub fn cmd_removed_since(db: &DbInstance, date: &str, limit: usize) {
         let cutoff = match resolve_date(date) {
@@ -1789,6 +1943,18 @@ pub mod cli {
                 Err(_) => -1,
             };
 
+            // DI-3 (audit 20260514): the previous writer hard-coded
+            // `enabled: true`, so the temporal index could never detect a
+            // plugin/mcp/lsp being toggled off in settings.json. The
+            // discoverer now emits `enabled` per element (defaults to true
+            // for file-based types whose state is implicit). Reading it
+            // from the JSONL line is the writer-side half of DI-3 and
+            // wires up Enabled/Disabled event emission.
+            let enabled = value
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
             let obs = Observation {
                 element_type,
                 name,
@@ -1800,7 +1966,7 @@ pub mod cli {
                 file_size,
                 token_count,
                 description,
-                enabled: true,
+                enabled,
             };
             observed_eids.insert(obs.element_id());
             visited_scope_paths.insert(scope_path);
@@ -1822,8 +1988,13 @@ pub mod cli {
                         "event": evt.as_str(),
                     })
                     .to_string();
+                    // DI-3 (audit 20260514): pass obs.enabled (not hard-true)
+                    // so the events row reflects the actual enabled state
+                    // observed in this scan. Without this, even after the
+                    // Enabled/Disabled events fire, the events row still
+                    // says enabled=true.
                     persist_event_and_state(
-                        db, &scan_id, &started_at, evt, obs, &diff, true,
+                        db, &scan_id, &started_at, evt, obs, &diff, obs.enabled,
                     )?;
                     events_emitted += 1;
                 }
@@ -2679,6 +2850,7 @@ pub fn drop_temporal_tables(db: &DbInstance) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cozo::Num;
 
     #[test]
     fn element_id_is_stable_and_lowercased() {
@@ -3234,5 +3406,151 @@ mod tests {
         let rows = as_of_rows_for_test(&db, "2026-12-01T00:00:00Z", Some("skill"), 2);
         assert_eq!(rows.len(), 1, "type filter applied first, then limit");
         assert_eq!(rows[0].1, "skill");
+    }
+
+    // ====================================================================
+    // Phase 3 Tier A — new query subcommands (audit 20260514 — v3.6.1)
+    // ====================================================================
+
+    /// Helper: emulate cmd_by_plugin's underlying query for testing.
+    fn by_plugin_rows_for_test(
+        db: &DbInstance,
+        plugin_name: &str,
+        type_filter: Option<&str>,
+    ) -> Vec<(String, String)> {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        let needle = format!("plugin:{}", plugin_name);
+        params.insert("source".into(), DataValue::Str(needle.into()));
+        let mut filters = String::new();
+        if let Some(t) = type_filter {
+            filters.push_str(", element_type = $f_type");
+            params.insert("f_type".into(), DataValue::Str(t.into()));
+        }
+        let q = format!(
+            r#"?[element_id, element_type] :=
+                *elements_state{{element_id, last_event_id, exists: true}},
+                *events{{event_id: last_event_id, element_type, source}},
+                source = $source{filters}"#,
+            filters = filters
+        );
+        let r = db.run_script(&q, params, ScriptMutability::Immutable)
+            .expect("by-plugin query must run");
+        r.rows.iter().filter_map(|row| {
+            let eid = if let DataValue::Str(s) = &row[0] { s.to_string() } else { return None };
+            let etype = if let DataValue::Str(s) = &row[1] { s.to_string() } else { return None };
+            Some((eid, etype))
+        }).collect()
+    }
+
+    /// Build a test DB with elements from two distinct plugin sources.
+    /// Populates BOTH events AND elements_state (the by_plugin/enabled-where
+    /// queries join the two via `last_event_id`).
+    fn build_test_db_with_plugin_sources() -> DbInstance {
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+
+        // Three events: sk1+ag1 from plugin:foo, sk2 from plugin:bar.
+        let seed_events = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["e1", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "sk1", "skill:sk1@plugin:foo", "plugin", "foo/skills", "plugin:foo",
+                 "/foo/sk1.md", "h1", 100, 50, true, "active", "{}", ""],
+                ["e2", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "sk2", "skill:sk2@plugin:bar", "plugin", "bar/skills", "plugin:bar",
+                 "/bar/sk2.md", "h2", 200, 80, true, "active", "{}", ""],
+                ["e3", "2026-01-01T00:00:00Z", "s1", "installed", "agent",
+                 "ag1", "agent:ag1@plugin:foo", "plugin", "foo/agents", "plugin:foo",
+                 "/foo/ag1.md", "h3", 50, 25, true, "active", "{}", ""]
+              ]
+            :put events { event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }
+        "#;
+        db.run_script(seed_events, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed events");
+
+        // Mirror in elements_state — exists=true so the joins find them.
+        let seed_state = r#"
+            ?[element_id, last_event_id, current_path, current_hash,
+              current_size, current_token_count, enabled, override_status,
+              installed_at, last_changed_at, exists] <- [
+                ["skill:sk1@plugin:foo", "e1", "/foo/sk1.md", "h1", 100, 50, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["skill:sk2@plugin:bar", "e2", "/bar/sk2.md", "h2", 200, 80, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["agent:ag1@plugin:foo", "e3", "/foo/ag1.md", "h3", 50, 25, true, "active", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true]
+              ]
+            :put elements_state { element_id =>
+              last_event_id, current_path, current_hash, current_size,
+              current_token_count, enabled, override_status, installed_at,
+              last_changed_at, exists }
+        "#;
+        db.run_script(seed_state, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed elements_state");
+        db
+    }
+
+    #[test]
+    fn cmd_by_plugin_filters_by_source() {
+        // F-1 (audit 20260514): listing elements provided by a given plugin
+        // must filter on the literal source `plugin:<name>` — not match
+        // other plugins.
+        let db = build_test_db_with_plugin_sources();
+        let foo_rows = by_plugin_rows_for_test(&db, "foo", None);
+        assert_eq!(foo_rows.len(), 2, "plugin:foo provides sk1 + ag1");
+        let bar_rows = by_plugin_rows_for_test(&db, "bar", None);
+        assert_eq!(bar_rows.len(), 1, "plugin:bar provides sk2");
+    }
+
+    #[test]
+    fn cmd_by_plugin_respects_type_filter() {
+        // F-1: `--type skill` must return only skills (not agents)
+        // when the plugin provides both.
+        let db = build_test_db_with_plugin_sources();
+        let foo_skills = by_plugin_rows_for_test(&db, "foo", Some("skill"));
+        assert_eq!(foo_skills.len(), 1, "plugin:foo has 1 skill (sk1)");
+        assert_eq!(foo_skills[0].1, "skill");
+    }
+
+    #[test]
+    fn cmd_by_plugin_returns_empty_for_unknown_plugin() {
+        // F-1: unknown plugin returns empty, no error.
+        let db = build_test_db_with_plugin_sources();
+        let rows = by_plugin_rows_for_test(&db, "nonexistent-plugin", None);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn cmd_changes_summary_groups_by_event_type() {
+        // F-7 (audit 20260514): changes-summary must aggregate event_type
+        // counts in the cutoff window — providing the "what changed?"
+        // dashboard the audit specifically called out as missing.
+        let db = build_test_db_with_plugin_sources();
+        // All 3 seeded events are 'installed' on 2026-01-01.
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert(
+            "cutoff".into(),
+            DataValue::Str("2025-12-01T00:00:00Z".into()),
+        );
+        let q = r#"?[event_type, count(event_id)] :=
+            *events{event_id, observed_at, event_type},
+            observed_at >= $cutoff"#;
+        let r = db.run_script(q, params, ScriptMutability::Immutable)
+            .expect("changes-summary query");
+        let installed_count: i64 = r.rows.iter()
+            .find_map(|row| match (&row[0], &row[1]) {
+                (DataValue::Str(s), DataValue::Num(Num::Int(n))) if s.as_str() == "installed" => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0);
+        assert_eq!(installed_count, 3, "expected 3 installed events");
     }
 }
