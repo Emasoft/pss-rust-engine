@@ -859,6 +859,7 @@ pub fn resolve_overrides(
 // ============================================================================
 pub mod cli {
     use super::*;
+    use crate::OutputFormat;
     use cozo::Num;
     use serde_json::{json, Value as JsonValue};
 
@@ -873,6 +874,35 @@ pub mod cli {
             DataValue::Null => JsonValue::Null,
             other => JsonValue::String(format!("{:?}", other)),
         }
+    }
+
+    /// COR-6 v3.7 helper: print a single-cell value (the "value" form of a
+    /// `JsonValue` — String, Number, Bool, Null) as a compact text string
+    /// suitable for a table cell.  Truncates long strings to keep the table
+    /// width manageable.
+    fn cell(v: &JsonValue) -> String {
+        match v {
+            JsonValue::Null => "".to_string(),
+            JsonValue::Bool(b) => b.to_string(),
+            JsonValue::Number(n) => n.to_string(),
+            JsonValue::String(s) => s.chars().take(80).collect::<String>(),
+            other => other.to_string().chars().take(80).collect::<String>(),
+        }
+    }
+
+    /// COR-6 v3.7 helper: shared "no rows" + "stub format" handling. Called
+    /// by the table arm of every temporal cmd.  Returns true if the format
+    /// has already been handled (stub printed); the caller should then
+    /// `return;` immediately.
+    fn handle_stub_format(format: OutputFormat, subcommand: &str) -> bool {
+        if matches!(
+            format,
+            OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown
+        ) {
+            format.print_stub(subcommand);
+            return true;
+        }
+        false
     }
 
     /// Resolve a date string to RFC3339. Thin wrapper around the unified
@@ -1026,7 +1056,10 @@ pub mod cli {
     }
 
     /// `pss timeline <ELEMENT_ID>`
-    pub fn cmd_timeline(db: &DbInstance, element_id: &str, limit: usize) {
+    pub fn cmd_timeline(db: &DbInstance, element_id: &str, limit: usize, format: OutputFormat) {
+        if handle_stub_format(format, "timeline") {
+            return;
+        }
         let q = r#"
             ?[event_id, observed_at, event_type, content_hash, file_size, token_count, diff_json] :=
                 *events{element_id: $eid, event_id, observed_at, event_type,
@@ -1054,10 +1087,28 @@ pub mod cli {
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
-                );
+                match format {
+                    OutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                        );
+                    }
+                    OutputFormat::Table => {
+                        let table_rows: Vec<Vec<String>> = rows.iter().map(|r| vec![
+                            cell(&r["observed_at"]),
+                            cell(&r["event_type"]),
+                            cell(&r["content_hash"]),
+                            cell(&r["file_size"]),
+                            cell(&r["token_count"]),
+                        ]).collect();
+                        crate::print_table(
+                            &["OBSERVED_AT", "EVENT_TYPE", "CONTENT_HASH", "SIZE", "TOKENS"],
+                            &table_rows,
+                        );
+                    }
+                    _ => {} // handled by handle_stub_format above
+                }
             }
             Err(e) => eprintln!("timeline query failed: {}", e),
         }
@@ -1136,7 +1187,11 @@ pub mod cli {
         end: &str,
         type_filter: Option<&str>,
         limit: usize,
+        format: OutputFormat,
     ) {
+        if handle_stub_format(format, "changed-between") {
+            return;
+        }
         let start = match resolve_date(start) {
             Ok(s) => s,
             Err(e) => { print_date_err("start date", start, &e); return; }
@@ -1188,10 +1243,27 @@ pub mod cli {
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
-                );
+                match format {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                    ),
+                    OutputFormat::Table => {
+                        let table_rows: Vec<Vec<String>> = rows.iter().map(|r| vec![
+                            cell(&r["observed_at"]),
+                            cell(&r["event_type"]),
+                            cell(&r["element_type"]),
+                            cell(&r["element_name"]),
+                            cell(&r["content_hash"]),
+                            cell(&r["file_size"]),
+                        ]).collect();
+                        crate::print_table(
+                            &["OBSERVED_AT", "EVENT_TYPE", "ELEMENT_TYPE", "ELEMENT_NAME", "CONTENT_HASH", "SIZE"],
+                            &table_rows,
+                        );
+                    }
+                    _ => {}
+                }
             }
             Err(e) => eprintln!("changed-between query failed: {}", e),
         }
@@ -1308,7 +1380,10 @@ pub mod cli {
     /// disabled, size_changed-without-hash-change, override_started,
     /// override_ended) so callers can reconstruct the version chain
     /// without manually filtering.
-    pub fn cmd_version_history(db: &DbInstance, element_id: &str, limit: usize) {
+    pub fn cmd_version_history(db: &DbInstance, element_id: &str, limit: usize, format: OutputFormat) {
+        if handle_stub_format(format, "version-history") {
+            return;
+        }
         // Cozo's predicate language uses `or(...)` — no native IN keyword.
         let q = r#"
             ?[event_id, observed_at, event_type, content_hash, file_size, diff_json] :=
@@ -1338,12 +1413,29 @@ pub mod cli {
                         "diff_json": data_to_json(&row[5]),
                     })
                 }).collect();
-                let output = json!({
-                    "element_id": element_id,
-                    "version_count": rows.len(),
-                    "versions": rows,
-                });
-                println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+                match format {
+                    OutputFormat::Json => {
+                        let output = json!({
+                            "element_id": element_id,
+                            "version_count": rows.len(),
+                            "versions": rows,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+                    }
+                    OutputFormat::Table => {
+                        let table_rows: Vec<Vec<String>> = rows.iter().map(|r| vec![
+                            cell(&r["observed_at"]),
+                            cell(&r["event_type"]),
+                            cell(&r["content_hash"]),
+                            cell(&r["file_size"]),
+                        ]).collect();
+                        crate::print_table(
+                            &["OBSERVED_AT", "EVENT_TYPE", "CONTENT_HASH", "SIZE"],
+                            &table_rows,
+                        );
+                    }
+                    _ => {}
+                }
             }
             Err(e) => {
                 eprintln!("version-history query failed: {}", e);
@@ -1353,7 +1445,10 @@ pub mod cli {
     }
 
     /// F-17 (audit 20260514): list every event from a specific scan_id.
-    pub fn cmd_changes_in_batch(db: &DbInstance, scan_id: &str, limit: usize) {
+    pub fn cmd_changes_in_batch(db: &DbInstance, scan_id: &str, limit: usize, format: OutputFormat) {
+        if handle_stub_format(format, "changes-in-batch") {
+            return;
+        }
         let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
         params.insert("scan_id".into(), DataValue::Str(scan_id.into()));
         params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
@@ -1378,7 +1473,26 @@ pub mod cli {
                         "diff_json": data_to_json(&row[6]),
                     })
                 }).collect();
-                println!("{}", serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default());
+                match format {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                    ),
+                    OutputFormat::Table => {
+                        let table_rows: Vec<Vec<String>> = rows.iter().map(|r| vec![
+                            cell(&r["observed_at"]),
+                            cell(&r["event_type"]),
+                            cell(&r["element_type"]),
+                            cell(&r["element_name"]),
+                            cell(&r["scope"]),
+                        ]).collect();
+                        crate::print_table(
+                            &["OBSERVED_AT", "EVENT_TYPE", "ELEMENT_TYPE", "ELEMENT_NAME", "SCOPE"],
+                            &table_rows,
+                        );
+                    }
+                    _ => {}
+                }
             }
             Err(e) => {
                 eprintln!("changes-in-batch query failed: {}", e);
@@ -1388,7 +1502,10 @@ pub mod cli {
     }
 
     /// F-18 (audit 20260514): emit every event from the most recent scan.
-    pub fn cmd_last_changes(db: &DbInstance, limit: usize) {
+    pub fn cmd_last_changes(db: &DbInstance, limit: usize, format: OutputFormat) {
+        if handle_stub_format(format, "last-changes") {
+            return;
+        }
         // Find the latest scan_id by `started_at` from scan_runs.
         let latest_q = r#"
             ?[scan_id, started_at] :=
@@ -1412,13 +1529,16 @@ pub mod cli {
                 return;
             }
         };
-        cmd_changes_in_batch(db, &scan_id, limit);
+        cmd_changes_in_batch(db, &scan_id, limit, format);
     }
 
     /// F-19 (audit 20260514): count elements per scope, optionally
     /// filtered by element_type. Reads `elements_state` joined against
     /// `events.scope` via last_event_id.
-    pub fn cmd_stats_by_scope(db: &DbInstance, type_filter: Option<&str>) {
+    pub fn cmd_stats_by_scope(db: &DbInstance, type_filter: Option<&str>, format: OutputFormat) {
+        if handle_stub_format(format, "stats-by-scope") {
+            return;
+        }
         let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
         let mut filters = String::new();
         if let Some(t) = type_filter {
@@ -1447,11 +1567,30 @@ pub mod cli {
                     by_scope.entry(scope).or_default().insert(etype, count);
                     total += count;
                 }
-                let output = json!({
-                    "by_scope": by_scope,
-                    "total_elements": total,
-                });
-                println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+                match format {
+                    OutputFormat::Json => {
+                        let output = json!({
+                            "by_scope": by_scope,
+                            "total_elements": total,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+                    }
+                    OutputFormat::Table => {
+                        let mut table_rows: Vec<Vec<String>> = Vec::new();
+                        for (scope, by_type) in &by_scope {
+                            for (etype, count) in by_type {
+                                table_rows.push(vec![
+                                    scope.clone(),
+                                    etype.clone(),
+                                    count.to_string(),
+                                ]);
+                            }
+                        }
+                        crate::print_table(&["SCOPE", "ELEMENT_TYPE", "COUNT"], &table_rows);
+                        println!("Total: {}", total);
+                    }
+                    _ => {}
+                }
             }
             Err(e) => {
                 eprintln!("stats-by-scope query failed: {}", e);
@@ -1552,7 +1691,11 @@ pub mod cli {
         db: &DbInstance,
         window: &str,
         type_filter: Option<&str>,
+        format: OutputFormat,
     ) {
+        if handle_stub_format(format, "changes-summary") {
+            return;
+        }
         let cutoff = match resolve_date(window) {
             Ok(s) => s,
             Err(e) => {
@@ -1584,13 +1727,28 @@ pub mod cli {
                         counts.insert(s, count);
                     }
                 }
-                let out = json!({
-                    "window": window,
-                    "cutoff": cutoff,
-                    "type_filter": type_filter,
-                    "counts": JsonValue::Object(counts),
-                });
-                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                match format {
+                    OutputFormat::Json => {
+                        let out = json!({
+                            "window": window,
+                            "cutoff": cutoff,
+                            "type_filter": type_filter,
+                            "counts": JsonValue::Object(counts),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                    }
+                    OutputFormat::Table => {
+                        println!("Window: {} (cutoff: {})", window, cutoff);
+                        if let Some(t) = type_filter {
+                            println!("Type filter: {}", t);
+                        }
+                        let table_rows: Vec<Vec<String>> = counts.iter()
+                            .map(|(k, v)| vec![k.clone(), cell(v)])
+                            .collect();
+                        crate::print_table(&["EVENT_TYPE", "COUNT"], &table_rows);
+                    }
+                    _ => {}
+                }
             }
             Err(e) => {
                 eprintln!("changes-summary query failed: {}", e);
@@ -1658,7 +1816,11 @@ pub mod cli {
         date2: &str,
         type_filter: Option<&str>,
         limit: usize,
+        format: OutputFormat,
     ) {
+        if handle_stub_format(format, "compare-snapshots") {
+            return;
+        }
         let c1 = match resolve_date(date1) {
             Ok(s) => s,
             Err(e) => {
@@ -1722,17 +1884,49 @@ pub mod cli {
         only_1_sorted.sort();
         let mut only_2_sorted = only_2;
         only_2_sorted.sort();
-        let out = json!({
-            "date1": c1,
-            "date2": c2,
-            "type_filter": type_filter,
-            "only_at_date1": only_1_sorted,
-            "only_at_date2": only_2_sorted,
-            "common_count": common_count,
-            "added_between_count": only_2_sorted.len(),
-            "removed_between_count": only_1_sorted.len(),
-        });
-        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        match format {
+            OutputFormat::Json => {
+                let out = json!({
+                    "date1": c1,
+                    "date2": c2,
+                    "type_filter": type_filter,
+                    "only_at_date1": only_1_sorted,
+                    "only_at_date2": only_2_sorted,
+                    "common_count": common_count,
+                    "added_between_count": only_2_sorted.len(),
+                    "removed_between_count": only_1_sorted.len(),
+                });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            }
+            OutputFormat::Table => {
+                println!("Snapshot comparison:");
+                println!("  date1: {}", c1);
+                println!("  date2: {}", c2);
+                if let Some(t) = type_filter {
+                    println!("  type_filter: {}", t);
+                }
+                let summary = vec![
+                    vec!["common_count".to_string(), common_count.to_string()],
+                    vec!["removed_between_count".to_string(), only_1_sorted.len().to_string()],
+                    vec!["added_between_count".to_string(), only_2_sorted.len().to_string()],
+                ];
+                crate::print_table(&["METRIC", "VALUE"], &summary);
+                // Cap inline rendering to keep output compact; full lists in JSON.
+                if !only_1_sorted.is_empty() {
+                    println!("\nOnly at date1 ({} total, showing up to 20):", only_1_sorted.len());
+                    for x in only_1_sorted.iter().take(20) {
+                        println!("  {}", x);
+                    }
+                }
+                if !only_2_sorted.is_empty() {
+                    println!("\nOnly at date2 ({} total, showing up to 20):", only_2_sorted.len());
+                    for x in only_2_sorted.iter().take(20) {
+                        println!("  {}", x);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// `pss dedup-candidates [--min-count N] [--type T]` (Phase 3 Tier A F-8)
@@ -1747,7 +1941,11 @@ pub mod cli {
         min_count: usize,
         type_filter: Option<&str>,
         limit: usize,
+        format: OutputFormat,
     ) {
+        if handle_stub_format(format, "dedup-candidates") {
+            return;
+        }
         let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
         params.insert("min".into(), DataValue::Num(Num::Int(min_count as i64)));
         params.insert("limit".into(), DataValue::Num(Num::Int(limit as i64)));
@@ -1781,7 +1979,24 @@ pub mod cli {
                         "scope_count": data_to_json(&row[2]),
                     })
                 }).collect();
-                println!("{}", serde_json::to_string_pretty(&JsonValue::Array(out)).unwrap_or_default());
+                match format {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&JsonValue::Array(out)).unwrap_or_default()
+                    ),
+                    OutputFormat::Table => {
+                        let table_rows: Vec<Vec<String>> = out.iter().map(|r| vec![
+                            cell(&r["element_type"]),
+                            cell(&r["element_name"]),
+                            cell(&r["scope_count"]),
+                        ]).collect();
+                        crate::print_table(
+                            &["ELEMENT_TYPE", "ELEMENT_NAME", "SCOPE_COUNT"],
+                            &table_rows,
+                        );
+                    }
+                    _ => {}
+                }
             }
             Err(e) => {
                 eprintln!("dedup-candidates query failed: {}", e);
@@ -1833,7 +2048,10 @@ pub mod cli {
     }
 
     /// `pss scan-log [--limit N]`
-    pub fn cmd_scan_log(db: &DbInstance, limit: usize) {
+    pub fn cmd_scan_log(db: &DbInstance, limit: usize, format: OutputFormat) {
+        if handle_stub_format(format, "scan-log") {
+            return;
+        }
         let q = r#"
             ?[scan_id, started_at, finished_at, scope_paths_json, events_emitted, rust_binary_version, pss_version] :=
                 *scan_runs{scan_id, started_at, finished_at, scope_paths_json,
@@ -1860,17 +2078,36 @@ pub mod cli {
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
-                );
+                match format {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                    ),
+                    OutputFormat::Table => {
+                        let table_rows: Vec<Vec<String>> = rows.iter().map(|r| vec![
+                            cell(&r["scan_id"]),
+                            cell(&r["finished_at"]),
+                            cell(&r["events_emitted"]),
+                            cell(&r["rust_binary_version"]),
+                            cell(&r["pss_version"]),
+                        ]).collect();
+                        crate::print_table(
+                            &["SCAN_ID", "FINISHED_AT", "EVENTS", "RUST_VERSION", "PSS_VERSION"],
+                            &table_rows,
+                        );
+                    }
+                    _ => {}
+                }
             }
             Err(e) => eprintln!("scan-log query failed: {}", e),
         }
     }
 
     /// `pss db-stats`
-    pub fn cmd_db_stats(db: &DbInstance) {
+    pub fn cmd_db_stats(db: &DbInstance, format: OutputFormat) {
+        if handle_stub_format(format, "db-stats") {
+            return;
+        }
         let event_count = db
             .run_script(
                 r#"?[count(event_id)] := *events{event_id}"#,
@@ -1927,15 +2164,33 @@ pub mod cli {
                 _ => None,
             })
             .unwrap_or_else(|| "9m".to_string());
-        let out = json!({
-            "schema_version": read_schema_version(db),
-            "event_count": event_count,
-            "blob_count": blob_count,
-            "state_count": state_count,
-            "oldest_event_at": oldest,
-            "retention_window": retention,
-        });
-        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        match format {
+            OutputFormat::Json => {
+                let out = json!({
+                    "schema_version": read_schema_version(db),
+                    "event_count": event_count,
+                    "blob_count": blob_count,
+                    "state_count": state_count,
+                    "oldest_event_at": oldest,
+                    "retention_window": retention,
+                });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            }
+            OutputFormat::Table => {
+                let schema_v = read_schema_version(db);
+                let oldest_str = oldest.unwrap_or_default();
+                let table_rows = vec![
+                    vec!["schema_version".to_string(), schema_v],
+                    vec!["event_count".to_string(), event_count.to_string()],
+                    vec!["blob_count".to_string(), blob_count.to_string()],
+                    vec!["state_count".to_string(), state_count.to_string()],
+                    vec!["oldest_event_at".to_string(), oldest_str],
+                    vec!["retention_window".to_string(), retention],
+                ];
+                crate::print_table(&["KEY", "VALUE"], &table_rows);
+            }
+            _ => {}
+        }
     }
 
     /// `pss reindex` — COR-8 (audit 20260514): the placeholder that
@@ -3454,7 +3709,10 @@ pub mod cli {
 
     /// `pss marketplace-history` — all marketplace_added / marketplace_removed
     /// events. Optionally filter by date window.
-    pub fn cmd_marketplace_history(db: &DbInstance, limit: usize) {
+    pub fn cmd_marketplace_history(db: &DbInstance, limit: usize, format: OutputFormat) {
+        if handle_stub_format(format, "marketplace-history") {
+            return;
+        }
         let q = r#"
             ?[observed_at, event_type, element_name, element_id, diff_json] :=
                 *events{event_type, element_type: "marketplace", observed_at,
@@ -3483,10 +3741,24 @@ pub mod cli {
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
-                );
+                match format {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                    ),
+                    OutputFormat::Table => {
+                        let table_rows: Vec<Vec<String>> = rows.iter().map(|r| vec![
+                            cell(&r["observed_at"]),
+                            cell(&r["event_type"]),
+                            cell(&r["element_name"]),
+                        ]).collect();
+                        crate::print_table(
+                            &["OBSERVED_AT", "EVENT_TYPE", "MARKETPLACE_NAME"],
+                            &table_rows,
+                        );
+                    }
+                    _ => {}
+                }
             }
             Err(e) => eprintln!("marketplace-history query failed: {}", e),
         }
@@ -3506,7 +3778,10 @@ pub mod cli {
     ///   - `name` (no `@`) → prefix match across all marketplaces
     ///     (`name@*`), so a user can find their plugin without
     ///     remembering the marketplace.
-    pub fn cmd_plugin_history(db: &DbInstance, plugin_name: &str, limit: usize) {
+    pub fn cmd_plugin_history(db: &DbInstance, plugin_name: &str, limit: usize, format: OutputFormat) {
+        if handle_stub_format(format, "plugin-history") {
+            return;
+        }
         // DI-9: dual-mode lookup.
         let has_at = plugin_name.contains('@');
         let q = if has_at {
@@ -3561,10 +3836,25 @@ pub mod cli {
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
-                );
+                match format {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&JsonValue::Array(rows)).unwrap_or_default()
+                    ),
+                    OutputFormat::Table => {
+                        let table_rows: Vec<Vec<String>> = rows.iter().map(|r| vec![
+                            cell(&r["observed_at"]),
+                            cell(&r["event_type"]),
+                            cell(&r["element_name"]),
+                            cell(&r["scope"]),
+                        ]).collect();
+                        crate::print_table(
+                            &["OBSERVED_AT", "EVENT_TYPE", "PLUGIN_NAME", "SCOPE"],
+                            &table_rows,
+                        );
+                    }
+                    _ => {}
+                }
             }
             Err(e) => eprintln!("plugin-history query failed: {}", e),
         }

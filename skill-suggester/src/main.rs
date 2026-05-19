@@ -118,6 +118,104 @@ struct Cli {
     command: Option<Commands>,
 }
 
+/// Canonical output format for every output-producing subcommand
+/// (COR-6, v3.7). `Table` is the default; `Json` is opt-in.
+///
+/// `Csv`, `Tsv`, and `Markdown` variants are reserved — most subcommands
+/// currently emit a "TODO: <format> format" stub when these are requested.
+/// Add the per-format formatter alongside the table / JSON branches in each
+/// `cmd_*` function as the need arises.
+///
+/// Legacy `--json` boolean flags remain on the subcommands as deprecated
+/// aliases for `--format json`. The compatibility helper
+/// [`resolve_format`] folds the two so every `cmd_*` only branches on a
+/// single `OutputFormat` value.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lower")]
+pub(crate) enum OutputFormat {
+    /// Human-readable Unicode-bordered table (default).
+    #[default]
+    Table,
+    /// Machine-readable JSON.
+    Json,
+    /// Comma-separated values. TODO: most subcommands stub this.
+    Csv,
+    /// Tab-separated values. TODO: most subcommands stub this.
+    Tsv,
+    /// Markdown table / fenced code block. TODO: most subcommands stub this.
+    Markdown,
+}
+
+impl OutputFormat {
+    /// Stable lowercase form used both for human-readable error messages
+    /// and for the legacy `--format` string compatibility shim.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            OutputFormat::Table => "table",
+            OutputFormat::Json => "json",
+            OutputFormat::Csv => "csv",
+            OutputFormat::Tsv => "tsv",
+            OutputFormat::Markdown => "markdown",
+        }
+    }
+
+    /// Returns true iff this format is currently a no-op stub. The
+    /// `cmd_*` functions use this to print a single `TODO: <fmt> format`
+    /// line instead of crashing or returning an empty body.
+    #[allow(dead_code)] // reserved API; not yet branched on in every cmd
+    pub(crate) fn is_stub(&self) -> bool {
+        matches!(self, OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown)
+    }
+
+    /// Print a single canonical stub line for an unsupported format.
+    /// Use from inside a `cmd_*` function when [`Self::is_stub`] returns true
+    /// so users always get the same wording.
+    pub(crate) fn print_stub(&self, subcommand: &str) {
+        println!(
+            "TODO: {} format for `{}` (Phase 3 reserves the variant; implementation pending)",
+            self.as_str(),
+            subcommand,
+        );
+    }
+}
+
+/// Fold the legacy `--json` boolean flag and the new `--format` enum into
+/// a single canonical [`OutputFormat`].
+///
+/// Behavior:
+/// - If `json` (legacy `--json` flag) is `true`, force [`OutputFormat::Json`].
+///   This preserves backward compatibility for users / scripts still passing
+///   `--json` on subcommands where the new `--format` flag is also exposed.
+/// - Otherwise, return `format` verbatim.
+pub(crate) fn resolve_format(json: bool, format: OutputFormat) -> OutputFormat {
+    if json {
+        OutputFormat::Json
+    } else {
+        format
+    }
+}
+
+/// Parse a legacy `--format <str>` parameter. Returns [`OutputFormat::Json`]
+/// for "json", [`OutputFormat::Table`] for everything else.  Used by the
+/// pre-v3.7 subcommands that still store `format: String` (because the
+/// `format` value is read from a position-aware match arm and migrating
+/// all of them in one pass is too much surface for one patch).
+///
+/// New subcommands should NOT use this helper — they should use the
+/// canonical `format: OutputFormat` field directly.
+#[allow(dead_code)] // reserved for future migrations of subcommands that
+                     // still parse `format: String` internally.
+pub(crate) fn parse_legacy_format(s: &str) -> OutputFormat {
+    match s.to_ascii_lowercase().as_str() {
+        "json" => OutputFormat::Json,
+        "csv" => OutputFormat::Csv,
+        "tsv" => OutputFormat::Tsv,
+        "markdown" | "md" => OutputFormat::Markdown,
+        // "table" or anything unknown — default to table (most user-friendly).
+        _ => OutputFormat::Table,
+    }
+}
+
 /// Query/inspect subcommands for exploring the skill index.
 /// These use CozoDB Datalog queries when available, with JSON fallback.
 #[derive(clap::Subcommand, Debug)]
@@ -167,9 +265,15 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         top: usize,
 
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        /// COR-6 (v3.7): standardized across every subcommand.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.  Kept for backward
+        /// compatibility with pre-v3.7 scripts.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// List entries with optional filtering and sorting
@@ -226,9 +330,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         top: usize,
 
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Show full details of a named entry (accepts name or ID)
@@ -236,9 +344,13 @@ enum Commands {
         /// Name or 13-char ID of the entry to inspect
         name: String,
 
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Side-by-side comparison of two entries (accepts names or IDs)
@@ -249,16 +361,24 @@ enum Commands {
         /// Second entry (name or ID)
         name2: String,
 
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Show index statistics (counts by type, domain, category, language, etc.)
     Stats {
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// List all distinct values for a field (the "menu" of available options).
@@ -276,9 +396,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         top: usize,
 
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Per-type coverage breakdown: what languages/domains/frameworks are covered
@@ -287,9 +411,13 @@ enum Commands {
         #[arg(long, value_name = "TYPE")]
         r#type: Option<String>,
 
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Resolve entry IDs to file paths (for reading actual skill/agent files)
@@ -297,9 +425,13 @@ enum Commands {
         /// One or more entry IDs (13-char deterministic hashes) or names
         ids: Vec<String>,
 
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Get lightweight metadata (description, type, plugin, keywords) for elements.
@@ -313,9 +445,13 @@ enum Commands {
         #[arg(long)]
         batch: bool,
 
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Index rule files from ~/.claude/rules/ and .claude/rules/ into the DB.
@@ -329,9 +465,13 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         project_root: Option<String>,
 
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// List all indexed rules with their descriptions.
@@ -341,9 +481,13 @@ enum Commands {
         #[arg(long)]
         scope: Option<String>,
 
-        /// Output format: json (default) or table
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format: table (default), json, csv, tsv, markdown.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Export a JSON snapshot of the CozoDB for debugging / git diff workflows.
@@ -367,9 +511,13 @@ enum Commands {
     /// Default output is a single integer on stdout; `--json` yields `{"count": N}`.
     /// Exits non-zero if the DB is missing or unreadable.
     Count {
-        /// Output as JSON: {"count": N}.
+        /// Output as JSON: {"count": N}.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format (table = bare integer, json = {"count": N}).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// Fetch a single entry by name. With --source, disambiguates when the
@@ -382,9 +530,13 @@ enum Commands {
         #[arg(long)]
         source: Option<String>,
 
-        /// Output as JSON (default is human-readable).
+        /// Output as JSON (default is human-readable).  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// Health probe. Exit 0=DB populated; 1=empty/corrupt; 2=missing.
@@ -407,9 +559,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
 
-        /// Output as JSON (default is human-readable).
+        /// Output as JSON.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// List entries whose `first_indexed_at` falls within [start, end] (inclusive).
@@ -425,9 +581,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
 
-        /// Output as JSON.
+        /// Output as JSON.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// List entries whose `last_updated_at` is >= the given datetime.
@@ -441,9 +601,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
 
-        /// Output as JSON.
+        /// Output as JSON.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// Find entries whose name contains the given substring (case-insensitive).
@@ -458,7 +622,7 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
 
-        /// Output as JSON.
+        /// Output as JSON.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
 
@@ -468,6 +632,10 @@ enum Commands {
         /// with a parse-error line on stderr (fail-fast).
         #[arg(long, default_value_t = false)]
         regex: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// Find entries with an exact keyword match via skill_keywords.
@@ -480,9 +648,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
 
-        /// Output as JSON.
+        /// Output as JSON.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// Find entries gated by (or tagged with) the given domain.
@@ -495,9 +667,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
 
-        /// Output as JSON.
+        /// Output as JSON.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// Find entries targeting the given programming language.
@@ -510,9 +686,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
 
-        /// Output as JSON.
+        /// Output as JSON.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// UX-8 (audit 20260514): find entries targeting the given framework
@@ -526,9 +706,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
 
-        /// Output as JSON.
+        /// Output as JSON.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// UX-8 (audit 20260514): find entries that integrate with the given
@@ -542,9 +726,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
 
-        /// Output as JSON.
+        /// Output as JSON.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// UX-8 (audit 20260514): find entries targeting the given platform
@@ -558,9 +746,13 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
 
-        /// Output as JSON.
+        /// Output as JSON.  Deprecated alias for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     // ========================================================================
@@ -595,6 +787,14 @@ enum Commands {
         /// Maximum rows (default: 200).
         #[arg(long, default_value_t = 200)]
         limit: usize,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// First-seen and last-seen (or null) timestamps for one element.
@@ -617,6 +817,14 @@ enum Commands {
         /// Maximum rows (default: 1000).
         #[arg(long, default_value_t = 1000)]
         limit: usize,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// All `removed` events since the given date (inclusive).
@@ -635,12 +843,28 @@ enum Commands {
         /// Maximum rows (default: 20).
         #[arg(long, default_value_t = 20)]
         limit: usize,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Statistics about the temporal database: event count, blob count,
     /// blob bytes, oldest event, retention window.
     #[command(name = "db-stats")]
-    DbStats,
+    DbStats {
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 
     /// Run a full reindex (discover → enrich → emit events). Suitable
     /// for cron via the janitor `pss-reindex-due` detector.
@@ -794,6 +1018,14 @@ enum Commands {
     MarketplaceHistory {
         #[arg(long, default_value_t = 500)]
         limit: usize,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// All events for one plugin name (across versions / scopes).
@@ -811,6 +1043,14 @@ enum Commands {
         plugin_name: String,
         #[arg(long, default_value_t = 500)]
         limit: usize,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Read JSONL observations from stdin and emit temporal events.
@@ -894,6 +1134,14 @@ enum Commands {
         scan_id: String,
         #[arg(long, default_value_t = 500)]
         limit: usize,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// F-18 (audit 20260514): emit every event from the most recent
@@ -902,6 +1150,14 @@ enum Commands {
     LastChanges {
         #[arg(long, default_value_t = 500)]
         limit: usize,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// F-19 (audit 20260514): count elements per scope (and per type
@@ -911,6 +1167,14 @@ enum Commands {
         /// Optional element-type filter; without it counts every type.
         #[arg(long, value_name = "TYPE")]
         r#type: Option<String>,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// F-12 (audit 20260514): focused "what versions has this element
@@ -928,6 +1192,14 @@ enum Commands {
         element_id: String,
         #[arg(long, default_value_t = 500)]
         limit: usize,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Count events by event_type in a recent time window.
@@ -941,6 +1213,14 @@ enum Commands {
         /// Optional element-type filter.
         #[arg(long, value_name = "TYPE")]
         r#type: Option<String>,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// List the scopes where the given element name is currently enabled
@@ -969,6 +1249,14 @@ enum Commands {
         /// Cap total elements scanned per snapshot (default 5000).
         #[arg(long, default_value_t = 5000)]
         limit: usize,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Find (element_type, element_name) pairs that appear in 2+ scopes.
@@ -985,6 +1273,47 @@ enum Commands {
         r#type: Option<String>,
         #[arg(long, default_value_t = 200)]
         limit: usize,
+
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// One-line overview of the PSS index — total element count, per-type
+    /// breakdown, and per-scope source breakdown.
+    ///
+    /// COR-6 / v3.7 task 3.2.  Reads from the temporal `elements_state` table
+    /// joined against `events` for the most recent event of each element.
+    /// Output is human-friendly by default; pass `--format json` for a
+    /// structured `{total, by_type, by_source}` envelope.
+    Summary {
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Directory-tree view of the PSS index, grouped by source (user / project
+    /// / plugin / marketplace) then by element type.
+    ///
+    /// COR-6 / v3.7 task 3.3.  Uses Unicode box-drawing characters
+    /// (├ │ └ ─) to render the hierarchy.  `--format json` returns the same
+    /// data as nested objects (`{source: {type: count, ...}, ...}`).
+    Tree {
+        /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -15185,42 +15514,76 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
     let db = open_db_for_query(cli)?;
     match cmd {
         Commands::Search { query, r#type, domain, language, framework, tool,
-                           category, file_type, keyword, platform, top, format } =>
+                           category, file_type, keyword, platform, top, format, json } => {
+            let fmt = resolve_format(*json, *format);
             cmd_search(&db, query, r#type.as_deref(), domain.as_deref(),
                        language.as_deref(), framework.as_deref(), tool.as_deref(),
                        category.as_deref(), file_type.as_deref(), keyword.as_deref(),
-                       platform.as_deref(), *top, format),
+                       platform.as_deref(), *top, fmt.as_str())
+        }
         Commands::List { r#type, domain, language, framework, tool,
-                         category, file_type, keyword, platform, source_prefix, sort, top, format } =>
+                         category, file_type, keyword, platform, source_prefix, sort, top, format, json } => {
+            let fmt = resolve_format(*json, *format);
             cmd_list(&db, r#type.as_deref(), domain.as_deref(),
                      language.as_deref(), framework.as_deref(), tool.as_deref(),
                      category.as_deref(), file_type.as_deref(), keyword.as_deref(),
-                     platform.as_deref(), source_prefix.as_deref(), sort, *top, format),
-        Commands::Inspect { name, format } =>
-            cmd_inspect(&db, name, format),
-        Commands::Compare { name1, name2, format } =>
-            cmd_compare(&db, name1, name2, format),
-        Commands::Stats { format } =>
-            cmd_stats(&db, format),
-        Commands::Vocab { field, r#type, top, format } =>
-            cmd_vocab(&db, field, r#type.as_deref(), *top, format),
-        Commands::Coverage { r#type, format } =>
-            cmd_coverage(&db, r#type.as_deref(), format),
-        Commands::Resolve { ids, format } =>
-            cmd_resolve(&db, ids, format),
-        Commands::GetDescription { names, batch, format } =>
-            cmd_get_description(&db, names, *batch, format),
-        Commands::IndexRules { project_root, format } =>
-            cmd_index_rules(&db, project_root.as_deref(), format),
-        Commands::ListRules { scope, format } =>
-            cmd_list_rules(&db, scope.as_deref(), format),
+                     platform.as_deref(), source_prefix.as_deref(), sort, *top, fmt.as_str())
+        }
+        Commands::Inspect { name, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_inspect(&db, name, fmt.as_str())
+        }
+        Commands::Compare { name1, name2, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_compare(&db, name1, name2, fmt.as_str())
+        }
+        Commands::Stats { format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_stats(&db, fmt.as_str())
+        }
+        Commands::Vocab { field, r#type, top, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_vocab(&db, field, r#type.as_deref(), *top, fmt.as_str())
+        }
+        Commands::Coverage { r#type, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_coverage(&db, r#type.as_deref(), fmt.as_str())
+        }
+        Commands::Resolve { ids, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_resolve(&db, ids, fmt.as_str())
+        }
+        Commands::GetDescription { names, batch, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_get_description(&db, names, *batch, fmt.as_str())
+        }
+        Commands::IndexRules { project_root, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_index_rules(&db, project_root.as_deref(), fmt.as_str())
+        }
+        Commands::ListRules { scope, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_list_rules(&db, scope.as_deref(), fmt.as_str())
+        }
         Commands::Export { json, path } =>
             cmd_export(&db, *json, path.as_deref()),
         // --- Phase D (v2.11.0) ---
-        Commands::Count { json } =>
-            cmd_count(&db, *json),
-        Commands::Get { name, source, json } =>
-            cmd_get(&db, name, source.as_deref(), *json),
+        Commands::Count { json, format } => {
+            let fmt = resolve_format(*json, *format);
+            // The cmd_count function's existing `json: bool` signature is kept
+            // for minimal surface change — table maps to bool=false (bare int),
+            // json maps to bool=true ({"count": N}).  Stub formats fall back to
+            // the JSON envelope so the integer is still parseable.
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_count(&db, want_json)
+        }
+        Commands::Get { name, source, json, format } => {
+            let fmt = resolve_format(*json, *format);
+            // Same rationale as cmd_count: keep the existing bool signature
+            // until each format gets its own branch.  Json/stub → JSON envelope.
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_get(&db, name, source.as_deref(), want_json)
+        }
         Commands::Health { .. } => {
             // Unreachable — Health is dispatched BEFORE run_query_command in main().
             // If we get here, that's a routing bug; fail loudly.
@@ -15228,26 +15591,56 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
                 "internal error: Health command reached run_query_command".to_string(),
             ))
         }
-        Commands::ListAddedSince { when, limit, json } =>
-            cmd_list_added_since(&db, when, *limit, *json),
-        Commands::ListAddedBetween { start, end, limit, json } =>
-            cmd_list_added_between(&db, start, end, *limit, *json),
-        Commands::ListUpdatedSince { when, limit, json } =>
-            cmd_list_updated_since(&db, when, *limit, *json),
-        Commands::FindByName { substring, limit, json, regex } =>
-            cmd_find_by_name(&db, substring, *limit, *json, *regex),
-        Commands::FindByKeyword { keyword, limit, json } =>
-            cmd_find_by_auxiliary(&db, "skill_keywords", keyword, *limit, *json),
-        Commands::FindByDomain { domain, limit, json } =>
-            cmd_find_by_auxiliary(&db, "skill_domains", domain, *limit, *json),
-        Commands::FindByLanguage { language, limit, json } =>
-            cmd_find_by_auxiliary(&db, "skill_languages", language, *limit, *json),
-        Commands::FindByFramework { framework, limit, json } =>
-            cmd_find_by_auxiliary(&db, "skill_frameworks", framework, *limit, *json),
-        Commands::FindByTool { tool, limit, json } =>
-            cmd_find_by_auxiliary(&db, "skill_tools", tool, *limit, *json),
-        Commands::FindByPlatform { platform, limit, json } =>
-            cmd_find_by_auxiliary(&db, "skill_platforms", platform, *limit, *json),
+        Commands::ListAddedSince { when, limit, json, format } => {
+            let fmt = resolve_format(*json, *format);
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_list_added_since(&db, when, *limit, want_json)
+        }
+        Commands::ListAddedBetween { start, end, limit, json, format } => {
+            let fmt = resolve_format(*json, *format);
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_list_added_between(&db, start, end, *limit, want_json)
+        }
+        Commands::ListUpdatedSince { when, limit, json, format } => {
+            let fmt = resolve_format(*json, *format);
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_list_updated_since(&db, when, *limit, want_json)
+        }
+        Commands::FindByName { substring, limit, json, regex, format } => {
+            let fmt = resolve_format(*json, *format);
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_find_by_name(&db, substring, *limit, want_json, *regex)
+        }
+        Commands::FindByKeyword { keyword, limit, json, format } => {
+            let fmt = resolve_format(*json, *format);
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_find_by_auxiliary(&db, "skill_keywords", keyword, *limit, want_json)
+        }
+        Commands::FindByDomain { domain, limit, json, format } => {
+            let fmt = resolve_format(*json, *format);
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_find_by_auxiliary(&db, "skill_domains", domain, *limit, want_json)
+        }
+        Commands::FindByLanguage { language, limit, json, format } => {
+            let fmt = resolve_format(*json, *format);
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_find_by_auxiliary(&db, "skill_languages", language, *limit, want_json)
+        }
+        Commands::FindByFramework { framework, limit, json, format } => {
+            let fmt = resolve_format(*json, *format);
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_find_by_auxiliary(&db, "skill_frameworks", framework, *limit, want_json)
+        }
+        Commands::FindByTool { tool, limit, json, format } => {
+            let fmt = resolve_format(*json, *format);
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_find_by_auxiliary(&db, "skill_tools", tool, *limit, want_json)
+        }
+        Commands::FindByPlatform { platform, limit, json, format } => {
+            let fmt = resolve_format(*json, *format);
+            let want_json = matches!(fmt, OutputFormat::Json | OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown);
+            cmd_find_by_auxiliary(&db, "skill_platforms", platform, *limit, want_json)
+        }
 
         // ====================================================================
         // Temporal history index (TRDD-152e697f) — see temporal::* dispatchers.
@@ -15258,28 +15651,32 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
                 scope.as_deref(), scope_path.as_deref(), *limit);
             Ok(())
         }
-        Commands::Timeline { element_id, limit } => {
-            temporal::cli::cmd_timeline(&db, element_id, *limit);
+        Commands::Timeline { element_id, limit, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_timeline(&db, element_id, *limit, fmt);
             Ok(())
         }
         Commands::Lifespan { element_id } => {
             temporal::cli::cmd_lifespan(&db, element_id);
             Ok(())
         }
-        Commands::ChangedBetween { start, end, r#type, limit } => {
-            temporal::cli::cmd_changed_between(&db, start, end, r#type.as_deref(), *limit);
+        Commands::ChangedBetween { start, end, r#type, limit, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_changed_between(&db, start, end, r#type.as_deref(), *limit, fmt);
             Ok(())
         }
         Commands::RemovedSince { date, limit } => {
             temporal::cli::cmd_removed_since(&db, date, *limit);
             Ok(())
         }
-        Commands::ScanLog { limit } => {
-            temporal::cli::cmd_scan_log(&db, *limit);
+        Commands::ScanLog { limit, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_scan_log(&db, *limit, fmt);
             Ok(())
         }
-        Commands::DbStats => {
-            temporal::cli::cmd_db_stats(&db);
+        Commands::DbStats { format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_db_stats(&db, fmt);
             Ok(())
         }
         Commands::Reindex { dry_run } => {
@@ -15339,12 +15736,14 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             temporal::cli::cmd_scope_moves(&db, name, r#type.as_deref(), *limit);
             Ok(())
         }
-        Commands::MarketplaceHistory { limit } => {
-            temporal::cli::cmd_marketplace_history(&db, *limit);
+        Commands::MarketplaceHistory { limit, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_marketplace_history(&db, *limit, fmt);
             Ok(())
         }
-        Commands::PluginHistory { plugin_name, limit } => {
-            temporal::cli::cmd_plugin_history(&db, plugin_name, *limit);
+        Commands::PluginHistory { plugin_name, limit, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_plugin_history(&db, plugin_name, *limit, fmt);
             Ok(())
         }
         Commands::MergeEvents { batch_stdin: _, quiet } => {
@@ -15374,41 +15773,57 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             temporal::cli::cmd_scope_diff(&db, scope1, scope2, r#type.as_deref(), *limit);
             Ok(())
         }
-        Commands::ChangesInBatch { scan_id, limit } => {
-            temporal::cli::cmd_changes_in_batch(&db, scan_id, *limit);
+        Commands::ChangesInBatch { scan_id, limit, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_changes_in_batch(&db, scan_id, *limit, fmt);
             Ok(())
         }
-        Commands::LastChanges { limit } => {
-            temporal::cli::cmd_last_changes(&db, *limit);
+        Commands::LastChanges { limit, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_last_changes(&db, *limit, fmt);
             Ok(())
         }
-        Commands::StatsByScope { r#type } => {
-            temporal::cli::cmd_stats_by_scope(&db, r#type.as_deref());
+        Commands::StatsByScope { r#type, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_stats_by_scope(&db, r#type.as_deref(), fmt);
             Ok(())
         }
-        Commands::VersionHistory { element_id, limit } => {
-            temporal::cli::cmd_version_history(&db, element_id, *limit);
+        Commands::VersionHistory { element_id, limit, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_version_history(&db, element_id, *limit, fmt);
             Ok(())
         }
-        Commands::ChangesSummary { window, r#type } => {
-            temporal::cli::cmd_changes_summary(&db, window, r#type.as_deref());
+        Commands::ChangesSummary { window, r#type, format, json } => {
+            let fmt = resolve_format(*json, *format);
+            temporal::cli::cmd_changes_summary(&db, window, r#type.as_deref(), fmt);
             Ok(())
         }
         Commands::EnabledWhere { name, r#type } => {
             temporal::cli::cmd_enabled_where(&db, name, r#type.as_deref());
             Ok(())
         }
-        Commands::DedupCandidates { min_count, r#type, limit } => {
+        Commands::DedupCandidates { min_count, r#type, limit, format, json } => {
+            let fmt = resolve_format(*json, *format);
             temporal::cli::cmd_dedup_candidates(
-                &db, *min_count, r#type.as_deref(), *limit,
+                &db, *min_count, r#type.as_deref(), *limit, fmt,
             );
             Ok(())
         }
-        Commands::CompareSnapshots { date1, date2, r#type, limit } => {
+        Commands::CompareSnapshots { date1, date2, r#type, limit, format, json } => {
+            let fmt = resolve_format(*json, *format);
             temporal::cli::cmd_compare_snapshots(
-                &db, date1, date2, r#type.as_deref(), *limit,
+                &db, date1, date2, r#type.as_deref(), *limit, fmt,
             );
             Ok(())
+        }
+        // ─── Phase 3 / v3.7 new top-level overview subcommands ────────────
+        Commands::Summary { format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_summary(&db, fmt)
+        }
+        Commands::Tree { format, json } => {
+            let fmt = resolve_format(*json, *format);
+            cmd_tree(&db, fmt)
         }
     }
 }
@@ -15545,7 +15960,7 @@ fn dv_to_i64(v: &DataValue) -> i64 {
 }
 
 /// Print a table with Unicode borders.
-fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+pub(crate) fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     if rows.is_empty() {
         println!("(no results)");
         return;
@@ -17281,6 +17696,255 @@ fn print_timestamp_list(entries: &[serde_json::Value], ts_label: &str) {
 
 fn ts_label_upper(label: &str) -> String {
     label.replace('_', " ").to_uppercase()
+}
+
+// --- cmd_summary (v3.7, task 3.2) ---
+
+/// Build a `(by_type, by_scope_kind, sources_set)` triple from elements_state +
+/// events.  Shared by `cmd_summary` and `cmd_tree`.
+///
+/// `by_type`: count of currently-active (`exists=true`) elements per
+///            element_type ("skill", "agent", ...).
+/// `by_scope_kind`: count per scope ("user", "project", "plugin", ...).
+/// `sources_set`: full set of distinct `source` strings (user / project /
+///                plugin:<name> / marketplace:<name>) currently observed.
+fn collect_index_overview(
+    db: &DbInstance,
+) -> Result<
+    (
+        BTreeMap<String, i64>,
+        BTreeMap<String, i64>,
+        std::collections::BTreeSet<String>,
+    ),
+    SuggesterError,
+> {
+    // Single query: for every active element, pull (element_type, scope, source)
+    // from the `events` row referenced by `elements_state.last_event_id`.
+    // We aggregate in Rust because Cozo's multi-dimensional aggregation gets
+    // verbose for this case.
+    let q = r#"?[element_type, scope, source] :=
+        *elements_state{element_id, last_event_id, exists: true},
+        *events{event_id: last_event_id, element_type, scope, source}"#;
+    let res = db
+        .run_script(q, Default::default(), ScriptMutability::Immutable)
+        .map_err(|e| SuggesterError::IndexParse(format!("summary query failed: {}", e)))?;
+    let mut by_type: BTreeMap<String, i64> = BTreeMap::new();
+    let mut by_scope: BTreeMap<String, i64> = BTreeMap::new();
+    let mut sources: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for row in &res.rows {
+        let et = dv_to_string(&row[0]);
+        let sc = dv_to_string(&row[1]);
+        let so = dv_to_string(&row[2]);
+        if !et.is_empty() {
+            *by_type.entry(et).or_insert(0) += 1;
+        }
+        if !sc.is_empty() {
+            *by_scope.entry(sc).or_insert(0) += 1;
+        }
+        if !so.is_empty() {
+            sources.insert(so);
+        }
+    }
+    Ok((by_type, by_scope, sources))
+}
+
+/// `pss summary` — one-line overview of the index.
+///
+/// Default (table): a single dense human-readable line.
+/// JSON: structured `{total, by_type, by_scope, by_source, sources}` object.
+fn cmd_summary(db: &DbInstance, format: OutputFormat) -> Result<(), SuggesterError> {
+    let (by_type, by_scope, sources) = collect_index_overview(db)?;
+    let total: i64 = by_type.values().sum();
+
+    match format {
+        OutputFormat::Json => {
+            // Build by_source breakdown: every distinct `source` and its
+            // active-element count.  Bucket "user" / "project" / "local" as
+            // their own scope keys; "plugin:..." entries land under "plugin"
+            // for the headline, but we also expose the raw `sources` list so
+            // callers see plugin names.
+            let mut plugin_count: i64 = 0;
+            let mut marketplace_count: i64 = 0;
+            let mut user_proj_local: i64 = 0;
+            for src in &sources {
+                if src.starts_with("plugin:") {
+                    plugin_count += 1;
+                } else if src.starts_with("marketplace:") {
+                    marketplace_count += 1;
+                } else {
+                    user_proj_local += 1;
+                }
+            }
+            let by_source = serde_json::json!({
+                "plugin": plugin_count,
+                "marketplace": marketplace_count,
+                "user_project_local": user_proj_local,
+            });
+            let out = serde_json::json!({
+                "total": total,
+                "by_type": by_type,
+                "by_scope": by_scope,
+                "by_source": by_source,
+                "sources": sources.iter().collect::<Vec<_>>(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_default()
+            );
+        }
+        OutputFormat::Table => {
+            // Build the canonical one-liner.  Format:
+            //   PSS index: <total> elements (<n> skills, <n> agents, ...) across
+            //   <m> sources (<n> plugins, <n> marketplaces, <n> user/project/local)
+            let type_parts: Vec<String> = by_type
+                .iter()
+                .map(|(k, v)| format!("{} {}{}", v, k, if *v == 1 { "" } else { "s" }))
+                .collect();
+            let mut plugin_n = 0;
+            let mut market_n = 0;
+            let mut upl_n = 0;
+            for s in &sources {
+                if s.starts_with("plugin:") {
+                    plugin_n += 1;
+                } else if s.starts_with("marketplace:") {
+                    market_n += 1;
+                } else {
+                    upl_n += 1;
+                }
+            }
+            let total_sources = sources.len();
+            println!(
+                "PSS index: {} elements ({}) across {} sources ({} plugins, {} marketplaces, {} user/project/local)",
+                total,
+                type_parts.join(", "),
+                total_sources,
+                plugin_n,
+                market_n,
+                upl_n,
+            );
+        }
+        OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown => {
+            format.print_stub("summary");
+        }
+    }
+    Ok(())
+}
+
+// --- cmd_tree (v3.7, task 3.3) ---
+
+/// `pss tree` — directory-tree view of the PSS index, grouped by source
+/// then by element type.
+///
+/// Default (table): Unicode box-drawing characters (├ │ └ ─).
+/// JSON: nested object `{source: {type: count, ...}, ...}`.
+fn cmd_tree(db: &DbInstance, format: OutputFormat) -> Result<(), SuggesterError> {
+    // Per-(source, element_type) count.  We sort sources into the canonical
+    // bucket order: user → project → local → plugin:* (alphabetical) →
+    // marketplace:* (alphabetical) → anything else.
+    let q = r#"?[source, element_type] :=
+        *elements_state{element_id, last_event_id, exists: true},
+        *events{event_id: last_event_id, source, element_type}"#;
+    let res = db
+        .run_script(q, Default::default(), ScriptMutability::Immutable)
+        .map_err(|e| SuggesterError::IndexParse(format!("tree query failed: {}", e)))?;
+
+    // Map: source → element_type → count
+    let mut grouped: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+    for row in &res.rows {
+        let src = dv_to_string(&row[0]);
+        let etype = dv_to_string(&row[1]);
+        if src.is_empty() || etype.is_empty() {
+            continue;
+        }
+        *grouped
+            .entry(src)
+            .or_default()
+            .entry(etype)
+            .or_insert(0) += 1;
+    }
+
+    /// Sort priority for a source bucket.  Lower number sorts first.
+    fn bucket_priority(src: &str) -> u8 {
+        match src {
+            "user" => 0,
+            "project" => 1,
+            "local" => 2,
+            _ => {
+                if src.starts_with("plugin:") {
+                    3
+                } else if src.starts_with("marketplace:") {
+                    4
+                } else {
+                    5
+                }
+            }
+        }
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let out = serde_json::to_value(&grouped).unwrap_or(serde_json::Value::Null);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_default()
+            );
+        }
+        OutputFormat::Table => {
+            // Sort sources by (priority, lexical).  Render as a Unicode tree.
+            let mut sources: Vec<&String> = grouped.keys().collect();
+            sources.sort_by(|a, b| {
+                let pa = bucket_priority(a);
+                let pb = bucket_priority(b);
+                pa.cmp(&pb).then(a.cmp(b))
+            });
+
+            // Friendly display label for a source bucket.
+            fn pretty_source(s: &str) -> String {
+                match s {
+                    "user" => "user (~/.claude/)".to_string(),
+                    "project" => "project (.claude/)".to_string(),
+                    "local" => "local".to_string(),
+                    _ => {
+                        if let Some(rest) = s.strip_prefix("plugin:") {
+                            format!("plugin/{}", rest)
+                        } else if let Some(rest) = s.strip_prefix("marketplace:") {
+                            format!("marketplace/{}", rest)
+                        } else {
+                            s.to_string()
+                        }
+                    }
+                }
+            }
+
+            println!("PSS Index Tree");
+            let total_sources = sources.len();
+            for (i, src) in sources.iter().enumerate() {
+                let is_last_src = i + 1 == total_sources;
+                let src_branch = if is_last_src { "└──" } else { "├──" };
+                println!("{} {}", src_branch, pretty_source(src));
+                let types = &grouped[*src];
+                let mut type_keys: Vec<&String> = types.keys().collect();
+                type_keys.sort();
+                let total_types = type_keys.len();
+                for (j, t) in type_keys.iter().enumerate() {
+                    let is_last_t = j + 1 == total_types;
+                    let prefix = if is_last_src { "   " } else { "│  " };
+                    let t_branch = if is_last_t { "└──" } else { "├──" };
+                    let count = types[*t];
+                    let label = if count == 1 {
+                        format!("{}", t)
+                    } else {
+                        format!("{}s", t)
+                    };
+                    println!("{}{} {}/ ({})", prefix, t_branch, label, count);
+                }
+            }
+        }
+        OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Markdown => {
+            format.print_stub("tree");
+        }
+    }
+    Ok(())
 }
 
 // --- cmd_count ---
