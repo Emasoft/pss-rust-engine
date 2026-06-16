@@ -9,3 +9,6 @@ reports_dev/
 .tldrignore
 .tldr_session_*
 .rechecker/
+
+# rechecker merge-pending markers — transient, never shipped (CPV: untracked+ignored)
+rck-*-merge-pending.md

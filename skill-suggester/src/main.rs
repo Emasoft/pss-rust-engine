@@ -18788,7 +18788,7 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
     // 1b. Apply typo corrections (e.g., "pyhton" → "python") so domain keywords match
     let corrected_prompt = correct_typos(&input.prompt);
     if corrected_prompt != input.prompt.to_lowercase() {
-        debug!("Typo-corrected prompt: {}", corrected_prompt);
+        debug!("Typo-corrected input: {}", corrected_prompt);
     }
 
     // 1c. Expand synonyms (e.g., "k8s" → "kubernetes") so domain keywords match
