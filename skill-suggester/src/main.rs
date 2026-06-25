@@ -14657,10 +14657,18 @@ fn project_slug_output(input: &str, json: bool) -> String {
 }
 
 /// P-9: build the `--contract-version` output:
-/// `{"cli_version":"<CARGO_PKG_VERSION>","schema_version":"<TEMPORAL_SCHEMA_VERSION>","contract_version":"1"}`.
+/// `{"cli_version":"<runtime VERSION>","schema_version":"<TEMPORAL_SCHEMA_VERSION>","contract_version":"1"}`.
+///
+/// `cli_version` MUST come from `read_version()` (the runtime VERSION file), NOT
+/// `env!("CARGO_PKG_VERSION")` (compile-time). The project bumps the version
+/// without rebuilding the binary on a docs-only release (per CLAUDE.md: "the Rust
+/// binary reads the version at runtime from the VERSION file"). Using the
+/// compile-time constant made the integrator-facing contract surface disagree with
+/// `--version` after such a release — e.g. v3.8.2 (docs-only) left the unrebuilt
+/// binary reporting `cli_version: 3.8.1` while `--version` correctly read 3.8.2.
 fn contract_version_output() -> String {
     serde_json::json!({
-        "cli_version": env!("CARGO_PKG_VERSION"),
+        "cli_version": read_version(),
         "schema_version": temporal::TEMPORAL_SCHEMA_VERSION,
         "contract_version": CONTRACT_VERSION,
     })
@@ -22406,7 +22414,9 @@ mediapipe>=0.10
     fn contract_version_output_has_three_fields() {
         let out = contract_version_output();
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
-        assert_eq!(v["cli_version"], serde_json::json!(env!("CARGO_PKG_VERSION")));
+        // cli_version must come from read_version() (runtime VERSION file), the
+        // same source --version uses, so the two never disagree.
+        assert_eq!(v["cli_version"], serde_json::json!(read_version()));
         assert_eq!(v["schema_version"], serde_json::json!(temporal::TEMPORAL_SCHEMA_VERSION));
         assert_eq!(v["contract_version"], serde_json::json!(CONTRACT_VERSION));
         assert_eq!(v.as_object().unwrap().len(), 3);
