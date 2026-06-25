@@ -55,6 +55,14 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     incomplete_mode: bool,
 
+    /// Issue #10 P-9: print the external CLI contract
+    /// `{"cli_version","schema_version","contract_version"}` and exit 0,
+    /// BEFORE any normal dispatch. A stable handle for integrators across PSS
+    /// upgrades (like `--version`, but it carries the temporal schema version
+    /// and the contract version too).
+    #[arg(long, default_value_t = false)]
+    contract_version: bool,
+
     /// Return only the top N candidates (default: 4, reduced from 10 to save context)
     #[arg(long, default_value_t = 4)]
     top: usize,
@@ -762,6 +770,12 @@ enum Commands {
     // ========================================================================
     /// List every element that was installed and active at the given date.
     /// Reads from elements_state with an as-of cutoff against events.
+    /// Each row also carries (P-4): `first_seen` — the earliest `installed`
+    /// event's timestamp for that element_id in its scope (the install
+    /// instant) — and `first_seen_is_synthetic` — true iff that earliest
+    /// install is the v1→v2 migration placeholder rather than a real observed
+    /// install. (The same real install instant is also exposed per-event by
+    /// `pss timeline <ELEMENT_ID>` and `pss installed-between <S> <E>`.)
     #[command(name = "as-of")]
     AsOf {
         /// RFC3339 date or shorthand: "2026-03-14", "2026-03-14T12:00:00Z", "yesterday", "now"
@@ -775,9 +789,47 @@ enum Commands {
         /// Optional scope_path filter (absolute path).
         #[arg(long, value_name = "PATH")]
         scope_path: Option<String>,
-        /// Maximum rows (default: 1000).
-        #[arg(long, default_value_t = 1000)]
+        /// Maximum rows. Default is UNLIMITED (P-7): a snapshot of ALL active
+        /// components must never silently truncate. The 1_000_000 sentinel is
+        /// "no practical cap"; pass `--limit N` to bound the result.
+        #[arg(long, default_value_t = 1_000_000)]
         limit: usize,
+    },
+
+    /// List every component ACTIVE in a project folder at a point in time —
+    /// the UNION of (a) project/local-scope elements whose scope_path is the
+    /// folder's slug, (b) all global user-scope elements, and (c) plugin /
+    /// marketplace elements currently enabled. Same row shape as `as-of`
+    /// (including `first_seen` / `first_seen_is_synthetic`). Default is
+    /// UNLIMITED (P-7) — pass `--limit N` to bound the result.
+    ///
+    /// NOTE (honesty): faithful PER-PROJECT plugin enablement at a PAST instant
+    /// is not recorded yet (issue #10 P-8 is going-forward). So (c) reflects
+    /// CURRENT/global enablement; per-project historical enablement fidelity is
+    /// limited until enablement observation accrues. The (a)/(b) members ARE
+    /// resolved as-of the requested time from the event history.
+    #[command(name = "active-in")]
+    ActiveIn {
+        /// Absolute project folder path. Its scope-path slug is computed with
+        /// the SAME algorithm as `pss project-slug` and matched against the
+        /// project/local-scope rows' scope_path.
+        abs_path: String,
+        /// Point in time. RFC3339 date or shorthand ("2026-03-14", "now",
+        /// "yesterday"). Default: now. Parsed exactly like `as-of`'s date.
+        #[arg(long, value_name = "DATE", default_value = "now")]
+        as_of: String,
+        /// Maximum rows. Default is UNLIMITED (P-7); pass `--limit N` to bound.
+        #[arg(long, default_value_t = 1_000_000)]
+        limit: usize,
+
+        /// COR-6 (v3.7): output format. Only `json` is meaningful for this
+        /// verb; any non-table format yields the JSON array.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Show the full event timeline for one element.
@@ -1308,6 +1360,45 @@ enum Commands {
     /// data as nested objects (`{source: {type: count, ...}, ...}`).
     Tree {
         /// COR-6 (v3.7): output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    // ========================================================================
+    // Issue #10 wave 1 — external integration helpers (no DB required).
+    // ========================================================================
+    /// Print the canonical resolved CozoDB path PSS would use (honoring
+    /// `--index` / `PSS_INDEX_PATH` / the default `~/.claude/cache/pss-skill-index.db`).
+    /// Lets external consumers stop reverse-engineering PSS path resolution.
+    /// Default: the bare path on one line. `--format json`: `{"db_path":"<abs>"}`.
+    #[command(name = "db-path")]
+    DbPath {
+        /// COR-6 (v3.7): output format. Only `table` (bare path) and `json`
+        /// are meaningful; stub formats fall back to the JSON envelope.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+
+        /// Deprecated alias for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Compute the scope-path slug for an absolute project path, EXACTLY as the
+    /// Python discoverer (`pss_discover.py::_slugify_project_path`) does:
+    /// `"<basename>-<8-char-sha256>"` over the filesystem-resolved path. Use it
+    /// to reconstruct an element_id's scope_path slug from an absolute path.
+    /// Default: the bare slug. `--format json`: `{"abs_path":"<in>","slug":"<out>"}`.
+    #[command(name = "project-slug")]
+    ProjectSlug {
+        /// Absolute project path to slugify.
+        abs_path: String,
+
+        /// COR-6 (v3.7): output format. Only `table` (bare slug) and `json`
+        /// are meaningful; stub formats fall back to the JSON envelope.
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
 
@@ -14422,6 +14513,160 @@ fn get_db_path(cli_index: Option<&str>) -> Option<PathBuf> {
     if db_path.exists() { Some(db_path) } else { None }
 }
 
+// ============================================================================
+// Issue #10 P-2 / P-6 / P-9 — externally-facing path & contract helpers.
+// These intentionally do NOT touch CozoDB; they let external consumers stop
+// reverse-engineering PSS's path-resolution and version contract.
+// ============================================================================
+
+/// Stable cross-version contract handle (P-9). Bumped only when the JSON shape
+/// or semantics of PSS's external CLI contract change in a breaking way — NOT on
+/// every release. Integrators key on `{cli_version, schema_version,
+/// contract_version}` to decide whether their assumptions still hold.
+const CONTRACT_VERSION: &str = "1";
+
+/// P-2: resolve the canonical DB path PSS *would* use, mirroring
+/// [`get_db_path`]'s resolution order (`--index` → `PSS_INDEX_PATH` → default
+/// `~/.claude/cache/pss-skill-index.db`) but WITHOUT the existence gate.
+///
+/// `get_db_path` returns `None` when the file is absent (it is the runtime
+/// "open the DB if present" path). A `db-path` consumer instead needs the path
+/// it would create/use even before it exists — returning nothing there would
+/// defeat the entire purpose of the subcommand. Hence this sibling helper
+/// always returns the resolved `PathBuf`.
+fn resolve_db_path_canonical(cli_index: Option<&str>) -> PathBuf {
+    // 1. Explicit --index.
+    if let Some(path) = cli_index {
+        if path.ends_with(".db") {
+            return PathBuf::from(path);
+        }
+        // JSON path → sibling DB in the same directory.
+        let json_path = PathBuf::from(path);
+        if let Some(parent) = json_path.parent() {
+            return parent.join(DB_FILE);
+        }
+    }
+
+    // 2. PSS_INDEX_PATH env var → sibling DB in its directory.
+    if let Ok(path) = std::env::var("PSS_INDEX_PATH") {
+        if !path.is_empty() {
+            let json_path = PathBuf::from(&path);
+            if let Some(parent) = json_path.parent() {
+                return parent.join(DB_FILE);
+            }
+        }
+    }
+
+    // 3. Default: ~/.claude/cache/pss-skill-index.db. If the home dir is
+    //    somehow unresolvable, fall back to a relative path so the command
+    //    still emits something deterministic rather than panicking.
+    match dirs::home_dir() {
+        Some(home) => home.join(".claude").join(CACHE_DIR).join(DB_FILE),
+        None => PathBuf::from(".claude").join(CACHE_DIR).join(DB_FILE),
+    }
+}
+
+/// P-2: build the `db-path` subcommand's output string.
+/// Bare path on one line by default; `{"db_path":"<abs>"}` with `--format json`.
+fn db_path_output(cli_index: Option<&str>, json: bool) -> String {
+    let path = resolve_db_path_canonical(cli_index);
+    let s = path.to_string_lossy().to_string();
+    if json {
+        serde_json::json!({ "db_path": s }).to_string()
+    } else {
+        s
+    }
+}
+
+/// P-6: replicate Python's `pathlib.Path.resolve(strict=False)` byte-for-byte.
+///
+/// Python's `_slugify_project_path` hashes `str(project_path.resolve())`, which
+/// on macOS canonicalizes through filesystem symlinks (`/tmp` → `/private/tmp`,
+/// `/var` → `/private/var`). Rust's `std::fs::canonicalize` is the exact
+/// equivalent for paths that EXIST, but it errors on any missing component —
+/// whereas Python `resolve(strict=False)` canonicalizes the longest existing
+/// ancestor and appends the missing tail literally. We mirror that:
+///   1. canonicalize the whole path (fast path — the usual case: real projects);
+///   2. on failure, walk up to the longest existing ancestor, canonicalize it,
+///      then push the remaining components verbatim.
+/// This keeps the slug identical to the discoverer's, so an `element_id` written
+/// by Python is reproducible from `pss project-slug <abs>`.
+fn python_resolve(input: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(input) {
+        return canon;
+    }
+    // Find the longest existing ancestor; canonicalize it; re-append the tail.
+    let mut existing = input;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match existing.parent() {
+            Some(parent) => {
+                if let Some(name) = existing.file_name() {
+                    tail.push(name.to_os_string());
+                }
+                existing = parent;
+                if existing.exists() {
+                    break;
+                }
+            }
+            None => break, // reached the root with nothing existing
+        }
+    }
+    let mut resolved = std::fs::canonicalize(existing)
+        .unwrap_or_else(|_| existing.to_path_buf());
+    for name in tail.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved
+}
+
+/// P-6: compute the scope-path slug EXACTLY as
+/// `scripts/pss_discover.py::_slugify_project_path` does:
+/// `"<basename>-<first 8 hex chars of sha256(resolved_abs_path)>"`.
+///
+/// The basename comes from the INPUT argument (Python uses `project_path.name`,
+/// not the resolved path's name), while the hash is over the RESOLVED path —
+/// matching Python precisely.
+fn project_slug(input: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let resolved = python_resolve(input);
+    let resolved_str = resolved.to_string_lossy();
+    let digest = Sha256::digest(resolved_str.as_bytes());
+    // hex-encode the first 4 bytes → 8 lowercase hex chars (== Python `[:8]`).
+    let mut hex = String::with_capacity(8);
+    for byte in &digest[..4] {
+        hex.push_str(&format!("{:02x}", byte));
+    }
+    // Python `Path(arg).name`: "" for "/" and other root-only inputs.
+    let basename = input
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    format!("{}-{}", basename, hex)
+}
+
+/// P-6: build the `project-slug` subcommand's output string.
+/// Bare slug by default; `{"abs_path":"<in>","slug":"<out>"}` with `--format json`.
+fn project_slug_output(input: &str, json: bool) -> String {
+    let slug = project_slug(Path::new(input));
+    if json {
+        serde_json::json!({ "abs_path": input, "slug": slug }).to_string()
+    } else {
+        slug
+    }
+}
+
+/// P-9: build the `--contract-version` output:
+/// `{"cli_version":"<CARGO_PKG_VERSION>","schema_version":"<TEMPORAL_SCHEMA_VERSION>","contract_version":"1"}`.
+fn contract_version_output() -> String {
+    serde_json::json!({
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "schema_version": temporal::TEMPORAL_SCHEMA_VERSION,
+        "contract_version": CONTRACT_VERSION,
+    })
+    .to_string()
+}
+
 /// Open a CozoDB instance with SQLite backend at the given path.
 fn open_db(path: &Path) -> Result<DbInstance, SuggesterError> {
     DbInstance::new("sqlite", path.to_str().unwrap_or(""), Default::default())
@@ -15651,6 +15896,18 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
                 scope.as_deref(), scope_path.as_deref(), *limit);
             Ok(())
         }
+        Commands::ActiveIn { abs_path, as_of, limit, format, json } => {
+            // active-in always emits the JSON array (same as as-of); the
+            // --format/--json flags are accepted for CLI convention parity
+            // but do not change the JSON-array output.
+            let _ = resolve_format(*json, *format);
+            // Compute the scope-path slug from the absolute path with the SAME
+            // algorithm `pss project-slug` uses (single source of truth), so it
+            // matches the project/local-scope rows' scope_path in the DB.
+            let slug = project_slug(Path::new(abs_path));
+            temporal::cli::cmd_active_in(&db, &slug, as_of, *limit);
+            Ok(())
+        }
         Commands::Timeline { element_id, limit, format, json } => {
             let fmt = resolve_format(*json, *format);
             temporal::cli::cmd_timeline(&db, element_id, *limit, fmt);
@@ -15825,6 +16082,16 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             let fmt = resolve_format(*json, *format);
             cmd_tree(&db, fmt)
         }
+        // Issue #10 P-2 / P-6: db-path and project-slug are intercepted in
+        // main() BEFORE run_query_command (they need no DB). Reaching here is a
+        // routing bug; fail loudly rather than silently mis-handle. These arms
+        // exist only to keep the match exhaustive.
+        Commands::DbPath { .. } => Err(SuggesterError::IndexParse(
+            "internal error: DbPath command reached run_query_command".to_string(),
+        )),
+        Commands::ProjectSlug { .. } => Err(SuggesterError::IndexParse(
+            "internal error: ProjectSlug command reached run_query_command".to_string(),
+        )),
     }
 }
 
@@ -18515,8 +18782,31 @@ fn main() {
         info!("Running in INCOMPLETE MODE - co_usage data will be ignored");
     }
 
+    // Issue #10 P-9: --contract-version is a global flag (like --version). It
+    // prints the external contract object and exits 0 BEFORE any normal
+    // dispatch — and works with or without a subcommand present, so a bare
+    // `pss --contract-version` answers without reading stdin or opening a DB.
+    if cli.contract_version {
+        println!("{}", contract_version_output());
+        return;
+    }
+
     // Dispatch: query subcommands vs build-db vs pass1-batch vs agent-profile vs hook
     if let Some(ref cmd) = cli.command {
+        // Issue #10 P-2 / P-6: db-path and project-slug are pure path helpers —
+        // they must NOT route through run_query_command (which opens the CozoDB
+        // and errors when it is absent). Intercept here, like Health above,
+        // print the result, and exit 0.
+        if let Commands::DbPath { format, json } = cmd {
+            let want_json = *json || !matches!(format, OutputFormat::Table);
+            println!("{}", db_path_output(cli.index.as_deref(), want_json));
+            return;
+        }
+        if let Commands::ProjectSlug { abs_path, format, json } = cmd {
+            let want_json = *json || !matches!(format, OutputFormat::Table);
+            println!("{}", project_slug_output(abs_path, want_json));
+            return;
+        }
         // Health has special exit-code semantics (0=populated, 1=empty/corrupt,
         // 2=missing) and must not route through the generic error-to-exit-1
         // path below. Intercept before `run_query_command`.
@@ -22000,5 +22290,131 @@ mediapipe>=0.10
         for entry in REQUIRED {
             assert!(!entry.is_empty());
         }
+    }
+
+    // ========================================================================
+    // Issue #10 wave 1 — P-2 (db-path), P-6 (project-slug), P-9 (--contract-version)
+    // ========================================================================
+
+    /// P-2: `resolve_db_path_canonical` honors an explicit `--index` that already
+    /// points at a `.db` file (returns it verbatim, no existence gate — a
+    /// `db-path` consumer wants the path it WOULD use, even before the file
+    /// exists).
+    #[test]
+    fn resolve_db_path_canonical_uses_explicit_db_file() {
+        let p = resolve_db_path_canonical(Some("/some/where/custom.db"));
+        assert_eq!(p, PathBuf::from("/some/where/custom.db"));
+    }
+
+    /// P-2: an explicit `--index` pointing at a JSON file derives the sibling DB
+    /// in the same directory using DB_FILE.
+    #[test]
+    fn resolve_db_path_canonical_derives_sibling_db_from_json() {
+        let p = resolve_db_path_canonical(Some("/tmp/pss/skill-index.json"));
+        assert_eq!(p, PathBuf::from("/tmp/pss").join(DB_FILE));
+    }
+
+    /// P-2: with no `--index` and no PSS_INDEX_PATH, the default is
+    /// `~/.claude/cache/pss-skill-index.db`.
+    #[test]
+    fn resolve_db_path_canonical_default_is_home_cache_db() {
+        // Guard: only assert when a home dir is resolvable (always true in CI).
+        if let Some(home) = dirs::home_dir() {
+            // Ensure no env override interferes with the default branch.
+            // (cargo test runs single-threaded per test process for env safety
+            //  is NOT guaranteed; we therefore only assert the suffix shape,
+            //  which is independent of any PSS_INDEX_PATH value.)
+            let expected = home.join(".claude").join(CACHE_DIR).join(DB_FILE);
+            // When PSS_INDEX_PATH is unset, the function returns `expected`.
+            if std::env::var_os("PSS_INDEX_PATH").is_none() {
+                let p = resolve_db_path_canonical(None);
+                assert_eq!(p, expected);
+            }
+        }
+    }
+
+    /// P-2: the bare (non-JSON) output is exactly the resolved path on one line.
+    #[test]
+    fn db_path_output_bare_is_the_path() {
+        let out = db_path_output(Some("/x/y/custom.db"), false);
+        assert_eq!(out, "/x/y/custom.db");
+    }
+
+    /// P-2: the JSON output is `{"db_path":"<abs>"}`.
+    #[test]
+    fn db_path_output_json_envelope() {
+        let out = db_path_output(Some("/x/y/custom.db"), true);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["db_path"], serde_json::json!("/x/y/custom.db"));
+        // Exactly one key.
+        assert_eq!(v.as_object().unwrap().len(), 1);
+    }
+
+    /// P-6 (the load-bearing parity test): the Rust `project_slug` must equal
+    /// Python's `scripts/pss_discover.py::_slugify_project_path` byte-for-byte.
+    ///
+    /// Python hashes `str(Path(arg).resolve())` (filesystem-canonicalized:
+    /// `/tmp` → `/private/tmp`, `/var` → `/private/var` on macOS) and prefixes
+    /// `Path(arg).name`. We assert against EXISTING paths so both Python's
+    /// `resolve()` and Rust's `canonicalize()` produce the identical canonical
+    /// string, making the expected slug deterministic. The expected values
+    /// below were computed once by running the real Python function:
+    ///
+    ///   /tmp  → tmp-11fe14a5   (sha256("/private/tmp")[:8])
+    ///   /var  → var-6c43d0c2   (sha256("/private/var")[:8])
+    #[test]
+    fn project_slug_matches_python_for_existing_paths() {
+        // These paths exist on every macOS/Linux box and (on macOS) canonicalize
+        // through the /private symlink — exercising the symlink-resolution parity.
+        assert_eq!(project_slug(Path::new("/tmp")), "tmp-11fe14a5");
+        assert_eq!(project_slug(Path::new("/var")), "var-6c43d0c2");
+    }
+
+    /// P-6: trailing slash is irrelevant (matches Python `Path("/tmp/").name == "tmp"`
+    /// and `resolve()` collapsing the slash).
+    #[test]
+    fn project_slug_ignores_trailing_slash() {
+        assert_eq!(project_slug(Path::new("/tmp/")), project_slug(Path::new("/tmp")));
+    }
+
+    /// P-6: the slug shape is always `<basename>-<8 lowercase hex>`.
+    #[test]
+    fn project_slug_shape_is_basename_dash_8hex() {
+        let s = project_slug(Path::new("/tmp"));
+        let (base, hash) = s.rsplit_once('-').expect("a dash separates basename and hash");
+        assert_eq!(base, "tmp");
+        assert_eq!(hash.len(), 8, "hash segment must be 8 chars");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "hash must be lowercase hex, got {hash:?}");
+    }
+
+    /// P-6: bare output is the slug; JSON output is `{"abs_path":..,"slug":..}`.
+    #[test]
+    fn project_slug_output_bare_and_json() {
+        let bare = project_slug_output("/tmp", false);
+        assert_eq!(bare, "tmp-11fe14a5");
+
+        let js = project_slug_output("/tmp", true);
+        let v: serde_json::Value = serde_json::from_str(&js).expect("valid JSON");
+        assert_eq!(v["abs_path"], serde_json::json!("/tmp"));
+        assert_eq!(v["slug"], serde_json::json!("tmp-11fe14a5"));
+        assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    /// P-9: `--contract-version` prints a stable 3-field contract object.
+    #[test]
+    fn contract_version_output_has_three_fields() {
+        let out = contract_version_output();
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["cli_version"], serde_json::json!(env!("CARGO_PKG_VERSION")));
+        assert_eq!(v["schema_version"], serde_json::json!(temporal::TEMPORAL_SCHEMA_VERSION));
+        assert_eq!(v["contract_version"], serde_json::json!(CONTRACT_VERSION));
+        assert_eq!(v.as_object().unwrap().len(), 3);
+    }
+
+    /// P-9: the contract handle constant is the stable string "1".
+    #[test]
+    fn contract_version_constant_is_one() {
+        assert_eq!(CONTRACT_VERSION, "1");
     }
 }

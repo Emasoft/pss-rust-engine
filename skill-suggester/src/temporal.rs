@@ -928,43 +928,86 @@ pub mod cli {
         println!("[]");
     }
 
-    /// `pss as-of <DATE> [filters]`
+    /// P-4 (issue #10 wave 2): build a map from `(element_id, scope)` to the
+    /// element's FIRST-SEEN install instant and whether that install is
+    /// synthetic.
     ///
-    /// DBE-2 + COR-1 (audit 20260514): single-query rewrite. The old
-    /// implementation walked every element_id in `elements_state`, then
-    /// issued a separate Cozo query per element to fetch the latest
-    /// at-or-before event — 1 + 9131 round-trips, ~2.2 min on the live DB.
-    /// The COR-1 bug was a `take(limit)` applied to the element_id slice
-    /// BEFORE the --type / --scope filters, so `--type skill --limit 100`
-    /// could return 0 rows (the first 100 element_ids weren't skills).
+    /// - `first_seen` = the EARLIEST `installed` event's `observed_at` for that
+    ///   element_id in that scope. (Earliest, not latest — it is the install
+    ///   *instant*, independent of any later content_changed events.)
+    /// - synthetic = true iff that earliest install's `diff_json` carries
+    ///   `"migrated": true` — the migration-stamped placeholder created by the
+    ///   v1→v2 migration (`insert_install_event` sets that flag), as opposed to
+    ///   a real observed install.
     ///
-    /// New strategy: one sorted Datalog query fetches every event
-    /// at-or-before cutoff (with `--type` / `--scope` / `--scope-path`
-    /// pushed into the WHERE clause), sorted by (element_id desc,
-    /// observed_at desc). Rust then dedupes by element_id (first
-    /// occurrence per id = latest observed_at — Cozo's numeric `max()`
-    /// can't aggregate the RFC3339 strings, hence the sort+dedup pattern),
-    /// excludes events whose latest type is `removed`, and applies the
-    /// `:limit` LAST. With DBE-1 indexes also landing, the sort is
-    /// effectively over a presorted observed_at column, dropping latency
-    /// from ~2 min to <50 ms on today's DB.
-    pub fn cmd_as_of(
+    /// We sort ascending by observed_at and keep the FIRST row per
+    /// `(element_id, scope)` because Cozo's numeric `min()` cannot aggregate
+    /// RFC3339 strings (the same constraint that forces cmd_as_of's sort+dedup).
+    /// Keying on `(element_id, scope)` matches the as-of row identity — the
+    /// hot-path never mixes the same element across scopes.
+    fn build_first_seen_map(
         db: &DbInstance,
-        date: &str,
+    ) -> std::collections::HashMap<(String, String), (String, bool)> {
+        use std::collections::HashMap;
+        let mut map: HashMap<(String, String), (String, bool)> = HashMap::new();
+        // Only `installed` events define a first-seen instant.
+        let q = r#"
+            ?[element_id, scope, observed_at, diff_json] :=
+                *events{element_id, scope, observed_at, diff_json, event_type},
+                event_type = "installed"
+            :order element_id, scope, observed_at
+        "#;
+        let result = match db.run_script(q, BTreeMap::new(), ScriptMutability::Immutable) {
+            Ok(r) => r,
+            // If this auxiliary query fails, callers degrade to rows without
+            // first_seen rather than failing the whole snapshot.
+            Err(_) => return map,
+        };
+        for r in result.rows.iter() {
+            let eid = match &r[0] {
+                DataValue::Str(s) => s.to_string(),
+                _ => continue,
+            };
+            let scope = match &r[1] {
+                DataValue::Str(s) => s.to_string(),
+                _ => String::new(),
+            };
+            let key = (eid, scope);
+            // Ascending order ⇒ the FIRST entry per key is the earliest install.
+            if map.contains_key(&key) {
+                continue;
+            }
+            let observed_at = match &r[2] {
+                DataValue::Str(s) => s.to_string(),
+                _ => continue,
+            };
+            // synthetic iff diff_json parses to an object with "migrated": true.
+            let is_synthetic = match &r[3] {
+                DataValue::Str(s) => serde_json::from_str::<JsonValue>(s)
+                    .ok()
+                    .and_then(|v| v.get("migrated").and_then(|m| m.as_bool()))
+                    .unwrap_or(false),
+                _ => false,
+            };
+            map.insert(key, (observed_at, is_synthetic));
+        }
+        map
+    }
+
+    /// Core of `as-of`: returns the JSON rows (the same 12 legacy fields PLUS
+    /// the P-4 `first_seen` / `first_seen_is_synthetic` fields) for the snapshot
+    /// at `cutoff` (an already-resolved RFC3339 timestamp). Shared by both
+    /// `cmd_as_of` (which prints them) and `cmd_active_in` (which filters them
+    /// to a project-folder union). Pure — no stdout — so it is unit-testable.
+    pub(crate) fn as_of_rows(
+        db: &DbInstance,
+        cutoff: &str,
         type_filter: Option<&str>,
         scope_filter: Option<&str>,
         scope_path_filter: Option<&str>,
         limit: usize,
-    ) {
+    ) -> Vec<JsonValue> {
         use std::collections::HashSet;
-
-        let cutoff = match resolve_date(date) {
-            Ok(s) => s,
-            Err(e) => {
-                print_date_err("date", date, &e);
-                return;
-            }
-        };
 
         // Parametrized filters — never f-string interpolated. Type filter
         // is whitelisted by validate_type_filter() in main.rs; scope and
@@ -1005,14 +1048,16 @@ pub mod cli {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("as-of query failed: {}", e);
-                println!("[]");
-                return;
+                return Vec::new();
             }
         };
 
+        // P-4: precompute first-seen per (element_id, scope) once, then attach.
+        let first_seen = build_first_seen_map(db);
+
         // Dedupe by element_id (first occurrence per id = latest by
         // observed_at). Skip rows where the latest event is `removed`
-        // (element wasn't present at cutoff). Apply :limit AFTER filtering
+        // (element wasn't present at cutoff). Apply limit AFTER filtering
         // — this is the COR-1 fix.
         let mut seen: HashSet<String> = HashSet::new();
         let mut out: Vec<JsonValue> = Vec::new();
@@ -1031,6 +1076,18 @@ pub mod cli {
             if event_type == "removed" {
                 continue; // latest event is a removal — not present at cutoff
             }
+            let scope = match &r[5] {
+                DataValue::Str(s) => s.to_string(),
+                _ => String::new(),
+            };
+            // P-4: look up first-seen for this (element_id, scope). When the
+            // element has no `installed` event recorded (should not happen for
+            // a present element, but stay robust), emit nulls.
+            let (first_seen_val, synthetic_val): (JsonValue, JsonValue) =
+                match first_seen.get(&(eid.clone(), scope)) {
+                    Some((ts, synth)) => (JsonValue::String(ts.clone()), JsonValue::Bool(*synth)),
+                    None => (JsonValue::Null, JsonValue::Null),
+                };
             out.push(json!({
                 "element_id": eid,
                 "event_type": event_type,
@@ -1043,12 +1100,128 @@ pub mod cli {
                 "file_size": data_to_json(&r[9]),
                 "token_count": data_to_json(&r[10]),
                 "enabled": data_to_json(&r[11]),
+                // P-4 (issue #10 wave 2) — ADDITIVE fields:
+                "first_seen": first_seen_val,
+                "first_seen_is_synthetic": synthetic_val,
             }));
             if out.len() >= limit {
                 break;
             }
         }
+        out
+    }
 
+    /// Core of `active-in`: returns the as-of snapshot rows at `cutoff`
+    /// filtered to the components ACTIVE in the project folder whose slug is
+    /// `slug`. Active = the UNION of:
+    ///   (a) project/local-scope rows whose `scope_path` equals `slug`,
+    ///   (b) all `user`-scope rows (global elements),
+    ///   (c) plugin/marketplace rows currently `enabled`.
+    /// Rows keep the same shape as `as_of_rows` (incl. the P-4 fields). Pure —
+    /// no stdout — so it is unit-testable.
+    ///
+    /// HONESTY: per-project plugin enablement at a PAST instant is not yet
+    /// recorded (issue #10 P-8 is going-forward), so (c) reflects the
+    /// CURRENT/global `enabled` signal — see the `active-in` help text.
+    pub(crate) fn active_in_rows(
+        db: &DbInstance,
+        slug: &str,
+        cutoff: &str,
+        limit: usize,
+    ) -> Vec<JsonValue> {
+        // Snapshot ALL elements at cutoff (no per-type/scope filter — we apply
+        // the union predicate in Rust). Use a high cap so the snapshot itself
+        // is never the limiting factor; the caller's `limit` is applied AFTER
+        // the union filter so it bounds the RESULT, not the pre-filter set.
+        let snapshot = as_of_rows(db, cutoff, None, None, None, usize::MAX);
+        let mut out: Vec<JsonValue> = Vec::new();
+        for row in snapshot.into_iter() {
+            let scope = row.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let scope_path = row.get("scope_path").and_then(|v| v.as_str()).unwrap_or("");
+            let enabled = row.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            let in_union = match scope {
+                // (a) this project's project/local-scope elements.
+                "project" | "local" => scope_path == slug,
+                // (b) all global user-scope elements.
+                "user" => true,
+                // (c) plugin/marketplace elements currently enabled.
+                "plugin" | "marketplace" => enabled,
+                _ => false,
+            };
+            if in_union {
+                out.push(row);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// `pss as-of <DATE> [filters]`
+    ///
+    /// DBE-2 + COR-1 (audit 20260514): single-query rewrite. The old
+    /// implementation walked every element_id in `elements_state`, then
+    /// issued a separate Cozo query per element to fetch the latest
+    /// at-or-before event — 1 + 9131 round-trips, ~2.2 min on the live DB.
+    /// The COR-1 bug was a `take(limit)` applied to the element_id slice
+    /// BEFORE the --type / --scope filters, so `--type skill --limit 100`
+    /// could return 0 rows (the first 100 element_ids weren't skills).
+    ///
+    /// New strategy: one sorted Datalog query fetches every event
+    /// at-or-before cutoff (with `--type` / `--scope` / `--scope-path`
+    /// pushed into the WHERE clause), sorted by (element_id desc,
+    /// observed_at desc). Rust then dedupes by element_id (first
+    /// occurrence per id = latest observed_at — Cozo's numeric `max()`
+    /// can't aggregate the RFC3339 strings, hence the sort+dedup pattern),
+    /// excludes events whose latest type is `removed`, and applies the
+    /// `:limit` LAST. With DBE-1 indexes also landing, the sort is
+    /// effectively over a presorted observed_at column, dropping latency
+    /// from ~2 min to <50 ms on today's DB.
+    pub fn cmd_as_of(
+        db: &DbInstance,
+        date: &str,
+        type_filter: Option<&str>,
+        scope_filter: Option<&str>,
+        scope_path_filter: Option<&str>,
+        limit: usize,
+    ) {
+        let cutoff = match resolve_date(date) {
+            Ok(s) => s,
+            Err(e) => {
+                print_date_err("date", date, &e);
+                return;
+            }
+        };
+
+        // DBE-2 / COR-1 row logic now lives in the shared `as_of_rows` helper
+        // (also consumed by `cmd_active_in`); it appends the P-4 first_seen /
+        // first_seen_is_synthetic fields to each of the 12 legacy fields.
+        let out = as_of_rows(db, &cutoff, type_filter, scope_filter, scope_path_filter, limit);
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&JsonValue::Array(out)).unwrap_or_default()
+        );
+    }
+
+    /// `pss active-in <ABS_PATH_SLUG> [--as-of <DATE>]`
+    ///
+    /// Print every component ACTIVE in the project folder whose slug is
+    /// `slug` at the given date (default: now). "Active" is the union defined
+    /// by `active_in_rows`. The caller (main.rs dispatch) computes `slug` from
+    /// the absolute path with the SAME algorithm `pss project-slug` uses, so
+    /// the slug is the project-scope identity used inside `scope_path`.
+    pub fn cmd_active_in(db: &DbInstance, slug: &str, date: &str, limit: usize) {
+        let cutoff = match resolve_date(date) {
+            Ok(s) => s,
+            Err(e) => {
+                print_date_err("as-of", date, &e);
+                return;
+            }
+        };
+        let out = active_in_rows(db, slug, &cutoff, limit);
         println!(
             "{}",
             serde_json::to_string_pretty(&JsonValue::Array(out)).unwrap_or_default()
@@ -5392,5 +5565,250 @@ mod tests {
             cli::scope_path_from_discovery_source("project:projA/plugin:foo"),
             cli::scope_path_from_discovery_source("project:projB/plugin:foo")
         );
+    }
+
+    // ====================================================================
+    // Issue #10 Wave 2 — P-4 (first_seen + synthetic), P-7 (unlimited),
+    // P-1 (active-in union). All exercise the REAL production helpers
+    // `cli::as_of_rows` and `cli::active_in_rows`.
+    // ====================================================================
+
+    /// Helper to read a string field off a serde_json row object.
+    fn row_str<'a>(row: &'a serde_json::Value, key: &str) -> &'a str {
+        row.get(key).and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    /// Build a DB whose events exercise P-4: `sk-real` has a genuine
+    /// install (diff_json without `migrated`), `sk-synth` has only a
+    /// migration-stamped placeholder install (diff_json `{"migrated":true}`).
+    /// `sk-real` also gets a LATER content_changed event so we can prove
+    /// `first_seen` is the EARLIEST install instant, not the latest event.
+    fn build_test_db_for_first_seen() -> DbInstance {
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+        // diff_json carries inner quotes, so pass the three values as
+        // parameters rather than embedding JSON-escaped strings in the Cozo
+        // source (mirrors how insert_install_event binds $diff_json).
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("d_real".into(),
+            DataValue::Str(r#"{"description":"real"}"#.into()));
+        params.insert("d_edit".into(),
+            DataValue::Str(r#"{"description":"edited"}"#.into()));
+        params.insert("d_synth".into(),
+            DataValue::Str(r#"{"description":"migrated","migrated":true}"#.into()));
+        let seed = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["r0", "2026-01-05T00:00:00Z", "s1", "installed", "skill",
+                 "sk-real", "skill:sk-real@user:_home", "user", "/home", "user",
+                 "/home/sk-real.md", "h1", 100, 50, true, "active",
+                 $d_real, ""],
+                ["r1", "2026-03-01T00:00:00Z", "s2", "content_changed", "skill",
+                 "sk-real", "skill:sk-real@user:_home", "user", "/home", "user",
+                 "/home/sk-real.md", "h1b", 110, 55, true, "active",
+                 $d_edit, ""],
+                ["y0", "2026-02-10T00:00:00Z", "s1", "installed", "skill",
+                 "sk-synth", "skill:sk-synth@user:_home", "user", "/home", "user",
+                 "/home/sk-synth.md", "h2", 200, 80, true, "active",
+                 $d_synth, ""]
+              ]
+            :put events { event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }
+        "#;
+        db.run_script(seed, params, ScriptMutability::Mutable)
+            .expect("seed first-seen events");
+        db
+    }
+
+    #[test]
+    fn as_of_rows_populates_first_seen_and_synthetic_flag() {
+        // P-4: every as-of row must carry `first_seen` (the earliest
+        // `installed` observed_at for that element_id in the same scope)
+        // and `first_seen_is_synthetic` (true iff that earliest install's
+        // diff_json carried `"migrated":true`).
+        let db = build_test_db_for_first_seen();
+        let rows = cli::as_of_rows(&db, "2026-12-01T00:00:00Z", None, None, None, 1_000_000);
+        assert_eq!(rows.len(), 2, "expected 2 elements, got {}", rows.len());
+
+        let real = rows.iter()
+            .find(|r| row_str(r, "element_id") == "skill:sk-real@user:_home")
+            .expect("sk-real row present");
+        // first_seen is the EARLIEST install (2026-01-05), NOT the later
+        // content_changed event (2026-03-01) — proving it tracks install,
+        // not last-modified.
+        assert_eq!(row_str(real, "first_seen"), "2026-01-05T00:00:00Z");
+        assert_eq!(real.get("first_seen_is_synthetic").and_then(|v| v.as_bool()),
+                   Some(false), "real install must NOT be synthetic");
+
+        let synth = rows.iter()
+            .find(|r| row_str(r, "element_id") == "skill:sk-synth@user:_home")
+            .expect("sk-synth row present");
+        assert_eq!(row_str(synth, "first_seen"), "2026-02-10T00:00:00Z");
+        assert_eq!(synth.get("first_seen_is_synthetic").and_then(|v| v.as_bool()),
+                   Some(true), "migration placeholder must be synthetic");
+    }
+
+    #[test]
+    fn as_of_rows_keeps_all_twelve_legacy_fields() {
+        // P-4 is ADDITIVE: the 12 pre-existing fields must remain unchanged.
+        let db = build_test_db_for_first_seen();
+        let rows = cli::as_of_rows(&db, "2026-12-01T00:00:00Z", None, None, None, 1_000_000);
+        let r = &rows[0];
+        for k in ["element_id", "event_type", "element_type", "element_name",
+                  "scope", "scope_path", "path", "content_hash", "file_size",
+                  "token_count", "enabled"] {
+            assert!(r.get(k).is_some(), "legacy field '{}' must still be present", k);
+        }
+        // And the two NEW fields exist on top of the 12.
+        assert!(r.get("first_seen").is_some());
+        assert!(r.get("first_seen_is_synthetic").is_some());
+    }
+
+    /// Build a DB modelling a sample project folder so `active-in` can be
+    /// tested. Union members:
+    ///   (a) project/local-scope rows whose scope_path == the folder slug,
+    ///   (b) all user-scope rows,
+    ///   (c) enabled plugin/marketplace rows.
+    /// Plus NON-members that must be excluded: a DIFFERENT project's slug,
+    /// and a DISABLED plugin.
+    fn build_test_db_for_active_in(slug: &str) -> DbInstance {
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+        // Row template: each gets its OWN install event.
+        let seed = format!(
+            r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["a", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "proj-skill", "skill:proj-skill@project:{slug}", "project", "{slug}", "project:{slug}",
+                 "/p/proj-skill.md", "h1", 100, 50, true, "active", "{{}}", ""],
+                ["b", "2026-01-01T00:00:00Z", "s1", "installed", "rule",
+                 "loc-rule", "rule:loc-rule@local:{slug}", "local", "{slug}", "local:{slug}",
+                 "/p/.claude/rules/loc-rule.md", "h2", 60, 30, true, "active", "{{}}", ""],
+                ["c", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "user-skill", "skill:user-skill@user:_home", "user", "/home", "user",
+                 "/home/user-skill.md", "h3", 100, 50, true, "active", "{{}}", ""],
+                ["d", "2026-01-01T00:00:00Z", "s1", "installed", "plugin",
+                 "enabled-plug", "plugin:enabled-plug@user:_home", "plugin", "mkt", "plugin:enabled-plug",
+                 "/plugins/enabled-plug", "h4", 300, 120, true, "active", "{{}}", ""],
+                ["e", "2026-01-01T00:00:00Z", "s1", "installed", "plugin",
+                 "disabled-plug", "plugin:disabled-plug@user:_home", "plugin", "mkt", "plugin:disabled-plug",
+                 "/plugins/disabled-plug", "h5", 300, 120, false, "disabled", "{{}}", ""],
+                ["f", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "other-proj-skill", "skill:other-proj-skill@project:OTHER-deadbeef", "project", "OTHER-deadbeef", "project:OTHER-deadbeef",
+                 "/o/other-proj-skill.md", "h6", 100, 50, true, "active", "{{}}", ""]
+              ]
+            :put events {{ event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }}
+        "#,
+            slug = slug
+        );
+        db.run_script(&seed, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed active-in events");
+        db
+    }
+
+    #[test]
+    fn active_in_rows_returns_correct_union() {
+        // P-1: active-in returns the UNION of (a) project/local rows whose
+        // scope_path == the folder slug, (b) all user-scope rows, (c) enabled
+        // plugin/marketplace rows. A different project's rows and a disabled
+        // plugin must be EXCLUDED.
+        let slug = "demo-abcd1234";
+        let db = build_test_db_for_active_in(slug);
+        let rows = cli::active_in_rows(&db, slug, "2026-12-01T00:00:00Z", 1_000_000);
+        let ids: std::collections::HashSet<String> = rows.iter()
+            .map(|r| row_str(r, "element_id").to_string())
+            .collect();
+
+        // (a) this project's project + local scope rows.
+        assert!(ids.contains("skill:proj-skill@project:demo-abcd1234"), "project-scope match missing");
+        assert!(ids.contains("rule:loc-rule@local:demo-abcd1234"), "local-scope match missing");
+        // (b) global user-scope row.
+        assert!(ids.contains("skill:user-skill@user:_home"), "user-scope row missing");
+        // (c) enabled plugin row.
+        assert!(ids.contains("plugin:enabled-plug@user:_home"), "enabled plugin missing");
+        // Excluded: disabled plugin + a different project's row.
+        assert!(!ids.contains("plugin:disabled-plug@user:_home"), "disabled plugin must be excluded");
+        assert!(!ids.contains("skill:other-proj-skill@project:OTHER-deadbeef"),
+                "a different project's row must be excluded");
+        assert_eq!(rows.len(), 4, "exactly 4 union members expected, got {}", rows.len());
+    }
+
+    #[test]
+    fn active_in_rows_carries_first_seen_fields() {
+        // P-1 rows must have the same shape as as-of rows, including P-4.
+        let slug = "demo-abcd1234";
+        let db = build_test_db_for_active_in(slug);
+        let rows = cli::active_in_rows(&db, slug, "2026-12-01T00:00:00Z", 1_000_000);
+        let r = &rows[0];
+        assert!(r.get("first_seen").is_some(), "active-in row needs first_seen");
+        assert!(r.get("first_seen_is_synthetic").is_some(),
+                "active-in row needs first_seen_is_synthetic");
+    }
+
+    #[test]
+    fn as_of_unlimited_default_returns_more_than_old_cap() {
+        // P-7: with the unlimited sentinel default (1_000_000) a snapshot of
+        // ALL active components must not be truncated at the old 1000 cap.
+        // Seed 1001 distinct user-scope skills and prove all 1001 come back.
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+        // Build a single batched insert of 1001 installed events.
+        let mut tuples = String::new();
+        for i in 0..1001 {
+            if i > 0 {
+                tuples.push(',');
+            }
+            tuples.push_str(&format!(
+                r#"["e{i}", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                   "sk{i}", "skill:sk{i}@user:_home", "user", "/home", "user",
+                   "/home/sk{i}.md", "h{i}", 1, 1, true, "active", "{{}}", ""]"#,
+                i = i
+            ));
+        }
+        let seed = format!(
+            r#"?[event_id, observed_at, scan_id, event_type, element_type,
+               element_name, element_id, scope, scope_path, source, path,
+               content_hash, file_size, token_count, enabled, override_status,
+               diff_json, snapshot_ref] <- [{tuples}]
+            :put events {{ event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }}"#,
+            tuples = tuples
+        );
+        db.run_script(&seed, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed 1001 events");
+        // The unlimited sentinel the CLI passes by default.
+        let rows = cli::as_of_rows(&db, "2026-12-01T00:00:00Z", None, None, None, 1_000_000);
+        assert_eq!(rows.len(), 1001,
+                   "unlimited default must return all 1001 rows, got {}", rows.len());
     }
 }
