@@ -324,7 +324,9 @@ const TEMPORAL_DDL: &[&str] = &[
         ref_count: Int default 0,
     }"#,
     // Materialized current state per element. Updated transactionally
-    // with each batch of events. Suggestion hot path reads this table.
+    // with each batch of events. NOTE: the suggestion hot path (find_matches)
+    // reads the legacy `skills` table, NOT this one — this table backs the
+    // temporal-index query verbs (as-of, show, timeline, etc.), not scoring.
     r#":create elements_state {
         element_id: String =>
         last_event_id: String,
@@ -434,7 +436,19 @@ pub fn migrate_v1_to_v2(db: &DbInstance) -> Result<MigrationStats, String> {
             let path = data_str(&row[2]);
             let skill_type = data_str(&row[3]);
             let description = data_str(&row[4]);
-            let first_indexed_at = data_str(&row[5]);
+            // DI-3 (code-review pass, 20260713): legacy `skills` rows can
+            // carry an empty `first_indexed_at` (PSS-file entries default
+            // it to String::new() until the next reindex populates it —
+            // see main.rs's PSS-file entry construction). Writing "" as
+            // the install event's observed_at would corrupt every
+            // downstream RFC3339 sort/compare (as-of, timeline, retention
+            // cutoffs) with a malformed timestamp, so fall back to `now`.
+            let first_indexed_at_raw = data_str(&row[5]);
+            let first_indexed_at = if first_indexed_at_raw.trim().is_empty() {
+                now.clone()
+            } else {
+                first_indexed_at_raw
+            };
 
             let element_type = match skill_type.as_str() {
                 "skill" => ElementType::Skill,
@@ -3293,58 +3307,73 @@ pub mod cli {
 
     /// Read element_ids that are currently `exists=true` in the given
     /// set of scope_paths. Used by removal detection.
+    ///
+    /// DI-4 (code-review pass, 20260713): this used to issue ONE query for
+    /// the active element_ids, then a SEPARATE per-element_id query
+    /// against `events` to resolve each one's most-recent scope_path — an
+    /// N+1 round-trip pattern. Rewritten to two queries total: one for the
+    /// active ids, one bulk scan of `events` sorted `element_id, -observed_at`,
+    /// deduped to "first row per element_id" in Rust (Cozo's `max()` can't
+    /// aggregate RFC3339 strings — see the `as_of_rows` comment above for
+    /// why the sort+take-first pattern is used throughout this file instead
+    /// of an aggregate).
     fn read_active_in_scope_paths(
         db: &DbInstance,
         scope_paths: &std::collections::HashSet<String>,
     ) -> Result<std::collections::HashSet<String>, String> {
-        // We can't parameterise an IN clause in Cozo as cleanly as SQL;
-        // walk the table once and filter in Rust. For ≤100k elements
-        // this is fine.
-        let q = r#"
-            ?[element_id, scope_path] :=
-                *elements_state{element_id, scope_path, exists: true}
-        "#;
-        // Note: scope_path lives in the events table, not elements_state.
-        // elements_state has installed_at + last_changed_at + the latest
-        // hash/size, but no scope_path. We resolve scope_path from the
-        // most recent event for each element_id.
-        let _ = q; // silence unused warning if we change strategy below.
-
-        let q = r#"
+        let active_q = r#"
             ?[element_id] := *elements_state{element_id, exists: true}
         "#;
-        let rows = db
-            .run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+        let active_rows = db
+            .run_script(active_q, BTreeMap::new(), ScriptMutability::Immutable)
             .map_err(|e| format!("active query failed: {}", e))?
             .rows;
-        let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for row in rows {
+        let active_ids: std::collections::HashSet<String> = active_rows
+            .into_iter()
+            .filter_map(|row| match row.into_iter().next() {
+                Some(DataValue::Str(s)) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect();
+        if active_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+
+        // scope_path lives in the events table, not elements_state —
+        // resolve it from the most recent event for each element_id via
+        // one bulk scan instead of one query per active id.
+        let events_q = r#"
+            ?[element_id, scope_path, observed_at] :=
+                *events{element_id, scope_path, observed_at}
+            :order element_id, -observed_at
+        "#;
+        let event_rows = db
+            .run_script(events_q, BTreeMap::new(), ScriptMutability::Immutable)
+            .map_err(|e| format!("events scan failed: {}", e))?
+            .rows;
+        // Rows are sorted (element_id asc, observed_at desc), so the FIRST
+        // row seen per element_id is the most recent event for it.
+        let mut latest_scope: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for row in event_rows {
             let eid = match row.first() {
                 Some(DataValue::Str(s)) => s.to_string(),
                 _ => continue,
             };
-            // Resolve scope_path from the most recent event for this eid.
-            // Use :order -observed_at :limit 1 instead of max() so we
-            // handle the empty-result case (no events for this eid) without
-            // raising "Evaluation of expression failed".
-            let mut p: BTreeMap<String, DataValue> = BTreeMap::new();
-            p.insert("eid".into(), DataValue::Str(eid.clone().into()));
-            // Cozo requires sort keys to appear in the output projection.
-            // observed_at is in the head solely for :order — row[1] is
-            // ignored downstream.
-            let scope_q = r#"
-                ?[scope_path, observed_at] :=
-                    *events{element_id: $eid, scope_path, observed_at}
-                :order -observed_at
-                :limit 1
-            "#;
-            if let Ok(r) = db.run_script(scope_q, p, ScriptMutability::Immutable) {
-                if let Some(row) = r.rows.first() {
-                    let sp = data_str(&row[0]);
-                    if scope_paths.contains(&sp) {
-                        out.insert(eid);
-                    }
-                }
+            if !active_ids.contains(&eid) || latest_scope.contains_key(&eid) {
+                continue;
+            }
+            let sp = match row.get(1) {
+                Some(v) => data_str(v),
+                None => continue,
+            };
+            latest_scope.insert(eid, sp);
+        }
+
+        let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (eid, sp) in latest_scope {
+            if scope_paths.contains(&sp) {
+                out.insert(eid);
             }
         }
         Ok(out)
