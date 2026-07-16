@@ -14681,6 +14681,61 @@ fn open_db(path: &Path) -> Result<DbInstance, SuggesterError> {
         .map_err(|e| SuggesterError::IndexParse(format!("CozoDB open failed: {}", e)))
 }
 
+/// F3 (TRDD-1Z8SGQ7N): build the flock path for a DB coordination file.
+/// The suffix is appended to the FULL db filename — `pss-skill-index.db` +
+/// `.lock` → `pss-skill-index.db.lock` — because that is the exact spelling
+/// both Python sides use (pss_paths.get_db_lock_path for the hook's reader
+/// LOCK_SH; pss_cozodb's WRITE_LOCK_SUFFIX for the skills writer's LOCK_EX).
+/// A lock on any other spelling coordinates with nobody.
+fn db_flock_path(db_path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{}", db_path.display(), suffix))
+}
+
+/// F3 (TRDD-1Z8SGQ7N): take a BLOCKING exclusive flock on `<db><suffix>` and
+/// return the open handle as an RAII guard (the OS lock releases on drop /
+/// process exit). Failure is fatal by design: an unlocked merge-events write
+/// is exactly the reproduced `database is locked` / partial-state corruption
+/// this lock exists to prevent, so "proceed unlocked" would trade a visible
+/// error for silent damage (project fail-fast rule). Blocking (not try_lock)
+/// is intentional too — hook readers hold their LOCK_SH for at most one
+/// bounded binary call and release on process exit, so the wait is short and
+/// self-clearing, whereas bailing out would drop the reindex's stage 4.
+fn acquire_db_flock(db_path: &Path, suffix: &str) -> std::fs::File {
+    let lock_path = db_flock_path(db_path, suffix);
+    use fs2::FileExt;
+    // truncate(false): the lock file exists only to carry an fd for flock —
+    // its CONTENT is never read or written, so we must not clobber whatever a
+    // prior holder left in it (and clippy requires the choice be explicit).
+    let f = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "merge-events failed: cannot open lock file {}: {}",
+                lock_path.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+    // Blocking exclusive flock; released when the returned File drops (RAII)
+    // or the process exits. fs2::lock_exclusive maps to flock(LOCK_EX) on Unix
+    // and LockFileEx on Windows.
+    if let Err(e) = f.lock_exclusive() {
+        eprintln!(
+            "merge-events failed: cannot flock {}: {}",
+            lock_path.display(),
+            e
+        );
+        std::process::exit(1);
+    }
+    f
+}
+
 /// Create the CozoDB schema with all relations needed for skill indexing.
 ///
 /// Kept as a reference implementation alongside
@@ -16011,15 +16066,14 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             temporal::cli::cmd_plugin_history(&db, plugin_name, *limit, fmt);
             Ok(())
         }
-        Commands::MergeEvents { batch_stdin: _, quiet } => {
-            // Always reads stdin in this Phase-2 wiring; batch_stdin is the
-            // only mode for now (kept as a flag so future versions can add
-            // file-based input without breaking the CLI surface).
-            if let Err(e) = temporal::cli::cmd_merge_events(&db, *quiet) {
-                eprintln!("merge-events failed: {}", e);
-                std::process::exit(1);
-            }
-            Ok(())
+        Commands::MergeEvents { .. } => {
+            // Unreachable — F3 (TRDD-1Z8SGQ7N) intercepts MergeEvents in main()
+            // BEFORE run_query_command so it can hold the two flocks across the
+            // write. Mirrors the Health/DbPath/ProjectSlug intercept pattern
+            // above; reaching here means that intercept was removed.
+            Err(SuggesterError::IndexParse(
+                "internal error: MergeEvents reached run_query_command".to_string(),
+            ))
         }
         Commands::Retention { set } => {
             temporal::cli::cmd_retention(&db, set.as_deref());
@@ -18836,6 +18890,62 @@ fn main() {
             };
             let db = db_path.as_ref().and_then(|p| open_db(p).ok());
             cmd_health(db.as_ref(), *verbose); // diverges — never returns
+        }
+
+        // F3 (TRDD-1Z8SGQ7N): merge-events is the ONLY in-place writer of the
+        // live DB (the Python skills writer builds a staging file and
+        // atomically renames it into place). Reproduced 2026-07-16 on the
+        // first real reindex after the DB paths were unified: with no
+        // coordination it raced the suggestion hook's readers on the SQLite
+        // file and died with `database is locked`, leaving `events` advanced
+        // but `elements_state` lagging. Intercepted BEFORE run_query_command
+        // because the locks must be acquired BEFORE the DB file is opened: a
+        // concurrent Python writer os.replace()s a fresh inode over the live
+        // path, so an FD opened first would keep writing the orphaned old
+        // file after the lock cleared — lock held, data still lost.
+        //
+        // Two flocks, fixed order, so the whole model stays deadlock-free:
+        //   1. `<db>.write.lock` (EX) — writer-vs-writer: excludes a
+        //      concurrent Python skills-write (it holds the same file for its
+        //      whole staging+rename, pss_cozodb.atomic_write_cozodb).
+        //   2. `<db>.lock`       (EX) — writer-vs-reader: the hook holds
+        //      LOCK_SH here around each binary call (pss_hook._db_shared_lock
+        //      via pss_paths.get_db_lock_path).
+        // Python writers take only #1, hook readers take only #2, and this
+        // arm takes #1 then #2 — no party ever acquires in the opposite
+        // order. flock(2) matches Python's fcntl.flock on the same files; on
+        // Windows the hook side is a documented no-op, so there the locks
+        // only serialize concurrent merge-events — an improvement, never a
+        // regression. Query subcommands stay lock-free: they are read-only
+        // and the staging+rename design already keeps them safe.
+        if let Commands::MergeEvents { batch_stdin: _, quiet } = cmd {
+            let db_path = match get_db_path(cli.index.as_deref()) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "merge-events failed: no CozoDB index found (run /pss-reindex-skills first)"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let _write_guard = acquire_db_flock(&db_path, ".write.lock");
+            let _reader_guard = acquire_db_flock(&db_path, ".lock");
+            let db = match open_db(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("merge-events failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = temporal::ensure_schema(&db) {
+                eprintln!("merge-events failed: ensure_schema: {}", e);
+                std::process::exit(1);
+            }
+            if let Err(e) = temporal::cli::cmd_merge_events(&db, *quiet) {
+                eprintln!("merge-events failed: {}", e);
+                std::process::exit(1);
+            }
+            return;
         }
 
         // Query subcommands use stderr for errors and exit(1) on failure
