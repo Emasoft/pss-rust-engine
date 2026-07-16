@@ -755,7 +755,10 @@ pub struct PriorState {
 /// - prior present, hash differs → `ContentChanged` (and `SizeChanged`
 ///   if size differs too — emit BOTH so per-event diffs are crisp)
 /// - prior present, same hash, size differs → `SizeChanged` only
-/// - prior present, same hash+size, path differs → `PathChanged`
+/// - prior present, path differs → `PathChanged`, INDEPENDENTLY of any
+///   content/size change (F8, TRDD-1Z8SGQ7N): a move that coincides with an
+///   edit records BOTH the ContentChanged and the relocation, so a
+///   move+edit no longer silently loses the move
 /// - enabled flag flipped → `Enabled` or `Disabled`
 /// - override_status changed → `OverrideStarted` or `OverrideEnded`
 ///
@@ -784,8 +787,15 @@ pub fn compare_and_emit(prior: Option<&PriorState>, current: &Observation) -> Ve
                 }
             } else if size_diff {
                 out.push(EventType::SizeChanged);
-            } else if path_diff {
-                // Same content+size at a new path within the same scope.
+            }
+            // F8 (TRDD-1Z8SGQ7N): PathChanged is emitted on ANY path change,
+            // not only when content+size are unchanged. The old `else if`
+            // dropped the relocation whenever a move coincided with an edit,
+            // so a move+edit recorded only the content change and lost the
+            // fact that the element moved. Emitting it independently keeps the
+            // pure-move case identical (only PathChanged fires) while making a
+            // move+edit record BOTH events.
+            if path_diff {
                 out.push(EventType::PathChanged);
             }
             if enabled_diff {
@@ -2834,7 +2844,6 @@ pub mod cli {
         event_type: EventType,
         obs: &Observation,
         diff_json: &str,
-        update_state: bool,
         // DI-2 (audit 20260514): the writer previously hard-coded
         // `override_status: "active"` for every event, so multi-scope
         // override resolution (resolve_overrides() — defined since v3.4.0
@@ -2887,9 +2896,18 @@ pub mod cli {
         db.run_script(event_q, params, ScriptMutability::Mutable)
             .map_err(|e| format!("event insert failed: {}", e))?;
 
-        if !update_state {
-            return Ok(());
-        }
+        // F2 (TRDD-1Z8SGQ7N): elements_state is materialized for EVERY event,
+        // enabled or disabled. This used to be gated by an `update_state`
+        // bool, and the DI-3 change wired `obs.enabled` into that slot —
+        // conflating "is this element enabled" (already recorded in the
+        // `enabled` column of both the events row above and the state row
+        // below) with "should state be materialized". The effect: a DISABLED
+        // element got its event logged but its `elements_state` row was never
+        // written, so `as-of`/`show` and removal detection (which read
+        // elements_state) silently stopped tracking it. The parameter is
+        // removed rather than pinned to `true` so the footgun cannot return —
+        // no caller ever needed a log-only event, and the `enabled` state is
+        // carried by the column, not by whether the row exists.
         // Upsert elements_state. installed_at: keep prior if any (we read
         // it back — if the event_type is `removed` or the prior row
         // existed we preserve installed_at; if this is a new install, we
@@ -3094,13 +3112,12 @@ pub mod cli {
                         "event": evt.as_str(),
                     })
                     .to_string();
-                    // DI-3 (audit 20260514): pass obs.enabled (not hard-true)
-                    // so the events row reflects the actual enabled state
-                    // observed in this scan. Without this, even after the
-                    // Enabled/Disabled events fire, the events row still
-                    // says enabled=true.
+                    // The events + state rows record obs.enabled in their own
+                    // `enabled` column (see persist_event_and_state); F2
+                    // removed the separate update_state bool this used to
+                    // pass obs.enabled into.
                     persist_event_and_state(
-                        db, &scan_id, &started_at, evt, obs, &diff, obs.enabled,
+                        db, &scan_id, &started_at, evt, obs, &diff,
                         // Per-observation events default to "active" — the
                         // override-resolution pass below this loop emits
                         // separate Override* events with the resolved
@@ -3137,7 +3154,6 @@ pub mod cli {
                             EventType::DescriptionChanged,
                             obs,
                             &diff,
-                            obs.enabled,
                             "active",
                         )?;
                         events_emitted += 1;
@@ -3223,7 +3239,6 @@ pub mod cli {
                     evt,
                     obs,
                     &diff,
-                    obs.enabled,
                     new_status,
                 )?;
                 events_emitted += 1;
@@ -3251,7 +3266,6 @@ pub mod cli {
                     EventType::Removed,
                     &meta,
                     &diff,
-                    true,
                     // Removal events: override_status no longer relevant.
                     "active",
                 )?;
@@ -4379,6 +4393,40 @@ mod tests {
         assert_eq!(compare_and_emit(Some(&p), &o), vec![EventType::Disabled]);
     }
 
+    /// F8 (TRDD-1Z8SGQ7N): a move that coincides with a content edit must
+    /// record BOTH the ContentChanged AND the PathChanged — the old `else if`
+    /// dropped the relocation whenever hash/size also changed.
+    #[test]
+    fn emit_path_change_alongside_content_change_on_move_and_edit() {
+        let o = obs("x", "user", "h2", 100, "/new/p");
+        let mut p = prior_of(&o);
+        p.current_hash = "h1".to_string(); // content changed
+        p.current_path = "/old/p".to_string(); // AND moved
+        assert_eq!(
+            compare_and_emit(Some(&p), &o),
+            vec![EventType::ContentChanged, EventType::PathChanged],
+        );
+    }
+
+    /// F8: a move that coincides with a content+size change records all three
+    /// events, path last.
+    #[test]
+    fn emit_path_change_alongside_content_and_size_change_on_move() {
+        let o = obs("x", "user", "h2", 200, "/new/p");
+        let mut p = prior_of(&o);
+        p.current_hash = "h1".to_string();
+        p.current_size = 100;
+        p.current_path = "/old/p".to_string();
+        assert_eq!(
+            compare_and_emit(Some(&p), &o),
+            vec![
+                EventType::ContentChanged,
+                EventType::SizeChanged,
+                EventType::PathChanged,
+            ],
+        );
+    }
+
     #[test]
     fn detect_removals_flags_missing_elements() {
         use std::collections::HashSet;
@@ -5366,6 +5414,45 @@ mod tests {
                 status
             );
         }
+    }
+
+    /// F2 (TRDD-1Z8SGQ7N): a DISABLED element must still materialize an
+    /// `elements_state` row. Before the fix, `obs.enabled` was wired into the
+    /// removed `update_state` control bool, so a disabled element's event was
+    /// logged but its state row was never written — `as-of`/`show` and
+    /// removal detection (which read elements_state) silently stopped
+    /// tracking it. This drives the real writer end-to-end and asserts the
+    /// state row exists with enabled=false, exists=true.
+    #[test]
+    fn cmd_merge_events_materializes_state_for_disabled_element() {
+        use std::io::Cursor;
+
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+
+        let jsonl = r#"{"_pss_manifest": true, "visited_scope_paths": ["/home"]}
+{"type": "skill", "name": "off-skill", "source": "user", "path": "/home/off.md", "description": "a disabled skill", "enabled": false}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(jsonl), true)
+            .expect("merge-events must succeed");
+
+        let q = r#"?[element_id, enabled, exists] := *elements_state{element_id, enabled, exists}"#;
+        let r = db
+            .run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+            .expect("query elements_state");
+        assert_eq!(
+            r.rows.len(),
+            1,
+            "a disabled element must still get an elements_state row; got {} rows",
+            r.rows.len()
+        );
+        let row = &r.rows[0];
+        assert_eq!(row[1], DataValue::Bool(false), "enabled column must be false");
+        assert_eq!(row[2], DataValue::Bool(true), "exists must be true (installed)");
     }
 
     /// DI-2: when only ONE scope reports the element, the resolver must
