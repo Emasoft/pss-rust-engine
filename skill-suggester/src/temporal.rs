@@ -5635,8 +5635,8 @@ mod tests {
 
     /// A v2 DB with an override PAIR keyed by OLD-scheme ids, where the
     /// override_status values (and one diff_json) EMBED those old ids:
-    ///   A = skill "CoolTool" @user   → old `skill:cooltool@user:`
-    ///   B = skill "CoolTool" @local  → old `skill:cooltool@local:` (wins)
+    ///   A = skill "CoolSkill" @user   → old `skill:coolskill@user:`
+    ///   B = skill "CoolSkill" @local  → old `skill:coolskill@local:` (wins)
     /// plus C = skill "plain" @user, whose id does not change and whose
     /// status/diff carry no ids at all.
     fn v2_db_with_embedded_override_ids() -> DbInstance {
@@ -5653,7 +5653,7 @@ mod tests {
         params.insert(
             "diff_a".into(),
             DataValue::Str(
-                r#"{"new_override_status":"overridden_by:skill:cooltool@local:","previous_override_status":"active"}"#.into(),
+                r#"{"new_override_status":"overridden_by:skill:coolskill@local:","previous_override_status":"active"}"#.into(),
             ),
         );
         params.insert("diff_c".into(), DataValue::Str(r#"{"contact":"a@b.c"}"#.into()));
@@ -5663,13 +5663,13 @@ mod tests {
               content_hash, file_size, token_count, enabled, override_status,
               diff_json, snapshot_ref] <- [
                 ["e1", "2026-01-01T00:00:00Z", "s1", "override_started", "skill",
-                 "CoolTool", "skill:cooltool@user:", "user", "", "user",
-                 "/u/CoolTool.md", "h1", 10, 5, true,
-                 "overridden_by:skill:cooltool@local:", $diff_a, ""],
+                 "CoolSkill", "skill:coolskill@user:", "user", "", "user",
+                 "/u/CoolSkill.md", "h1", 10, 5, true,
+                 "overridden_by:skill:coolskill@local:", $diff_a, ""],
                 ["e2", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
-                 "CoolTool", "skill:cooltool@local:", "local", "", "local",
-                 "/l/CoolTool.md", "h2", 20, 6, true,
-                 "overrides:skill:cooltool@user:;skill:unchanged@user:", "{}", ""],
+                 "CoolSkill", "skill:coolskill@local:", "local", "", "local",
+                 "/l/CoolSkill.md", "h2", 20, 6, true,
+                 "overrides:skill:coolskill@user:;skill:unchanged@user:", "{}", ""],
                 ["e3", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
                  "plain", "skill:plain@user:", "user", "", "user",
                  "/u/plain.md", "h3", 30, 7, true, "active", $diff_c, ""]
@@ -5686,11 +5686,11 @@ mod tests {
             ?[element_id, last_event_id, current_path, current_hash,
               current_size, current_token_count, enabled, override_status,
               installed_at, last_changed_at, exists] <- [
-                ["skill:cooltool@user:", "e1", "/u/CoolTool.md", "h1", 10, 5, true,
-                 "overridden_by:skill:cooltool@local:",
+                ["skill:coolskill@user:", "e1", "/u/CoolSkill.md", "h1", 10, 5, true,
+                 "overridden_by:skill:coolskill@local:",
                  "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
-                ["skill:cooltool@local:", "e2", "/l/CoolTool.md", "h2", 20, 6, true,
-                 "overrides:skill:cooltool@user:;skill:unchanged@user:",
+                ["skill:coolskill@local:", "e2", "/l/CoolSkill.md", "h2", 20, 6, true,
+                 "overrides:skill:coolskill@user:;skill:unchanged@user:",
                  "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
                 ["skill:plain@user:", "e3", "/u/plain.md", "h3", 30, 7, true,
                  "none", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true]
@@ -5746,8 +5746,8 @@ mod tests {
         let db = v2_db_with_embedded_override_ids();
         assert_eq!(migrate_element_id_scheme_v2(&db).expect("re-key"), 2);
 
-        let new_a = "skill:CoolTool@user:";
-        let new_b = "skill:CoolTool@local:";
+        let new_a = "skill:CoolSkill@user:";
+        let new_b = "skill:CoolSkill@local:";
 
         // events: both directions re-pointed; the unchanged id in the
         // semicolon list ("skill:unchanged@user:") passes through verbatim.
@@ -5770,7 +5770,7 @@ mod tests {
         // Invariant: no stale old id survives anywhere in either carrier.
         for eid in ["e1", "e2", "e3"] {
             let (status, diff) = event_status_and_diff(&db, eid);
-            for old in ["skill:cooltool@user:", "skill:cooltool@local:"] {
+            for old in ["skill:coolskill@user:", "skill:coolskill@local:"] {
                 assert!(!status.contains(old), "{eid} status keeps old id: {status}");
                 assert!(!diff.contains(old), "{eid} diff keeps old id: {diff}");
             }
@@ -5799,10 +5799,10 @@ mod tests {
             serde_json::from_str(&diff).expect("rewritten diff_json must still parse");
         assert_eq!(
             parsed["new_override_status"],
-            serde_json::json!("overridden_by:skill:CoolTool@local:")
+            serde_json::json!("overridden_by:skill:CoolSkill@local:")
         );
         assert_eq!(parsed["previous_override_status"], serde_json::json!("active"));
-        assert!(!diff.contains("skill:cooltool@local:"), "old id must be gone: {diff}");
+        assert!(!diff.contains("skill:coolskill@local:"), "old id must be gone: {diff}");
     }
 
     #[test]
