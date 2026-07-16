@@ -935,6 +935,14 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Re-key events/elements_state from the old lossy element_id scheme
+    /// to the lossless one (F4, TRDD-1Z8SGQ7N). Prints `{"changed": N}`.
+    /// Idempotent and gated — also auto-runs inside `merge-events`, so
+    /// this verb is only the manual/validation lever. Aborts without
+    /// writing anything if the old scheme had merged distinct elements.
+    #[command(name = "migrate-element-ids")]
+    MigrateElementIds {},
+
     /// Get or set the retention window (default: 9 months).
     Retention {
         /// Set the retention window. Accepts ISO 8601 duration ("P9M",
@@ -16007,6 +16015,15 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             temporal::cli::cmd_prune_history(&db, *dry_run);
             Ok(())
         }
+        Commands::MigrateElementIds {} => {
+            // Unreachable — F4 (TRDD-1Z8SGQ7N) intercepts MigrateElementIds in
+            // main() BEFORE run_query_command so it can hold the two F3 flocks
+            // across its full-table rewrite (same pattern as MergeEvents).
+            // Reaching here means that intercept was removed.
+            Err(SuggesterError::IndexParse(
+                "internal error: MigrateElementIds reached run_query_command".to_string(),
+            ))
+        }
         Commands::Show { element_id, as_of } => {
             temporal::cli::cmd_show_at(&db, element_id, as_of);
             Ok(())
@@ -18943,6 +18960,44 @@ fn main() {
             }
             if let Err(e) = temporal::cli::cmd_merge_events(&db, *quiet) {
                 eprintln!("merge-events failed: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+
+        // F4 (TRDD-1Z8SGQ7N): migrate-element-ids is a WRITER — it rewrites
+        // every events/elements_state/element_descriptions row — so it takes
+        // the SAME two flocks in the SAME order as MergeEvents above (order
+        // is the deadlock invariant). Without them it would race the
+        // suggestion hook's LOCK_SH readers exactly like F3's reproduction:
+        // cozo-ce hits "database is locked", `.unwrap()`s, and either this
+        // migration or the user's hook process dies with SIGABRT. Its write
+        // window is LONGER than merge-events' (a full-table rewrite), so the
+        // race is more likely, not less. Intercepted BEFORE run_query_command
+        // for the same open-after-lock reason documented on MergeEvents.
+        if let Commands::MigrateElementIds {} = cmd {
+            let db_path = match get_db_path(cli.index.as_deref()) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "migrate-element-ids failed: no CozoDB index found (run /pss-reindex-skills first)"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let _write_guard = acquire_db_flock(&db_path, ".write.lock");
+            let _reader_guard = acquire_db_flock(&db_path, ".lock");
+            let db = match open_db(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("migrate-element-ids failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            // Surface the un-merge abort verbatim — a silently half-migrated
+            // history is worse than a loud failure.
+            if let Err(e) = temporal::cli::cmd_migrate_element_ids(&db) {
+                eprintln!("migrate-element-ids failed: {}", e);
                 std::process::exit(1);
             }
             return;

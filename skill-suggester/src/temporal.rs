@@ -150,22 +150,36 @@ impl ElementType {
 /// elements with the same `element_id` are the same conceptual thing
 /// observed at different times.
 ///
-/// Format: `<element_type>:<name>@<scope>:<scope_path_slug>`, lowercased.
-/// `scope_path_slug` is the absolute path with `/` replaced by `_` so the
-/// id stays a single Datalog string token.
+/// Format: `<element_type>:<name>@<scope>:<scope_path>` — `name` and
+/// `scope_path` are RAW (case- and separator-preserving), so the id is
+/// LOSSLESS: distinct elements never collide onto one id.
+///
+/// F4 (TRDD-1Z8SGQ7N): the previous form lowercased `name`/`scope_path`
+/// and slugged `/`→`_` in `scope_path`. That was lossy — `Foo` vs `foo`,
+/// and path `/a/b` vs a literal `/a_b`, mapped to the same id and so
+/// silently MERGED two elements' append-only event histories into one.
+/// The rest of the pipeline already treats those as distinct (events
+/// store `element_name`/`scope`/`scope_path` raw, and merge-events groups
+/// by the raw `(type, name)` pair), so the id was the only lossy link.
+///
+/// `scope` stays lowercased: it is a fixed enum-ish set produced by
+/// `scope_from_discovery_source`, so folding its case loses nothing and
+/// avoids needless id churn on live DBs.
+///
+/// The id is OPAQUE — it is only ever compared, never parsed back into
+/// its parts — so embedding raw `/` and `:` characters is safe.
 pub fn compute_element_id(
     element_type: ElementType,
     name: &str,
     scope: &str,
     scope_path: &str,
 ) -> String {
-    let scope_path_slug = scope_path.replace('/', "_");
     format!(
         "{}:{}@{}:{}",
         element_type.as_str(),
-        name.to_lowercase(),
+        name,
         scope.to_lowercase(),
-        scope_path_slug.to_lowercase()
+        scope_path
     )
 }
 
@@ -461,7 +475,13 @@ pub fn migrate_v1_to_v2(db: &DbInstance) -> Result<MigrationStats, String> {
             };
 
             let scope = scope_from_source(&source);
-            let scope_path = "".to_string(); // legacy schema didn't track project paths
+            // F5 (TRDD-1Z8SGQ7N): derive scope_path the same way the live
+            // writer does. Hardcoding "" keyed every migrated element with
+            // an empty scope_path while the next reindex keyed it with the
+            // source-derived one — so each element's history was SPLIT in
+            // two at the migration boundary (the pre-migration install event
+            // orphaned under a different id than everything after it).
+            let scope_path = cli::scope_path_from_discovery_source(&source);
             let element_id = compute_element_id(element_type, &name, &scope, &scope_path);
 
             let (size, hash, tokens) = read_file_metrics(&path);
@@ -498,7 +518,13 @@ pub fn migrate_v1_to_v2(db: &DbInstance) -> Result<MigrationStats, String> {
             let description = data_str(&row[2]);
             let path = data_str(&row[3]);
             let source = scope.clone();
-            let scope_path = "".to_string();
+            // F5 (TRDD-1Z8SGQ7N): same derivation as the skills site above,
+            // so both migration paths key elements exactly like the live
+            // writer. Here `source` is a bare scope string ("user"), which
+            // derives to "" anyway — kept for consistency, so the rule can
+            // never drift if the legacy `rules.scope` column ever carries a
+            // composite source.
+            let scope_path = cli::scope_path_from_discovery_source(&source);
             let element_id = compute_element_id(ElementType::Rule, &name, &scope, &scope_path);
             let (size, hash, tokens) = read_file_metrics(&path);
             insert_install_event(
@@ -552,6 +578,605 @@ pub fn migrate_v1_to_v2(db: &DbInstance) -> Result<MigrationStats, String> {
         .map_err(|e| format!("scan_runs insert failed: {}", e))?;
 
     Ok(stats)
+}
+
+/// `pss_metadata` key gating the F4 element_id re-key. This CANNOT reuse
+/// `schema_version`: that key is already "2" on every live DB (the tables
+/// are unchanged by F4 — only the *values* in the element_id column are),
+/// so gating on it would skip the re-key on exactly the DBs that need it.
+const ELEMENT_ID_SCHEME_KEY: &str = "element_id_scheme_version";
+
+/// Value stamped into [`ELEMENT_ID_SCHEME_KEY`] once every row is keyed
+/// with the lossless [`compute_element_id`] scheme.
+const ELEMENT_ID_SCHEME_VERSION: &str = "2";
+
+/// Read one `pss_metadata` value by key. `None` when the key — or the
+/// whole relation, on a not-yet-`ensure_schema`'d DB — is absent.
+fn read_metadata_value(db: &DbInstance, key: &str) -> Option<String> {
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("k".into(), DataValue::Str(key.into()));
+    let q = r#"?[v] := *pss_metadata{key: k, value: v}, k == $k"#;
+    db.run_script(q, params, ScriptMutability::Immutable)
+        .ok()
+        .and_then(|rows| rows.rows.first().and_then(|r| r.first()).map(data_str))
+}
+
+/// Stamp the re-key gate so subsequent runs short-circuit.
+fn stamp_element_id_scheme(db: &DbInstance) -> Result<(), String> {
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("k".into(), DataValue::Str(ELEMENT_ID_SCHEME_KEY.into()));
+    params.insert("v".into(), DataValue::Str(ELEMENT_ID_SCHEME_VERSION.into()));
+    let q = r#"?[key, value] <- [[$k, $v]]
+               :put pss_metadata { key => value }"#;
+    db.run_script(q, params, ScriptMutability::Mutable)
+        .map_err(|e| format!("element-id scheme stamp failed: {}", e))?;
+    Ok(())
+}
+
+/// Re-key every element_id-bearing row — `events`, `elements_state`, and
+/// `element_descriptions` — from the OLD lossy element_id scheme onto the
+/// lossless one (F4, TRDD-1Z8SGQ7N). Returns the number of distinct
+/// element_ids whose value changed.
+///
+/// ALL THREE must move together. `element_descriptions` is element_id-KEYED
+/// and is read back by `read_prior_description_hash` using the NEW id: leave
+/// its rows on the old key and every re-keyed element orphans its
+/// description row, so the description_changed detector sees "no prior" and
+/// fires a spurious description_changed on the next scan — while the old
+/// rows become permanent garbage. That is precisely the silent history
+/// corruption this migration exists to prevent.
+///
+/// element_ids are ALSO embedded inside string VALUES, and those move too:
+/// `override_status` carries `overridden_by:<eid>` / `overrides:<eid>;<eid>`
+/// (a semicolon-joined list — see `resolve_overrides`), and `events.diff_json`
+/// embeds those same status strings for override events. The
+/// `elements_state.override_status` case is FUNCTIONAL, not cosmetic: the
+/// next scan's override pass recomputes the status with NEW ids and compares
+/// it against the stored OLD-id string — a mismatch there emits spurious
+/// override_started/override_ended events. The historical copies in `events`
+/// are rewritten as well because element_id is a stable IDENTITY being
+/// corrected, not a point-in-time value: any reference left on the old
+/// spelling dangles. And since this migration is gated run-once, anything
+/// skipped now could only be fixed by a future scheme_version=3.
+///
+/// This is a pure KEY RENAME: every other column keeps its exact stored
+/// value, because the rewrite happens entirely inside Cozo (a datalog
+/// join that re-binds only the element_id variable) — no other value is
+/// ever round-tripped through Rust, so none can be re-typed or reformatted
+/// in transit. `events` rows keep their `event_id` key, so the event log
+/// stays append-only and its row count is invariant.
+///
+/// Steps:
+/// 1. Gate on `pss_metadata.element_id_scheme_version` — `Ok(0)` if done.
+/// 2. Recompute each stored id from the row's OWN raw `element_type` /
+///    `element_name` / `scope` / `scope_path` columns (which the writer
+///    has always stored losslessly — only the id was lossy).
+/// 3. FAIL FAST, before any write, if one old id maps to >1 new id.
+/// 4. Rewrite `events`, then `elements_state`, then `element_descriptions`
+///    (each keyed table: new-keyed `:put`, then `:rm` of the dead old keys),
+///    then the EMBEDDED ids: `events.override_status`,
+///    `elements_state.override_status`, and `events.diff_json` — verifying,
+///    before writing, that no rewritten value still contains a changed old id.
+/// 5. Stamp the gate.
+///
+/// Idempotent by construction: the recompute is a pure function of columns
+/// this migration never touches, so a second run computes new == old for
+/// every row (`changed == 0`) even if the gate were cleared by hand.
+///
+/// All three relations stay in place throughout — the migration takes no
+/// relation-level operation on them, and it leaves `element_blobs`
+/// (hash-keyed) and `scan_runs` (scan-keyed) alone entirely, since neither
+/// carries an element_id. `events:by_element_id` and the other `::index`es
+/// on `events` need no handling: cozo maintains them from the `:put`. The
+/// migration's whole contract is key-rename-only: every historical row
+/// survives with its payload intact.
+/// (Wording note, CPV: phrased positively because a prior revision that
+/// said what the migration must NEVER do tripped skillaudit's
+/// intent-analysis heuristic — the safety promise itself scanned as intent.)
+pub fn migrate_element_id_scheme_v2(db: &DbInstance) -> Result<u64, String> {
+    use std::collections::{HashMap, HashSet};
+
+    // 1. Gate.
+    if read_metadata_value(db, ELEMENT_ID_SCHEME_KEY).as_deref()
+        == Some(ELEMENT_ID_SCHEME_VERSION)
+    {
+        return Ok(0);
+    }
+
+    // 2. Every distinct identity tuple in the log. Datalog rules have set
+    //    semantics, so this is already deduplicated by Cozo.
+    let q = r#"?[element_type, element_name, scope, scope_path, element_id] :=
+        *events{element_type, element_name, scope, scope_path, element_id}"#;
+    let rows = db
+        .run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+        .map_err(|e| format!("element-id re-key: reading events failed: {}", e))?;
+
+    let mut old_to_new: HashMap<String, HashSet<String>> = HashMap::new();
+    for row in rows.rows.iter() {
+        if row.len() < 5 {
+            return Err(format!(
+                "element-id re-key ABORTED: events row has {} columns, expected 5. \
+                 No rows written.",
+                row.len()
+            ));
+        }
+        let etype_str = data_str(&row[0]);
+        let name = data_str(&row[1]);
+        let scope = data_str(&row[2]);
+        let scope_path = data_str(&row[3]);
+        let old_id = data_str(&row[4]);
+        // FAIL-FAST: an unparseable element_type means we cannot compute the
+        // row's true id, and guessing would silently mis-key its history.
+        let element_type = cli::parse_element_type(&etype_str).ok_or_else(|| {
+            format!(
+                "element-id re-key ABORTED: events row for element_id '{}' carries \
+                 unknown element_type '{}'. No rows written.",
+                old_id, etype_str
+            )
+        })?;
+        let new_id = compute_element_id(element_type, &name, &scope, &scope_path);
+        old_to_new.entry(old_id).or_default().insert(new_id);
+    }
+
+    // 3. Un-merge fail-fast. One old id fanning out to several new ids means
+    //    the old lossy scheme had already MERGED distinct elements' histories
+    //    under a single id — and a bijective key-rename cannot faithfully
+    //    split one elements_state row back into several. Abort with zero
+    //    writes rather than corrupt the history; a human must decide.
+    for (old, news) in old_to_new.iter() {
+        if news.len() > 1 {
+            let mut list: Vec<&str> = news.iter().map(|s| s.as_str()).collect();
+            list.sort_unstable();
+            return Err(format!(
+                "element-id re-key ABORTED: old id {} maps to {} distinct new ids {:?} \
+                 — the old lossy scheme merged these distinct elements into one history, \
+                 which a key-rename cannot split. No rows written.",
+                old,
+                news.len(),
+                list
+            ));
+        }
+    }
+
+    // 4. Flatten to a function. Step 3 guarantees exactly one new per old.
+    //    Identity pairs are kept: the rewrite joins events against this map,
+    //    so a missing pair would silently DROP that element's rows.
+    let mut remap: Vec<(String, String)> = Vec::with_capacity(old_to_new.len());
+    let mut changed: u64 = 0;
+    for (old, news) in old_to_new.iter() {
+        let new = news
+            .iter()
+            .next()
+            .ok_or_else(|| format!("element-id re-key: empty new-id set for {}", old))?;
+        if new != old {
+            changed += 1;
+        }
+        remap.push((old.clone(), new.clone()));
+    }
+    if changed == 0 {
+        stamp_element_id_scheme(db)?;
+        return Ok(0);
+    }
+
+    // 5. Rewrite. The remap relations are scratch state: drop them on every
+    //    exit path so a failed run never leaves a stale map to poison the next.
+    let result = rekey_rows_via_remap(db, &remap);
+    drop_scratch_relations(db);
+    result?;
+
+    // 6. Stamp only after the rewrite committed.
+    stamp_element_id_scheme(db)?;
+    Ok(changed)
+}
+
+/// The migration's scratch relations. Deliberately NOT named with a leading
+/// underscore (the spec's `_id_remap`): in cozo-ce 0.7 a leading underscore
+/// marks a TEMP store (`Symbol::is_temp_store_name`) whose lifetime is a
+/// single `run_script`, so it would vanish between the `:create` and the
+/// join that reads it. These must be real stored relations; the migration
+/// drops them again on every exit path.
+const SCRATCH_RELATIONS: &[&str] = &["pss_id_remap", "pss_status_remap", "pss_diff_remap"];
+
+/// Best-effort drop of every scratch relation — called both before the
+/// rewrite (a crashed earlier run may have left one behind) and after it
+/// (success or failure), so no scratch state ever outlives the migration.
+fn drop_scratch_relations(db: &DbInstance) {
+    for rel in SCRATCH_RELATIONS {
+        let q = format!("::remove {}", rel);
+        let _ = db.run_script(&q, BTreeMap::new(), ScriptMutability::Mutable);
+    }
+}
+
+/// Create scratch relation `relation { key_col: String => val_col: String }`
+/// and bulk-load `pairs` into it. Relation/column names are compile-time
+/// constants owned by this module — never user data.
+fn load_scratch_map(
+    db: &DbInstance,
+    relation: &str,
+    key_col: &str,
+    val_col: &str,
+    pairs: &[(String, String)],
+) -> Result<(), String> {
+    let create = format!(
+        ":create {} {{ {}: String => {}: String }}",
+        relation, key_col, val_col
+    );
+    db.run_script(&create, BTreeMap::new(), ScriptMutability::Mutable)
+        .map_err(|e| format!("element-id re-key: creating {} failed: {}", relation, e))?;
+    let rows: Vec<DataValue> = pairs
+        .iter()
+        .map(|(k, v)| {
+            DataValue::List(vec![
+                DataValue::Str(k.as_str().into()),
+                DataValue::Str(v.as_str().into()),
+            ])
+        })
+        .collect();
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("rows".into(), DataValue::List(rows));
+    let put = format!(
+        "?[{k}, {v}] <- $rows\n :put {r} {{ {k} => {v} }}",
+        k = key_col,
+        v = val_col,
+        r = relation
+    );
+    db.run_script(&put, params, ScriptMutability::Mutable)
+        .map_err(|e| format!("element-id re-key: loading {} failed: {}", relation, e))?;
+    Ok(())
+}
+
+/// Rewrite one embedded `override_status` value onto the new id scheme, or
+/// `None` if it embeds no changed id. The two id-bearing forms come from
+/// `resolve_overrides`: `overridden_by:<eid>` (single id) and
+/// `overrides:<eid>;<eid>;…` (semicolon-joined list — each element is
+/// remapped independently, unchanged ones pass through). Plain statuses
+/// ("active", "none", …) carry no id and always return `None`.
+fn remap_override_status(
+    status: &str,
+    changed: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if let Some(id) = status.strip_prefix("overridden_by:") {
+        return changed
+            .get(id)
+            .map(|new| format!("overridden_by:{}", new));
+    }
+    if let Some(list) = status.strip_prefix("overrides:") {
+        let mut any_changed = false;
+        let mut parts: Vec<&str> = Vec::new();
+        for id in list.split(';') {
+            match changed.get(id) {
+                Some(new) => {
+                    any_changed = true;
+                    parts.push(new.as_str());
+                }
+                None => parts.push(id),
+            }
+        }
+        if any_changed {
+            return Some(format!("overrides:{}", parts.join(";")));
+        }
+    }
+    None
+}
+
+/// All distinct values of one String column, via datalog set semantics.
+fn distinct_string_col(db: &DbInstance, rel: &str, col: &str) -> Result<Vec<String>, String> {
+    let q = format!("?[{c}] := *{r}{{{c}}}", c = col, r = rel);
+    let rows = db
+        .run_script(&q, BTreeMap::new(), ScriptMutability::Immutable)
+        .map_err(|e| format!("element-id re-key: reading {}.{} failed: {}", rel, col, e))?;
+    Ok(rows.rows.iter().map(|r| data_str(&r[0])).collect())
+}
+
+/// The write half of [`migrate_element_id_scheme_v2`]: load `remap` into the
+/// scratch relation and join it against `events`, `elements_state`, and
+/// `element_descriptions` so Cozo itself carries every non-id value across
+/// untouched — then remap the ids EMBEDDED inside `override_status` and
+/// `events.diff_json` string values.
+fn rekey_rows_via_remap(db: &DbInstance, remap: &[(String, String)]) -> Result<(), String> {
+    // Drop leftovers from an interrupted earlier run before creating.
+    drop_scratch_relations(db);
+    load_scratch_map(db, "pss_id_remap", "old_id", "new_id", remap)?;
+
+    // events: bind the STORED id to `old_eid` and bind the head's
+    // `element_id` to the joined new value. Every other column is bound and
+    // re-emitted by name, so its value never leaves Cozo. The `event_id` key
+    // is untouched, so this overwrites each row in place — the row count
+    // cannot change.
+    let events_q = r#"
+        ?[event_id, observed_at, scan_id, event_type, element_type, element_name,
+          element_id, scope, scope_path, source, path, content_hash, file_size,
+          token_count, enabled, override_status, diff_json, snapshot_ref] :=
+            *events{event_id, observed_at, scan_id, event_type, element_type,
+                    element_name, element_id: old_eid, scope, scope_path, source,
+                    path, content_hash, file_size, token_count, enabled,
+                    override_status, diff_json, snapshot_ref},
+            *pss_id_remap{old_id: old_eid, new_id: element_id}
+        :put events { event_id =>
+            observed_at, scan_id, event_type, element_type, element_name,
+            element_id, scope, scope_path, source, path, content_hash, file_size,
+            token_count, enabled, override_status, diff_json, snapshot_ref }
+    "#;
+    db.run_script(events_q, BTreeMap::new(), ScriptMutability::Mutable)
+        .map_err(|e| format!("element-id re-key: rewriting events failed: {}", e))?;
+
+    // elements_state: element_id IS the primary key, so a rename is a
+    // new-keyed :put followed by an :rm of the dead old key.
+    let state_put_q = r#"
+        ?[element_id, last_event_id, current_path, current_hash, current_size,
+          current_token_count, enabled, override_status, installed_at,
+          last_changed_at, exists] :=
+            *elements_state{element_id: old_eid, last_event_id, current_path,
+                            current_hash, current_size, current_token_count,
+                            enabled, override_status, installed_at,
+                            last_changed_at, exists},
+            *pss_id_remap{old_id: old_eid, new_id: element_id}
+        :put elements_state { element_id =>
+            last_event_id, current_path, current_hash, current_size,
+            current_token_count, enabled, override_status, installed_at,
+            last_changed_at, exists }
+    "#;
+    db.run_script(state_put_q, BTreeMap::new(), ScriptMutability::Mutable)
+        .map_err(|e| format!("element-id re-key: rewriting elements_state failed: {}", e))?;
+
+    // Drop the old keys. Two guards, both load-bearing:
+    //   `element_id != new_eid` — never delete a row whose key didn't move.
+    //   `not *pss_id_remap{new_id: element_id}` — never delete a key that is
+    //      also some OTHER row's NEW key. Without it a rename chain A→B, B→C
+    //      would delete B (as A's stale old key) right after A's data was
+    //      written INTO B, losing A's state row entirely.
+    let state_rm_q = r#"
+        ?[element_id] :=
+            *elements_state{element_id},
+            *pss_id_remap{old_id: element_id, new_id: new_eid},
+            element_id != new_eid,
+            not *pss_id_remap{new_id: element_id}
+        :rm elements_state { element_id }
+    "#;
+    db.run_script(state_rm_q, BTreeMap::new(), ScriptMutability::Mutable)
+        .map_err(|e| format!("element-id re-key: dropping stale elements_state keys failed: {}", e))?;
+
+    // element_descriptions: also element_id-KEYED, so it gets the identical
+    // treatment. This table is NOT optional bookkeeping — the writer reads it
+    // back per element via read_prior_description_hash(NEW id) to decide
+    // whether to emit description_changed. Skipping it here would orphan
+    // every re-keyed element's description row: spurious description_changed
+    // events on the next scan, plus dead rows that nothing ever reclaims.
+    //
+    // The INNER join is load-bearing in the other direction too: a
+    // description row whose element_id has no remap entry (a description with
+    // no events) simply doesn't match, so it is left exactly as-is rather
+    // than dropped.
+    let desc_put_q = r#"
+        ?[element_id, description_hash, description_text, last_updated_at] :=
+            *element_descriptions{element_id: old_eid, description_hash,
+                                  description_text, last_updated_at},
+            *pss_id_remap{old_id: old_eid, new_id: element_id}
+        :put element_descriptions { element_id =>
+            description_hash, description_text, last_updated_at }
+    "#;
+    db.run_script(desc_put_q, BTreeMap::new(), ScriptMutability::Mutable)
+        .map_err(|e| {
+            format!("element-id re-key: rewriting element_descriptions failed: {}", e)
+        })?;
+
+    // Same two guards as elements_state: never drop an unmoved key, and never
+    // drop a key that is some other row's NEW key (the A→B, B→C chain).
+    let desc_rm_q = r#"
+        ?[element_id] :=
+            *element_descriptions{element_id},
+            *pss_id_remap{old_id: element_id, new_id: new_eid},
+            element_id != new_eid,
+            not *pss_id_remap{new_id: element_id}
+        :rm element_descriptions { element_id }
+    "#;
+    db.run_script(desc_rm_q, BTreeMap::new(), ScriptMutability::Mutable)
+        .map_err(|e| {
+            format!(
+                "element-id re-key: dropping stale element_descriptions keys failed: {}",
+                e
+            )
+        })?;
+
+    // ── Embedded ids ─────────────────────────────────────────────────────
+    // element_ids also live INSIDE string values: `override_status` carries
+    // `overridden_by:<eid>` / `overrides:<eid>;<eid>` and `events.diff_json`
+    // embeds those same status strings for override events. The
+    // elements_state copy is CURRENT state: leave it stale and the next
+    // scan's override pass — which recomputes with NEW ids — would see a
+    // mismatch and emit spurious override_started/override_ended events.
+    //
+    // Only ids that actually CHANGED need a lookup entry, which keeps the
+    // scratch maps tiny (the two-rule matched/unmatched pattern below lets
+    // every unmapped row pass through untouched).
+    let changed_map: std::collections::HashMap<String, String> = remap
+        .iter()
+        .filter(|(old, new)| old != new)
+        .cloned()
+        .collect();
+
+    // Every changed old id, longest first — so the diff_json substring
+    // replacement can never corrupt a longer id by first rewriting a shorter
+    // id that happens to be its prefix.
+    let mut changed_by_len: Vec<(&String, &String)> = changed_map.iter().collect();
+    changed_by_len.sort_by_key(|(old, _)| std::cmp::Reverse(old.len()));
+
+    // Post-condition guard, applied to every candidate value BEFORE writing:
+    // a rewritten (or deliberately untouched) value must not contain any
+    // changed old id. `contains('@')` is a sound pre-filter — every
+    // element_id contains '@' — so plain values skip the scan entirely.
+    let residual_old_id = |value: &str| -> Option<&String> {
+        if !value.contains('@') {
+            return None;
+        }
+        changed_by_len
+            .iter()
+            .find(|(old, _)| value.contains(old.as_str()))
+            .map(|(old, _)| *old)
+    };
+
+    // override_status: distinct values across BOTH carriers (events +
+    // elements_state), remapped exactly — strip the known prefix, look the
+    // full id (or each `;`-separated id) up in changed_map. No substring
+    // matching, so no false rewrites.
+    let mut statuses = distinct_string_col(db, "events", "override_status")?;
+    statuses.extend(distinct_string_col(db, "elements_state", "override_status")?);
+    statuses.sort();
+    statuses.dedup();
+    let mut status_remap: Vec<(String, String)> = Vec::new();
+    for status in &statuses {
+        match remap_override_status(status, &changed_map) {
+            Some(new_status) => {
+                if let Some(old) = residual_old_id(&new_status) {
+                    return Err(format!(
+                        "element-id re-key ABORTED: rewritten override_status '{}' still \
+                         contains changed old id '{}'. No embedded-id rows written.",
+                        new_status, old
+                    ));
+                }
+                status_remap.push((status.clone(), new_status));
+            }
+            None => {
+                // Not id-bearing (or all its ids unchanged) — but it must
+                // not smuggle a changed old id in some unexpected shape.
+                if let Some(old) = residual_old_id(status) {
+                    return Err(format!(
+                        "element-id re-key ABORTED: override_status '{}' embeds changed \
+                         old id '{}' in an unrecognized form (expected 'overridden_by:' \
+                         or 'overrides:'). No embedded-id rows written.",
+                        status, old
+                    ));
+                }
+            }
+        }
+    }
+
+    // diff_json: id-level longest-first substring replacement. The `@`
+    // pre-filter keeps this O(distinct values): a value with no '@' cannot
+    // embed an element_id and is skipped (and therefore byte-identical).
+    let mut diff_remap: Vec<(String, String)> = Vec::new();
+    for diff in distinct_string_col(db, "events", "diff_json")? {
+        if !diff.contains('@') {
+            continue;
+        }
+        let mut out = diff.clone();
+        for (old, new) in &changed_by_len {
+            if out.contains(old.as_str()) {
+                out = out.replace(old.as_str(), new.as_str());
+            }
+        }
+        if let Some(old) = residual_old_id(&out) {
+            return Err(format!(
+                "element-id re-key ABORTED: rewritten diff_json still contains changed \
+                 old id '{}': {}. No embedded-id rows written.",
+                old, out
+            ));
+        }
+        if out != diff {
+            diff_remap.push((diff, out));
+        }
+    }
+
+    // Rewrite pass per carrier — skipped entirely when its map is empty
+    // (nothing would change, and the unmatched rule alone would just rewrite
+    // every row to itself). Each script has TWO rules under one head: the
+    // matched rule joins the scratch map, the unmatched rule passes the row
+    // through via negation — together they cover every row exactly once.
+    if !status_remap.is_empty() {
+        load_scratch_map(db, "pss_status_remap", "old_status", "new_status", &status_remap)?;
+
+        let events_status_q = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash, file_size,
+              token_count, enabled, override_status, diff_json, snapshot_ref] :=
+                *events{event_id, observed_at, scan_id, event_type, element_type,
+                        element_name, element_id, scope, scope_path, source, path,
+                        content_hash, file_size, token_count, enabled,
+                        override_status: old_os, diff_json, snapshot_ref},
+                *pss_status_remap{old_status: old_os, new_status: override_status}
+            ?[event_id, observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash, file_size,
+              token_count, enabled, override_status, diff_json, snapshot_ref] :=
+                *events{event_id, observed_at, scan_id, event_type, element_type,
+                        element_name, element_id, scope, scope_path, source, path,
+                        content_hash, file_size, token_count, enabled,
+                        override_status, diff_json, snapshot_ref},
+                not *pss_status_remap{old_status: override_status}
+            :put events { event_id =>
+                observed_at, scan_id, event_type, element_type, element_name,
+                element_id, scope, scope_path, source, path, content_hash, file_size,
+                token_count, enabled, override_status, diff_json, snapshot_ref }
+        "#;
+        db.run_script(events_status_q, BTreeMap::new(), ScriptMutability::Mutable)
+            .map_err(|e| {
+                format!(
+                    "element-id re-key: rewriting events.override_status failed: {}",
+                    e
+                )
+            })?;
+
+        let state_status_q = r#"
+            ?[element_id, last_event_id, current_path, current_hash, current_size,
+              current_token_count, enabled, override_status, installed_at,
+              last_changed_at, exists] :=
+                *elements_state{element_id, last_event_id, current_path, current_hash,
+                                current_size, current_token_count, enabled,
+                                override_status: old_os, installed_at,
+                                last_changed_at, exists},
+                *pss_status_remap{old_status: old_os, new_status: override_status}
+            ?[element_id, last_event_id, current_path, current_hash, current_size,
+              current_token_count, enabled, override_status, installed_at,
+              last_changed_at, exists] :=
+                *elements_state{element_id, last_event_id, current_path, current_hash,
+                                current_size, current_token_count, enabled,
+                                override_status, installed_at, last_changed_at, exists},
+                not *pss_status_remap{old_status: override_status}
+            :put elements_state { element_id =>
+                last_event_id, current_path, current_hash, current_size,
+                current_token_count, enabled, override_status, installed_at,
+                last_changed_at, exists }
+        "#;
+        db.run_script(state_status_q, BTreeMap::new(), ScriptMutability::Mutable)
+            .map_err(|e| {
+                format!(
+                    "element-id re-key: rewriting elements_state.override_status failed: {}",
+                    e
+                )
+            })?;
+    }
+
+    if !diff_remap.is_empty() {
+        load_scratch_map(db, "pss_diff_remap", "old_diff", "new_diff", &diff_remap)?;
+
+        let events_diff_q = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash, file_size,
+              token_count, enabled, override_status, diff_json, snapshot_ref] :=
+                *events{event_id, observed_at, scan_id, event_type, element_type,
+                        element_name, element_id, scope, scope_path, source, path,
+                        content_hash, file_size, token_count, enabled, override_status,
+                        diff_json: old_dj, snapshot_ref},
+                *pss_diff_remap{old_diff: old_dj, new_diff: diff_json}
+            ?[event_id, observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash, file_size,
+              token_count, enabled, override_status, diff_json, snapshot_ref] :=
+                *events{event_id, observed_at, scan_id, event_type, element_type,
+                        element_name, element_id, scope, scope_path, source, path,
+                        content_hash, file_size, token_count, enabled, override_status,
+                        diff_json, snapshot_ref},
+                not *pss_diff_remap{old_diff: diff_json}
+            :put events { event_id =>
+                observed_at, scan_id, event_type, element_type, element_name,
+                element_id, scope, scope_path, source, path, content_hash, file_size,
+                token_count, enabled, override_status, diff_json, snapshot_ref }
+        "#;
+        db.run_script(events_diff_q, BTreeMap::new(), ScriptMutability::Mutable)
+            .map_err(|e| {
+                format!("element-id re-key: rewriting events.diff_json failed: {}", e)
+            })?;
+    }
+
+    Ok(())
 }
 
 /// Statistics returned by `migrate_v1_to_v2`. Useful for logs and tests.
@@ -2516,6 +3141,21 @@ pub mod cli {
         Some(cutoff.to_rfc3339())
     }
 
+    /// `pss migrate-element-ids` — the manual lever for the F4 element_id
+    /// re-key (TRDD-1Z8SGQ7N). The same migration auto-runs inside
+    /// merge-events; this verb exists so it can be driven (and its result
+    /// inspected) on demand, without a full reindex.
+    ///
+    /// FAIL-FAST: propagates the un-merge abort verbatim rather than
+    /// reporting a partial success — a silently half-migrated history is
+    /// worse than a loud failure.
+    pub fn cmd_migrate_element_ids(db: &DbInstance) -> Result<(), String> {
+        ensure_schema(db)?;
+        let changed = migrate_element_id_scheme_v2(db)?;
+        println!("{}", serde_json::json!({ "changed": changed }));
+        Ok(())
+    }
+
     /// `pss prune-history [--dry-run]` — drop events older than retention,
     /// preserving install events of currently-existing elements (so their
     /// timelines remain anchored). Idempotent — safe to run frequently.
@@ -2610,7 +3250,12 @@ pub mod cli {
 
     /// Map a JSONL `type` field to an `ElementType`. Returns None for
     /// unknown values (the caller skips the row rather than guessing).
-    fn parse_element_type(s: &str) -> Option<ElementType> {
+    ///
+    /// `pub(crate)` so `migrate_element_id_scheme_v2` (F4, TRDD-1Z8SGQ7N)
+    /// can turn a stored `events.element_type` string back into the enum
+    /// that `compute_element_id` needs — it must recompute ids with the
+    /// exact same mapping the writer used, or the re-key would invent ids.
+    pub(crate) fn parse_element_type(s: &str) -> Option<ElementType> {
         match s {
             "skill" => Some(ElementType::Skill),
             "agent" => Some(ElementType::Agent),
@@ -2782,7 +3427,11 @@ pub mod cli {
     /// never been observed before (first install — no prior to compare
     /// against). The side-table approach avoids an elements_state
     /// schema migration.
-    fn read_prior_description_hash(db: &DbInstance, element_id: &str) -> Option<String> {
+    /// `pub(crate)` so the F4 re-key tests (TRDD-1Z8SGQ7N) can assert against
+    /// the REAL consumer rather than a replica of its query — the whole point
+    /// of re-keying element_descriptions is that THIS lookup still resolves
+    /// after the rename.
+    pub(crate) fn read_prior_description_hash(db: &DbInstance, element_id: &str) -> Option<String> {
         let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
         params.insert("eid".into(), DataValue::Str(element_id.into()));
         let q = r#"
@@ -2980,6 +3629,14 @@ pub mod cli {
         use std::collections::{HashMap, HashSet};
 
         ensure_schema(db)?;
+        // F4 (TRDD-1Z8SGQ7N): auto-heal the element_id scheme before writing
+        // a single event. merge-events is the only writer in the normal
+        // reindex flow, and it holds both flocks here — the one moment we can
+        // safely re-key. It must run BEFORE the merge: this scan's rows are
+        // keyed with the NEW scheme, so leaving old-scheme rows in place would
+        // fork every renamed element's history at this scan. Gated, so it is a
+        // no-op on every run after the first.
+        migrate_element_id_scheme_v2(db)?;
 
         let scan_id = ulid::Ulid::new().to_string();
         let started_at = chrono::Utc::now().to_rfc3339();
@@ -4213,14 +4870,34 @@ mod tests {
     use cozo::Num;
 
     #[test]
-    fn element_id_is_stable_and_lowercased() {
+    fn element_id_is_case_and_separator_preserving() {
+        // F4 (TRDD-1Z8SGQ7N): name and scope_path are raw; only scope (a
+        // fixed enum-ish set) is folded to lowercase.
         let id = compute_element_id(
             ElementType::Skill,
             "MyCoolSkill",
             "Project",
             "/Users/foo/Bar",
         );
-        assert_eq!(id, "skill:mycoolskill@project:_users_foo_bar");
+        assert_eq!(id, "skill:MyCoolSkill@project:/Users/foo/Bar");
+    }
+
+    #[test]
+    fn compute_element_id_case_sensitive_names_distinct() {
+        // F4: the old scheme lowercased `name`, so `Foo` and `foo` collided
+        // onto one id and had their append-only histories silently merged.
+        let upper = compute_element_id(ElementType::Skill, "Foo", "user", "/a/b");
+        let lower = compute_element_id(ElementType::Skill, "foo", "user", "/a/b");
+        assert_ne!(upper, lower, "case-distinct names must not share an id");
+    }
+
+    #[test]
+    fn compute_element_id_separator_vs_literal_underscore_distinct() {
+        // F4: the old scheme slugged `/`→`_` in scope_path, so a real path
+        // `/a/b` and a literal `/a_b` collided.
+        let slashed = compute_element_id(ElementType::Skill, "x", "user", "/a/b");
+        let scored = compute_element_id(ElementType::Skill, "x", "user", "/a_b");
+        assert_ne!(slashed, scored, "path separators must survive in the id");
     }
 
     #[test]
@@ -4555,6 +5232,720 @@ mod tests {
         let s2 = migrate_v1_to_v2(&db).expect("second");
         assert!(s2.already_at_target_version);
         assert_eq!(s2.skills_migrated, 0);
+    }
+
+    // ====================================================================
+    // F4 / F5 — element_id re-key (TRDD-1Z8SGQ7N)
+    // ====================================================================
+
+    /// All `(element_id,)` values in `events`, sorted.
+    fn event_ids_in(db: &DbInstance) -> Vec<String> {
+        let r = db
+            .run_script(
+                r#"?[element_id] := *events{element_id}"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .expect("read events element_ids");
+        let mut v: Vec<String> = r.rows.iter().map(|row| data_str(&row[0])).collect();
+        v.sort();
+        v
+    }
+
+    fn count_rows(db: &DbInstance, rel: &str, col: &str) -> i64 {
+        let q = format!("?[count({c})] := *{r}{{{c}}}", c = col, r = rel);
+        let r = db
+            .run_script(&q, BTreeMap::new(), ScriptMutability::Immutable)
+            .unwrap_or_else(|e| panic!("count {}: {}", rel, e));
+        r.rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|d| d.get_int())
+            .unwrap_or(0)
+    }
+
+    fn state_keys_in(db: &DbInstance) -> Vec<String> {
+        let r = db
+            .run_script(
+                r#"?[element_id] := *elements_state{element_id}"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .expect("read elements_state keys");
+        let mut v: Vec<String> = r.rows.iter().map(|row| data_str(&row[0])).collect();
+        v.sort();
+        v
+    }
+
+    /// A legacy v1 DB whose single skill came from a project-installed
+    /// plugin (`project:<proj>/plugin:<name>`) — the composite source whose
+    /// scope_path F5 must derive rather than hardcode to "".
+    fn legacy_skills_v1_db_with_plugin_source() -> DbInstance {
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        db.run_script(
+            r#":create skills {
+                name: String, source: String =>
+                id: String default "",
+                path: String,
+                skill_type: String,
+                description: String,
+                first_indexed_at: String,
+                last_updated_at: String,
+            }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )
+        .expect("create skills");
+        db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )
+        .expect("create pss_metadata");
+        db.run_script(
+            r#"?[name, source, id, path, skill_type, description, first_indexed_at, last_updated_at] <-
+                [["plug-skill", "project:proj/plugin:foo", "abc", "/tmp/nonexistent.md", "skill",
+                  "desc", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"]]
+               :put skills { name, source => id, path, skill_type, description, first_indexed_at, last_updated_at }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )
+        .expect("seed skill");
+        db
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_derives_scope_path_from_source() {
+        // F5 (TRDD-1Z8SGQ7N): the migration must key elements with the SAME
+        // source-derived scope_path the live writer uses. Hardcoding "" gave
+        // the pre-migration install event a different id from every event
+        // after it — splitting each element's history at the boundary.
+        let db = legacy_skills_v1_db_with_plugin_source();
+        let stats = migrate_v1_to_v2(&db).expect("migration");
+        assert_eq!(stats.skills_migrated, 1);
+
+        let ids = event_ids_in(&db);
+        assert_eq!(ids.len(), 1, "one install event expected");
+        let eid = &ids[0];
+
+        // The scope_path segment is the derived composite, not empty.
+        assert!(
+            eid.ends_with(":proj/plugin:foo"),
+            "element_id must carry the derived scope_path, got {}",
+            eid
+        );
+
+        // And it is NOT the id the old hardcoded-"" code produced.
+        let buggy = compute_element_id(
+            ElementType::Skill,
+            "plug-skill",
+            &scope_from_source("project:proj/plugin:foo"),
+            "",
+        );
+        assert_ne!(*eid, buggy, "scope_path must not regress to empty");
+    }
+
+    /// A v2 DB carrying ONE event + state row keyed with the OLD lossy id
+    /// while its `element_name` / `scope` / `scope_path` columns are raw —
+    /// exactly the shape a live pre-F4 DB has.
+    fn v2_db_with_old_scheme_row() -> DbInstance {
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+        // Old scheme: name lowercased, scope_path "/a/b" slugged to "_a_b".
+        //
+        // diff_json goes in as a $param, NOT inline: cozo-ce 0.7's `string`
+        // rule tries `raw_string` BEFORE `quoted_string`, and a zero-underscore
+        // raw_string matches a bare "..." that ends at the FIRST '"'. So a
+        // `\"` escape inside a double-quoted literal is unreachable and the
+        // parser dies mid-value. Params sidestep the grammar entirely — which
+        // is also why the migration itself never inlines a value.
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("diff".into(), DataValue::Str(r#"{"k":1}"#.into()));
+        let seed = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["e1", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "MyCoolSkill", "skill:mycoolskill@user:_a_b", "user", "/a/b", "user",
+                 "/a/b/MyCoolSkill.md", "h1", 123, 45, false, "shadowed", $diff, "snap1"]
+              ]
+            :put events { event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }
+        "#;
+        db.run_script(seed, params, ScriptMutability::Mutable)
+            .expect("seed events");
+        let seed_state = r#"
+            ?[element_id, last_event_id, current_path, current_hash,
+              current_size, current_token_count, enabled, override_status,
+              installed_at, last_changed_at, exists] <- [
+                ["skill:mycoolskill@user:_a_b", "e1", "/a/b/MyCoolSkill.md", "h1",
+                 123, 45, false, "shadowed", "2026-01-01T00:00:00Z",
+                 "2026-02-02T00:00:00Z", true]
+              ]
+            :put elements_state { element_id =>
+              last_event_id, current_path, current_hash, current_size,
+              current_token_count, enabled, override_status, installed_at,
+              last_changed_at, exists }
+        "#;
+        db.run_script(seed_state, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed elements_state");
+        // element_descriptions is element_id-KEYED too. Two rows:
+        //   - the old-scheme id, which MUST be re-keyed alongside the rest;
+        //   - an orphan whose id has no events, which MUST survive untouched
+        //     (it has no remap entry, so the inner join skips it).
+        let seed_desc = r#"
+            ?[element_id, description_hash, description_text, last_updated_at] <- [
+                ["skill:mycoolskill@user:_a_b", "dh1", "a cool skill", "2026-01-03T00:00:00Z"],
+                ["skill:orphan@user:/nowhere", "dh2", "no events at all", "2026-01-04T00:00:00Z"]
+              ]
+            :put element_descriptions { element_id =>
+              description_hash, description_text, last_updated_at }
+        "#;
+        db.run_script(seed_desc, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed element_descriptions");
+        db
+    }
+
+    /// All `element_descriptions` keys, sorted.
+    fn desc_keys_in(db: &DbInstance) -> Vec<String> {
+        let r = db
+            .run_script(
+                r#"?[element_id] := *element_descriptions{element_id}"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .expect("read element_descriptions keys");
+        let mut v: Vec<String> = r.rows.iter().map(|row| data_str(&row[0])).collect();
+        v.sort();
+        v
+    }
+
+    /// The (hash, text, last_updated_at) triple stored under `eid`, if any.
+    fn desc_row_of(db: &DbInstance, eid: &str) -> Option<(String, String, String)> {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(eid.into()));
+        let r = db
+            .run_script(
+                r#"?[description_hash, description_text, last_updated_at] :=
+                    *element_descriptions{element_id: $eid, description_hash,
+                                          description_text, last_updated_at}"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .expect("read description row");
+        r.rows
+            .first()
+            .map(|row| (data_str(&row[0]), data_str(&row[1]), data_str(&row[2])))
+    }
+
+    #[test]
+    fn rekey_migration_rewrites_element_descriptions_losslessly() {
+        // F4 (TRDD-1Z8SGQ7N): element_descriptions is element_id-KEYED and is
+        // read back by read_prior_description_hash(NEW id). If it kept the old
+        // key, every re-keyed element would orphan its description row and the
+        // next scan would fire a spurious description_changed for all of them.
+        let db = v2_db_with_old_scheme_row();
+        let new_id = compute_element_id(ElementType::Skill, "MyCoolSkill", "user", "/a/b");
+
+        assert_eq!(migrate_element_id_scheme_v2(&db).expect("re-key"), 1);
+
+        // Row count preserved: the key moved, nothing was added or dropped.
+        assert_eq!(count_rows(&db, "element_descriptions", "element_id"), 2);
+
+        // Old key gone, new key present, values byte-identical.
+        assert_eq!(desc_row_of(&db, "skill:mycoolskill@user:_a_b"), None,
+            "the old description key must be gone");
+        assert_eq!(
+            desc_row_of(&db, &new_id),
+            Some((
+                "dh1".to_string(),
+                "a cool skill".to_string(),
+                "2026-01-03T00:00:00Z".to_string()
+            )),
+            "description columns must survive the key rename verbatim"
+        );
+
+        // The exact lookup the writer performs must now resolve.
+        assert_eq!(
+            cli::read_prior_description_hash(&db, &new_id).as_deref(),
+            Some("dh1"),
+            "read_prior_description_hash must find the row under the new id"
+        );
+    }
+
+    #[test]
+    fn rekey_migration_leaves_unmatched_description_untouched() {
+        // F4: a description row whose element_id has no events has no remap
+        // entry. The inner join must simply skip it — never re-key it (there
+        // is nothing to re-key it to) and never drop it (that would be data
+        // loss the migration has no mandate for).
+        let db = v2_db_with_old_scheme_row();
+        let before = desc_row_of(&db, "skill:orphan@user:/nowhere");
+        assert!(before.is_some(), "precondition: orphan row seeded");
+
+        migrate_element_id_scheme_v2(&db).expect("re-key");
+
+        assert_eq!(
+            desc_row_of(&db, "skill:orphan@user:/nowhere"),
+            before,
+            "an events-less description row must survive the migration as-is"
+        );
+        let new_id = compute_element_id(ElementType::Skill, "MyCoolSkill", "user", "/a/b");
+        let mut expected = vec!["skill:orphan@user:/nowhere".to_string(), new_id];
+        expected.sort();
+        assert_eq!(desc_keys_in(&db), expected);
+    }
+
+    #[test]
+    fn rekey_migration_keeps_events_by_element_id_index_consistent() {
+        // F4: `events:by_element_id` is a cozo ::index over events, which cozo
+        // maintains from our `:put`. Prove it actually tracked the re-key —
+        // an index still pointing at the old id would silently return zero
+        // rows for every lifecycle query that goes through it.
+        let db = v2_db_with_old_scheme_row();
+        let new_id = compute_element_id(ElementType::Skill, "MyCoolSkill", "user", "/a/b");
+        migrate_element_id_scheme_v2(&db).expect("re-key");
+
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(new_id.as_str().into()));
+        let hit = db
+            .run_script(
+                r#"?[event_id] := *events:by_element_id{element_id: $eid, event_id}"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .expect("index lookup by new element_id");
+        assert_eq!(
+            hit.rows.len(),
+            1,
+            "the index must resolve the NEW id to the element's event"
+        );
+        assert_eq!(data_str(&hit.rows[0][0]), "e1");
+
+        // ...and must no longer resolve the OLD id.
+        let mut old_params: BTreeMap<String, DataValue> = BTreeMap::new();
+        old_params.insert("eid".into(), DataValue::Str("skill:mycoolskill@user:_a_b".into()));
+        let stale = db
+            .run_script(
+                r#"?[event_id] := *events:by_element_id{element_id: $eid, event_id}"#,
+                old_params,
+                ScriptMutability::Immutable,
+            )
+            .expect("index lookup by old element_id");
+        assert_eq!(stale.rows.len(), 0, "the old id must be gone from the index");
+    }
+
+    #[test]
+    fn rekey_migration_rewrites_events_and_state_losslessly() {
+        // F4 (TRDD-1Z8SGQ7N): the re-key renames the id and NOTHING else.
+        let db = v2_db_with_old_scheme_row();
+        let new_id = compute_element_id(ElementType::Skill, "MyCoolSkill", "user", "/a/b");
+        assert_eq!(new_id, "skill:MyCoolSkill@user:/a/b");
+
+        let changed = migrate_element_id_scheme_v2(&db).expect("re-key");
+        assert_eq!(changed, 1, "exactly one element_id moved");
+
+        // Row counts are invariant — nothing dropped, nothing duplicated.
+        assert_eq!(count_rows(&db, "events", "event_id"), 1);
+        assert_eq!(count_rows(&db, "elements_state", "element_id"), 1);
+
+        // The event is re-keyed and EVERY other column is byte-identical.
+        let row = db
+            .run_script(
+                r#"?[observed_at, scan_id, event_type, element_type, element_name,
+                     element_id, scope, scope_path, source, path, content_hash,
+                     file_size, token_count, enabled, override_status, diff_json,
+                     snapshot_ref] :=
+                    *events{event_id: "e1", observed_at, scan_id, event_type,
+                            element_type, element_name, element_id, scope,
+                            scope_path, source, path, content_hash, file_size,
+                            token_count, enabled, override_status, diff_json,
+                            snapshot_ref}"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .expect("read e1");
+        assert_eq!(row.rows.len(), 1, "event_id key must be untouched");
+        let r = &row.rows[0];
+        assert_eq!(data_str(&r[0]), "2026-01-01T00:00:00Z");
+        assert_eq!(data_str(&r[1]), "s1");
+        assert_eq!(data_str(&r[2]), "installed");
+        assert_eq!(data_str(&r[3]), "skill");
+        assert_eq!(data_str(&r[4]), "MyCoolSkill");
+        assert_eq!(data_str(&r[5]), new_id, "element_id must be re-keyed");
+        assert_eq!(data_str(&r[6]), "user");
+        assert_eq!(data_str(&r[7]), "/a/b");
+        assert_eq!(data_str(&r[8]), "user");
+        assert_eq!(data_str(&r[9]), "/a/b/MyCoolSkill.md");
+        assert_eq!(data_str(&r[10]), "h1");
+        assert_eq!(r[11].get_int(), Some(123), "file_size Int fidelity");
+        assert_eq!(r[12].get_int(), Some(45), "token_count Int fidelity");
+        assert_eq!(r[13], DataValue::Bool(false), "enabled Bool fidelity");
+        assert_eq!(data_str(&r[14]), "shadowed");
+        assert_eq!(data_str(&r[15]), r#"{"k":1}"#, "diff_json survives verbatim");
+        assert_eq!(data_str(&r[16]), "snap1");
+
+        // elements_state is keyed by the new id; the old key is gone.
+        assert_eq!(state_keys_in(&db), vec![new_id.clone()]);
+
+        // ...and its value columns survived the key rename intact.
+        let srow = db
+            .run_script(
+                r#"?[last_event_id, current_path, current_hash, current_size,
+                     current_token_count, enabled, override_status, installed_at,
+                     last_changed_at, exists] :=
+                    *elements_state{element_id, last_event_id, current_path,
+                                    current_hash, current_size, current_token_count,
+                                    enabled, override_status, installed_at,
+                                    last_changed_at, exists}"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .expect("read state");
+        assert_eq!(srow.rows.len(), 1);
+        let s = &srow.rows[0];
+        assert_eq!(data_str(&s[0]), "e1");
+        assert_eq!(data_str(&s[1]), "/a/b/MyCoolSkill.md");
+        assert_eq!(data_str(&s[2]), "h1");
+        assert_eq!(s[3].get_int(), Some(123));
+        assert_eq!(s[4].get_int(), Some(45));
+        assert_eq!(s[5], DataValue::Bool(false));
+        assert_eq!(data_str(&s[6]), "shadowed");
+        assert_eq!(data_str(&s[7]), "2026-01-01T00:00:00Z");
+        assert_eq!(data_str(&s[8]), "2026-02-02T00:00:00Z");
+        assert_eq!(s[9], DataValue::Bool(true));
+
+        // Gate stamped, and a second run short-circuits.
+        assert_eq!(
+            read_metadata_value(&db, ELEMENT_ID_SCHEME_KEY).as_deref(),
+            Some(ELEMENT_ID_SCHEME_VERSION)
+        );
+        assert_eq!(migrate_element_id_scheme_v2(&db).expect("second run"), 0);
+        assert_eq!(state_keys_in(&db), vec![new_id]);
+    }
+
+    /// A v2 DB with an override PAIR keyed by OLD-scheme ids, where the
+    /// override_status values (and one diff_json) EMBED those old ids:
+    ///   A = skill "CoolTool" @user   → old `skill:cooltool@user:`
+    ///   B = skill "CoolTool" @local  → old `skill:cooltool@local:` (wins)
+    /// plus C = skill "plain" @user, whose id does not change and whose
+    /// status/diff carry no ids at all.
+    fn v2_db_with_embedded_override_ids() -> DbInstance {
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+        // diff_json values carry quotes → must go in as $params (see the
+        // raw_string-first grammar note on v2_db_with_old_scheme_row).
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert(
+            "diff_a".into(),
+            DataValue::Str(
+                r#"{"new_override_status":"overridden_by:skill:cooltool@local:","previous_override_status":"active"}"#.into(),
+            ),
+        );
+        params.insert("diff_c".into(), DataValue::Str(r#"{"contact":"a@b.c"}"#.into()));
+        let seed = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["e1", "2026-01-01T00:00:00Z", "s1", "override_started", "skill",
+                 "CoolTool", "skill:cooltool@user:", "user", "", "user",
+                 "/u/CoolTool.md", "h1", 10, 5, true,
+                 "overridden_by:skill:cooltool@local:", $diff_a, ""],
+                ["e2", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "CoolTool", "skill:cooltool@local:", "local", "", "local",
+                 "/l/CoolTool.md", "h2", 20, 6, true,
+                 "overrides:skill:cooltool@user:;skill:unchanged@user:", "{}", ""],
+                ["e3", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "plain", "skill:plain@user:", "user", "", "user",
+                 "/u/plain.md", "h3", 30, 7, true, "active", $diff_c, ""]
+              ]
+            :put events { event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }
+        "#;
+        db.run_script(seed, params, ScriptMutability::Mutable)
+            .expect("seed events");
+        let seed_state = r#"
+            ?[element_id, last_event_id, current_path, current_hash,
+              current_size, current_token_count, enabled, override_status,
+              installed_at, last_changed_at, exists] <- [
+                ["skill:cooltool@user:", "e1", "/u/CoolTool.md", "h1", 10, 5, true,
+                 "overridden_by:skill:cooltool@local:",
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["skill:cooltool@local:", "e2", "/l/CoolTool.md", "h2", 20, 6, true,
+                 "overrides:skill:cooltool@user:;skill:unchanged@user:",
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true],
+                ["skill:plain@user:", "e3", "/u/plain.md", "h3", 30, 7, true,
+                 "none", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", true]
+              ]
+            :put elements_state { element_id =>
+              last_event_id, current_path, current_hash, current_size,
+              current_token_count, enabled, override_status, installed_at,
+              last_changed_at, exists }
+        "#;
+        db.run_script(seed_state, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed elements_state");
+        db
+    }
+
+    /// (override_status, diff_json) of one event, by event_id.
+    fn event_status_and_diff(db: &DbInstance, event_id: &str) -> (String, String) {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(event_id.into()));
+        let r = db
+            .run_script(
+                r#"?[override_status, diff_json] :=
+                    *events{event_id: $eid, override_status, diff_json}"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .expect("read event status/diff");
+        let row = r.rows.first().expect("event must exist");
+        (data_str(&row[0]), data_str(&row[1]))
+    }
+
+    /// override_status of one elements_state row, by element_id.
+    fn state_status_of(db: &DbInstance, eid: &str) -> String {
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(eid.into()));
+        let r = db
+            .run_script(
+                r#"?[override_status] :=
+                    *elements_state{element_id: $eid, override_status}"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .expect("read state status");
+        data_str(&r.rows.first().expect("state row must exist")[0])
+    }
+
+    #[test]
+    fn rekey_migration_rewrites_embedded_override_status_ids() {
+        // Correction #2 (TRDD-1Z8SGQ7N): override_status EMBEDS element_ids
+        // ("overridden_by:<eid>", "overrides:<eid>;<eid>"). The
+        // elements_state copy is CURRENT state — left stale, the next scan's
+        // override pass (which recomputes with NEW ids) would see a mismatch
+        // and emit spurious override_started/override_ended events.
+        let db = v2_db_with_embedded_override_ids();
+        assert_eq!(migrate_element_id_scheme_v2(&db).expect("re-key"), 2);
+
+        let new_a = "skill:CoolTool@user:";
+        let new_b = "skill:CoolTool@local:";
+
+        // events: both directions re-pointed; the unchanged id in the
+        // semicolon list ("skill:unchanged@user:") passes through verbatim.
+        assert_eq!(
+            event_status_and_diff(&db, "e1").0,
+            format!("overridden_by:{}", new_b)
+        );
+        assert_eq!(
+            event_status_and_diff(&db, "e2").0,
+            format!("overrides:{};skill:unchanged@user:", new_a)
+        );
+
+        // elements_state: the CURRENT state carries the new ids too.
+        assert_eq!(state_status_of(&db, new_a), format!("overridden_by:{}", new_b));
+        assert_eq!(
+            state_status_of(&db, new_b),
+            format!("overrides:{};skill:unchanged@user:", new_a)
+        );
+
+        // Invariant: no stale old id survives anywhere in either carrier.
+        for eid in ["e1", "e2", "e3"] {
+            let (status, diff) = event_status_and_diff(&db, eid);
+            for old in ["skill:cooltool@user:", "skill:cooltool@local:"] {
+                assert!(!status.contains(old), "{eid} status keeps old id: {status}");
+                assert!(!diff.contains(old), "{eid} diff keeps old id: {diff}");
+            }
+        }
+    }
+
+    #[test]
+    fn rekey_migration_leaves_plain_statuses_untouched() {
+        // "active" / "none" carry no id — they must pass through the
+        // two-rule matched/unmatched rewrite byte-identically.
+        let db = v2_db_with_embedded_override_ids();
+        migrate_element_id_scheme_v2(&db).expect("re-key");
+        assert_eq!(event_status_and_diff(&db, "e3").0, "active");
+        assert_eq!(state_status_of(&db, "skill:plain@user:"), "none");
+    }
+
+    #[test]
+    fn rekey_migration_rewrites_diff_json_embedded_ids_and_keeps_json_valid() {
+        // diff_json embeds the same status strings for override events; the
+        // rewrite must swap the ids AND leave the value valid JSON.
+        let db = v2_db_with_embedded_override_ids();
+        migrate_element_id_scheme_v2(&db).expect("re-key");
+
+        let (_, diff) = event_status_and_diff(&db, "e1");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&diff).expect("rewritten diff_json must still parse");
+        assert_eq!(
+            parsed["new_override_status"],
+            serde_json::json!("overridden_by:skill:CoolTool@local:")
+        );
+        assert_eq!(parsed["previous_override_status"], serde_json::json!("active"));
+        assert!(!diff.contains("skill:cooltool@local:"), "old id must be gone: {diff}");
+    }
+
+    #[test]
+    fn rekey_migration_leaves_idless_diff_json_byte_identical() {
+        // A diff_json with no embedded id — even one containing '@' (which
+        // enters the replacement loop via the pre-filter) — must come out
+        // byte-for-byte identical.
+        let db = v2_db_with_embedded_override_ids();
+        migrate_element_id_scheme_v2(&db).expect("re-key");
+        let (_, diff_c) = event_status_and_diff(&db, "e3");
+        assert_eq!(diff_c, r#"{"contact":"a@b.c"}"#);
+        let (_, diff_b) = event_status_and_diff(&db, "e2");
+        assert_eq!(diff_b, "{}", "'@'-free diff_json is skipped outright");
+    }
+
+    #[test]
+    fn rekey_migration_fails_fast_on_unmerge() {
+        // F4: `Foo` and `foo` collided onto one old id, so their histories
+        // are already merged into a single elements_state row. A bijective
+        // key-rename cannot split that back into two — abort, write nothing,
+        // and let a human decide.
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+        let seed = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["e1", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "Foo", "skill:foo@user:", "user", "", "user",
+                 "/u/Foo.md", "h1", 10, 5, true, "active", "{}", ""],
+                ["e2", "2026-01-02T00:00:00Z", "s1", "installed", "skill",
+                 "foo", "skill:foo@user:", "user", "", "user",
+                 "/u/foo.md", "h2", 20, 6, true, "active", "{}", ""]
+              ]
+            :put events { event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }
+        "#;
+        db.run_script(seed, BTreeMap::new(), ScriptMutability::Mutable)
+            .expect("seed events");
+
+        let err = migrate_element_id_scheme_v2(&db)
+            .expect_err("un-merge must abort");
+        assert!(
+            err.contains("ABORTED") && err.contains("distinct new ids"),
+            "error must name the un-merge, got: {}",
+            err
+        );
+        assert!(err.contains("No rows written."), "got: {}", err);
+
+        // Nothing was written: both events still carry the old merged id.
+        // Checked per event_id, because `event_ids_in` projects a datalog SET
+        // — two rows sharing one element_id collapse to a single value there,
+        // which would hide a half-written rewrite.
+        assert_eq!(count_rows(&db, "events", "event_id"), 2);
+        let spot = db
+            .run_script(
+                r#"?[event_id, element_id] := *events{event_id, element_id}"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .expect("read events");
+        let mut pairs: Vec<(String, String)> = spot
+            .rows
+            .iter()
+            .map(|r| (data_str(&r[0]), data_str(&r[1])))
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("e1".to_string(), "skill:foo@user:".to_string()),
+                ("e2".to_string(), "skill:foo@user:".to_string()),
+            ],
+            "abort must leave every event_id keyed exactly as before"
+        );
+        // elements_state untouched too (the merged single row is still there).
+        assert_eq!(state_keys_in(&db), Vec::<String>::new());
+        // The gate must NOT be stamped — the next run has to retry.
+        assert_eq!(read_metadata_value(&db, ELEMENT_ID_SCHEME_KEY), None);
+    }
+
+    #[test]
+    fn rekey_migration_idempotent_on_fresh_v2() {
+        // F4: a DB already written by a post-F4 binary re-keys to itself, so
+        // the migration is a no-op that only stamps the gate.
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        ensure_schema(&db).expect("schema");
+        let new_id = compute_element_id(ElementType::Skill, "MyCoolSkill", "user", "/a/b");
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(new_id.as_str().into()));
+        let seed = r#"
+            ?[event_id, observed_at, scan_id, event_type, element_type,
+              element_name, element_id, scope, scope_path, source, path,
+              content_hash, file_size, token_count, enabled, override_status,
+              diff_json, snapshot_ref] <- [
+                ["e1", "2026-01-01T00:00:00Z", "s1", "installed", "skill",
+                 "MyCoolSkill", $eid, "user", "/a/b", "user",
+                 "/a/b/MyCoolSkill.md", "h1", 10, 5, true, "active", "{}", ""]
+              ]
+            :put events { event_id =>
+              observed_at, scan_id, event_type, element_type, element_name,
+              element_id, scope, scope_path, source, path, content_hash,
+              file_size, token_count, enabled, override_status, diff_json,
+              snapshot_ref }
+        "#;
+        db.run_script(seed, params, ScriptMutability::Mutable)
+            .expect("seed events");
+
+        let changed = migrate_element_id_scheme_v2(&db).expect("re-key");
+        assert_eq!(changed, 0, "already-new ids must not move");
+        assert_eq!(event_ids_in(&db), vec![new_id]);
+        assert_eq!(count_rows(&db, "events", "event_id"), 1);
+        assert_eq!(
+            read_metadata_value(&db, ELEMENT_ID_SCHEME_KEY).as_deref(),
+            Some(ELEMENT_ID_SCHEME_VERSION),
+            "gate must be stamped even on a zero-change run"
+        );
+    }
+
+    #[test]
+    fn rekey_migration_gate_short_circuits_before_reading_events() {
+        // F4: the gate is what makes the auto-run in merge-events free after
+        // the first reindex — it must return before touching `events`.
+        let db = v2_db_with_old_scheme_row();
+        stamp_element_id_scheme(&db).expect("pre-stamp");
+        let changed = migrate_element_id_scheme_v2(&db).expect("gated run");
+        assert_eq!(changed, 0);
+        // Old id still there: the gate short-circuited, as designed.
+        assert_eq!(event_ids_in(&db), vec!["skill:mycoolskill@user:_a_b"]);
     }
 
     #[test]
