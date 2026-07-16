@@ -3100,6 +3100,32 @@ pub mod cli {
             by_type_and_name.entry(key).or_default().push(obs);
         }
 
+        // F6 (TRDD-1Z8SGQ7N): snapshot each element's override_status AS IT
+        // STOOD BEFORE THIS SCAN, keyed by element_id, BEFORE the emit loop
+        // below upserts elements_state. The override-resolution pass further
+        // down needs the TRUE prior status to detect a transition, but the
+        // emit loop upserts elements_state (with override_status="active")
+        // for every element that produced any event — so a plain read_prior
+        // in that pass reads the value THIS scan just wrote, not the prior.
+        // The concrete miss: an element that WAS overridden and whose
+        // overriding scope disappeared this scan should emit OverrideEnded,
+        // but read_prior returns the just-written "active", equals the new
+        // status, and the event is dropped. Snapshot first, compare against
+        // the snapshot, and the transition is seen.
+        let prior_override_status: std::collections::HashMap<String, String> = by_type_and_name
+            .values()
+            .flatten()
+            .map(|obs| obs.element_id())
+            .collect::<std::collections::HashSet<String>>()
+            .into_iter()
+            .map(|eid| {
+                let status = read_prior(db, &eid)
+                    .map(|p| p.override_status)
+                    .unwrap_or_else(|| "active".to_string());
+                (eid, status)
+            })
+            .collect();
+
         // Emit events for every observation.
         for (_, observations) in &by_type_and_name {
             for obs in observations {
@@ -3202,9 +3228,13 @@ pub mod cli {
                 .collect();
             let resolved = resolve_overrides(element_type, &candidates);
             for (eid, new_status) in &resolved {
-                // What did elements_state say BEFORE this scan?
-                let prior_status = read_prior(db, eid)
-                    .map(|p| p.override_status)
+                // What did elements_state say BEFORE this scan? F6: read the
+                // pre-scan snapshot, NOT read_prior — the emit loop above has
+                // already upserted elements_state this scan, so read_prior
+                // here would return the value we just wrote.
+                let prior_status = prior_override_status
+                    .get(eid)
+                    .cloned()
                     .unwrap_or_else(|| "active".to_string());
                 if new_status == &prior_status {
                     continue; // unchanged — no event needed
@@ -5453,6 +5483,61 @@ mod tests {
         let row = &r.rows[0];
         assert_eq!(row[1], DataValue::Bool(false), "enabled column must be false");
         assert_eq!(row[2], DataValue::Bool(true), "exists must be true (installed)");
+    }
+
+    /// F6 (TRDD-1Z8SGQ7N): the override-resolution pass must compare against
+    /// the override_status AS IT STOOD BEFORE THE SCAN, not the value the
+    /// emit loop just wrote. Scenario: scan 1 establishes user-overrides-plugin
+    /// — that emits TWO override_started (user active→overrides, plugin
+    /// active→overridden_by). Scan 2 keeps both scopes but MOVES the plugin
+    /// file — that fires a PathChanged whose emit-loop upsert overwrites the
+    /// plugin's override_status with the placeholder "active". The override
+    /// decision itself is UNCHANGED (user still wins), so scan 2 must emit NO
+    /// new override event → the total stays at 2. With the read-own-write bug
+    /// the pass read the just-written "active", saw it differ from the
+    /// resolved "overridden_by:...", and emitted a SPURIOUS third
+    /// override_started (total 3).
+    #[test]
+    fn cmd_merge_events_override_uses_pre_scan_status_not_own_write() {
+        use std::io::Cursor;
+
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+
+        let scan1 = r#"{"_pss_manifest": true, "visited_scope_paths": ["/home", "foo/skills"]}
+{"type": "skill", "name": "shared", "source": "user", "path": "/home/shared.md", "description": "user scope", "enabled": true}
+{"type": "skill", "name": "shared", "source": "plugin:foo", "path": "foo/skills/shared.md", "description": "plugin scope", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan1), true)
+            .expect("scan 1 must succeed");
+
+        // Scan 2: same two scopes, but the plugin file MOVED — forces an
+        // emit-loop event whose upsert clobbers override_status to "active".
+        let scan2 = r#"{"_pss_manifest": true, "visited_scope_paths": ["/home", "foo/skills"]}
+{"type": "skill", "name": "shared", "source": "user", "path": "/home/shared.md", "description": "user scope", "enabled": true}
+{"type": "skill", "name": "shared", "source": "plugin:foo", "path": "foo/skills/moved.md", "description": "plugin scope", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan2), true)
+            .expect("scan 2 must succeed");
+
+        let q = r#"?[count(event_id)] := *events{event_id, event_type}, event_type = "override_started""#;
+        let r = db
+            .run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+            .expect("query override_started count");
+        let n = match &r.rows[0][0] {
+            DataValue::Num(cozo::Num::Int(n)) => *n,
+            _ => -1,
+        };
+        assert_eq!(
+            n, 2,
+            "two override_started expected (both from scan 1; scan 2's move must \
+             emit none); {} means the override pass re-read its own write (F6)",
+            n
+        );
     }
 
     /// DI-2: when only ONE scope reports the element, the resolver must
