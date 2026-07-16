@@ -16011,9 +16011,15 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
             temporal::cli::cmd_reindex(&db, *dry_run);
             Ok(())
         }
-        Commands::PruneHistory { dry_run } => {
-            temporal::cli::cmd_prune_history(&db, *dry_run);
-            Ok(())
+        Commands::PruneHistory { dry_run: _ } => {
+            // Unreachable — F10 (TRDD-1Z8SGQ7N) intercepts PruneHistory in
+            // main() BEFORE run_query_command so it can hold the two F3 flocks
+            // across its event deletions (same pattern as MergeEvents and
+            // MigrateElementIds). Reaching here means that intercept was
+            // removed.
+            Err(SuggesterError::IndexParse(
+                "internal error: PruneHistory reached run_query_command".to_string(),
+            ))
         }
         Commands::MigrateElementIds {} => {
             // Unreachable — F4 (TRDD-1Z8SGQ7N) intercepts MigrateElementIds in
@@ -18975,6 +18981,38 @@ fn main() {
         // window is LONGER than merge-events' (a full-table rewrite), so the
         // race is more likely, not less. Intercepted BEFORE run_query_command
         // for the same open-after-lock reason documented on MergeEvents.
+        // F10 (TRDD-1Z8SGQ7N): prune-history is a WRITER — it deletes events
+        // older than the retention window — but it was dispatched on the
+        // unlocked run_query_command path, the same latent F3-class race that
+        // bit merge-events (a Rust writer racing the suggestion hook's LOCK_SH
+        // readers → cozo-ce "database is locked" → `.unwrap()` → SIGABRT).
+        // Same intercept, same two flocks, same order (the deadlock
+        // invariant). --dry-run only reads, but it takes the locks too: one
+        // code path beats a conditional lock, and the EX hold for its short
+        // scan just briefly queues hook readers.
+        if let Commands::PruneHistory { dry_run } = cmd {
+            let db_path = match get_db_path(cli.index.as_deref()) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "prune-history failed: no CozoDB index found (run /pss-reindex-skills first)"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let _write_guard = acquire_db_flock(&db_path, ".write.lock");
+            let _reader_guard = acquire_db_flock(&db_path, ".lock");
+            let db = match open_db(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("prune-history failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            temporal::cli::cmd_prune_history(&db, *dry_run);
+            return;
+        }
+
         if let Commands::MigrateElementIds {} = cmd {
             let db_path = match get_db_path(cli.index.as_deref()) {
                 Some(p) => p,
