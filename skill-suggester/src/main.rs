@@ -1120,9 +1120,11 @@ enum Commands {
     /// `compare_and_emit()`, persists any resulting events into the
     /// `events` table, and refreshes `elements_state`. After the stream
     /// ends, it issues a single `removed` event per element_id that is
-    /// `exists=true` in `elements_state` for one of the visited
-    /// scope_paths but was NOT observed in this scan. Finally, it records
-    /// a `scan_runs` row.
+    /// `exists=true` in `elements_state`, was NOT observed in this scan,
+    /// and that this scan covered — meaning its scope is listed in the
+    /// manifest's `exhaustive_scopes` (F7, manifest v2), or its scope_path
+    /// is one of the visited scope_paths (the manifest-v1 rule, kept for
+    /// scopes no claim covers). Finally, it records a `scan_runs` row.
     ///
     /// This is the only writer of the `events` table during normal
     /// reindex flow. Wired into `pss_reindex.py` after the existing

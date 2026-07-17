@@ -3642,6 +3642,13 @@ pub mod cli {
         let started_at = chrono::Utc::now().to_rfc3339();
         let mut observed_eids: HashSet<String> = HashSet::new();
         let mut visited_scope_paths: HashSet<String> = HashSet::new();
+        // F7 (TRDD-1Z8SGQ7N): the scopes THIS scan claims to have enumerated
+        // exhaustively. Only the discoverer knows whether a run was complete,
+        // so it says so on the manifest and we take it at its word — that is
+        // the ONLY signal that can authorize removing an element whose
+        // scope_path produced zero observations (a scope root that vanished,
+        // or one still present but emptied of elements).
+        let mut exhaustive_scopes: HashSet<String> = HashSet::new();
         let mut events_emitted: u64 = 0;
         let mut lines_read: u64 = 0;
         // Group observations per (element_type, name) so override
@@ -3673,6 +3680,17 @@ pub mod cli {
                     for sp in arr {
                         if let Some(s) = sp.as_str() {
                             visited_scope_paths.insert(s.to_string());
+                        }
+                    }
+                }
+                // F7 (TRDD-1Z8SGQ7N): manifest v2 adds the domain-level coverage
+                // claim. Absent key ⇒ empty set ⇒ v1 behavior, unchanged. A
+                // string naming no real scope is harmless: it simply matches no
+                // element, so garbage under-claims rather than over-deletes.
+                if let Some(arr) = value.get("exhaustive_scopes").and_then(|v| v.as_array()) {
+                    for s in arr {
+                        if let Some(s) = s.as_str() {
+                            exhaustive_scopes.insert(s.to_string());
                         }
                     }
                 }
@@ -3932,10 +3950,11 @@ pub mod cli {
             }
         }
 
-        // Detect removals: anything in elements_state with exists=true
-        // whose scope_path is in visited_scope_paths but whose
-        // element_id was NOT observed this scan.
-        let prior_active = read_active_in_scope_paths(db, &visited_scope_paths)?;
+        // Detect removals: anything in elements_state with exists=true that
+        // this scan covered (see read_removal_candidates) but whose element_id
+        // was NOT observed.
+        let prior_active =
+            read_removal_candidates(db, &visited_scope_paths, &exhaustive_scopes)?;
         let removed = detect_removals(&prior_active, &observed_eids);
         for eid in &removed {
             // Read the prior obs metadata to attach to the removal event.
@@ -4006,8 +4025,18 @@ pub mod cli {
         Ok(())
     }
 
-    /// Read element_ids that are currently `exists=true` in the given
-    /// set of scope_paths. Used by removal detection.
+    /// Read the element_ids that are currently `exists=true` AND that this
+    /// scan actually covered — i.e. the ones for which "not observed" is
+    /// evidence of removal rather than evidence of not having looked.
+    ///
+    /// F7 (TRDD-1Z8SGQ7N): coverage used to be `scope_path ∈ visited`, and
+    /// `visited` is built ONLY from elements that still exist (both from the
+    /// manifest and from each observation). So a scope that yielded ZERO
+    /// elements never entered the set and its stale rows were never even
+    /// considered — measured live: 799 genuinely-gone elements, of which the
+    /// old policy removed 1. Coverage is therefore taken from the scan's
+    /// explicit per-scope claim (`exhaustive_scopes`), which is independent of
+    /// the results and so survives a scope root vanishing entirely.
     ///
     /// DI-4 (code-review pass, 20260713): this used to issue ONE query for
     /// the active element_ids, then a SEPARATE per-element_id query
@@ -4018,9 +4047,10 @@ pub mod cli {
     /// aggregate RFC3339 strings — see the `as_of_rows` comment above for
     /// why the sort+take-first pattern is used throughout this file instead
     /// of an aggregate).
-    fn read_active_in_scope_paths(
+    fn read_removal_candidates(
         db: &DbInstance,
         scope_paths: &std::collections::HashSet<String>,
+        exhaustive_scopes: &std::collections::HashSet<String>,
     ) -> Result<std::collections::HashSet<String>, String> {
         let active_q = r#"
             ?[element_id] := *elements_state{element_id, exists: true}
@@ -4040,12 +4070,14 @@ pub mod cli {
             return Ok(std::collections::HashSet::new());
         }
 
-        // scope_path lives in the events table, not elements_state —
-        // resolve it from the most recent event for each element_id via
-        // one bulk scan instead of one query per active id.
+        // scope and scope_path live in the events table, not elements_state —
+        // resolve both from the most recent event for each element_id via
+        // one bulk scan instead of one query per active id. `scope` rides the
+        // SAME projection (F7) precisely so the domain claim costs no extra
+        // round-trip.
         let events_q = r#"
-            ?[element_id, scope_path, observed_at] :=
-                *events{element_id, scope_path, observed_at}
+            ?[element_id, scope, scope_path, observed_at] :=
+                *events{element_id, scope, scope_path, observed_at}
             :order element_id, -observed_at
         "#;
         let event_rows = db
@@ -4054,7 +4086,7 @@ pub mod cli {
             .rows;
         // Rows are sorted (element_id asc, observed_at desc), so the FIRST
         // row seen per element_id is the most recent event for it.
-        let mut latest_scope: std::collections::HashMap<String, String> =
+        let mut latest_scope: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
         for row in event_rows {
             let eid = match row.first() {
@@ -4064,16 +4096,27 @@ pub mod cli {
             if !active_ids.contains(&eid) || latest_scope.contains_key(&eid) {
                 continue;
             }
-            let sp = match row.get(1) {
+            let scope = match row.get(1) {
                 Some(v) => data_str(v),
                 None => continue,
             };
-            latest_scope.insert(eid, sp);
+            let sp = match row.get(2) {
+                Some(v) => data_str(v),
+                None => continue,
+            };
+            latest_scope.insert(eid, (scope, sp));
         }
 
         let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (eid, sp) in latest_scope {
-            if scope_paths.contains(&sp) {
+        for (eid, (scope, sp)) in latest_scope {
+            // F7: an element is a removal candidate if EITHER
+            //  (a) this scan claims it enumerated all of that element's scope —
+            //      which catches a scope whose root vanished AND one whose root
+            //      still exists but now yields nothing; or
+            //  (b) [manifest-v1 path] its scope_path was visited this scan.
+            // (a) subsumes (b) for claimed scopes; (b) is kept so a v1 manifest,
+            // or a filtered run that claims nothing, behaves exactly as before.
+            if exhaustive_scopes.contains(&scope) || scope_paths.contains(&sp) {
                 out.insert(eid);
             }
         }
@@ -6965,6 +7008,200 @@ mod tests {
             -1
         };
         assert_eq!(count, 0, "single-scope element must not produce override_started");
+    }
+
+    // ========================================================================
+    // F7 (TRDD-1Z8SGQ7N): manifest v2 `exhaustive_scopes` — full-scope removal
+    // ========================================================================
+
+    /// Names of every element that got a `removed` event, sorted. Datalog set
+    /// semantics dedupe the projection, so one name per removed element.
+    fn removed_element_names(db: &DbInstance) -> Vec<String> {
+        let q = r#"
+            ?[element_name] :=
+                *events{element_name, event_type},
+                event_type = "removed"
+        "#;
+        let r = db
+            .run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+            .expect("query removed events");
+        let mut names: Vec<String> = r
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(DataValue::Str(s)) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn mem_db_with_metadata() -> DbInstance {
+        let db = DbInstance::new("mem", "", "").expect("mem db");
+        let _ = db.run_script(
+            r#":create pss_metadata { key: String => value: String }"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
+        db
+    }
+
+    /// F7 shape 1 — the scope ROOT VANISHED (`kazuph-dotfiles` et al.: gone from
+    /// `~/.claude/plugins/marketplaces/`). Its elements produce no observation
+    /// AND its scope_path can no longer be enumerated from the filesystem, so
+    /// every result-derived coverage set misses it and its rows stay
+    /// `exists=true` forever. This is the F7 regression test: it MUST fail
+    /// before the fix (799 such zombies measured live; the old policy caught 1).
+    #[test]
+    fn manifest_v2_exhaustive_scope_removes_element_in_vanished_scope() {
+        use std::io::Cursor;
+
+        let db = mem_db_with_metadata();
+
+        let scan1 = r#"{"_pss_manifest": true, "_pss_manifest_version": 2, "visited_scope_paths": ["gone-mp", "live-mp"], "exhaustive_scopes": ["marketplace"]}
+{"type": "skill", "name": "doomed", "source": "marketplace:gone-mp", "path": "gone-mp/skills/doomed.md", "description": "in the marketplace about to vanish", "enabled": true}
+{"type": "skill", "name": "survivor", "source": "marketplace:live-mp", "path": "live-mp/skills/survivor.md", "description": "in a marketplace that stays", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan1), true).expect("scan 1");
+
+        // Scan 2: `gone-mp` is gone from disk — zero observations for it, and
+        // it is absent from visited_scope_paths (the discoverer builds that
+        // only from surviving elements). Only the domain-level claim
+        // `exhaustive_scopes:["marketplace"]` can authorize the sweep.
+        let scan2 = r#"{"_pss_manifest": true, "_pss_manifest_version": 2, "visited_scope_paths": ["live-mp"], "exhaustive_scopes": ["marketplace"]}
+{"type": "skill", "name": "survivor", "source": "marketplace:live-mp", "path": "live-mp/skills/survivor.md", "description": "in a marketplace that stays", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan2), true).expect("scan 2");
+
+        assert_eq!(
+            removed_element_names(&db),
+            vec!["doomed".to_string()],
+            "an exhaustive `marketplace` scan that did not observe `doomed` must \
+             remove it even though its scope_path is unenumerable (root gone)"
+        );
+    }
+
+    /// F7 shape 2 — the scope root is STILL PRESENT but now yields ZERO elements
+    /// (`melodic-software`: dir and marketplace.json intact, content swapped to
+    /// 4 formatter plugins; all 599 skills stranded at the seed scan). Identical
+    /// blindness to shape 1: no observation ⇒ the scope_path never enters any
+    /// result-derived set. Seeds two elements so the assertion proves the whole
+    /// bucket is swept, which is the signature of full-scope removal.
+    #[test]
+    fn manifest_v2_exhaustive_scope_removes_element_in_present_but_empty_scope() {
+        use std::io::Cursor;
+
+        let db = mem_db_with_metadata();
+
+        let scan1 = r#"{"_pss_manifest": true, "_pss_manifest_version": 2, "visited_scope_paths": ["emptied-mp", "live-mp"], "exhaustive_scopes": ["marketplace"]}
+{"type": "skill", "name": "stranded-one", "source": "marketplace:emptied-mp", "path": "emptied-mp/skills/one.md", "description": "seeded then never seen again", "enabled": true}
+{"type": "agent", "name": "stranded-two", "source": "marketplace:emptied-mp", "path": "emptied-mp/agents/two.md", "description": "seeded then never seen again", "enabled": true}
+{"type": "skill", "name": "survivor", "source": "marketplace:live-mp", "path": "live-mp/skills/survivor.md", "description": "in a marketplace that stays", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan1), true).expect("scan 1");
+
+        let scan2 = r#"{"_pss_manifest": true, "_pss_manifest_version": 2, "visited_scope_paths": ["live-mp"], "exhaustive_scopes": ["marketplace"]}
+{"type": "skill", "name": "survivor", "source": "marketplace:live-mp", "path": "live-mp/skills/survivor.md", "description": "in a marketplace that stays", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan2), true).expect("scan 2");
+
+        assert_eq!(
+            removed_element_names(&db),
+            vec!["stranded-one".to_string(), "stranded-two".to_string()],
+            "every element of an emptied marketplace must be swept, and the \
+             surviving marketplace's element must not be touched"
+        );
+    }
+
+    /// F7 negative guard — the claim is per-scope, so an UNCLAIMED scope keeps
+    /// today's scope_path-membership rule. A `marketplace`-only claim must not
+    /// reach into `plugin` rows: over-reaching here would delete real history
+    /// for a scope the scan never promised to have enumerated.
+    #[test]
+    fn manifest_v2_does_not_remove_element_of_unclaimed_scope() {
+        use std::io::Cursor;
+
+        let db = mem_db_with_metadata();
+
+        let scan1 = r#"{"_pss_manifest": true, "_pss_manifest_version": 2, "visited_scope_paths": ["foo", "live-mp"], "exhaustive_scopes": ["marketplace", "plugin"]}
+{"type": "skill", "name": "plug-skill", "source": "plugin:foo", "path": "foo/skills/plug.md", "description": "plugin scope", "enabled": true}
+{"type": "skill", "name": "mkt-skill", "source": "marketplace:live-mp", "path": "live-mp/skills/mkt.md", "description": "marketplace scope", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan1), true).expect("scan 1");
+
+        // Scan 2 claims ONLY `marketplace` (e.g. a plugin-filtered run), and
+        // does not observe the plugin element. `plugin` is unclaimed and
+        // scope_path "foo" is unvisited ⇒ plug-skill must survive.
+        let scan2 = r#"{"_pss_manifest": true, "_pss_manifest_version": 2, "visited_scope_paths": ["live-mp"], "exhaustive_scopes": ["marketplace"]}
+{"type": "skill", "name": "mkt-skill", "source": "marketplace:live-mp", "path": "live-mp/skills/mkt.md", "description": "marketplace scope", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan2), true).expect("scan 2");
+
+        assert!(
+            removed_element_names(&db).is_empty(),
+            "a marketplace-only claim must not remove a plugin-scoped element; got {:?}",
+            removed_element_names(&db)
+        );
+    }
+
+    /// F7 back-compat — a manifest with NO `exhaustive_scopes` key (v1, or an
+    /// older discoverer) must behave byte-for-byte as before: only elements
+    /// whose scope_path was visited this scan are removal candidates.
+    /// `foo-second` (visited scope_path, unobserved) goes; `bar-only`
+    /// (unvisited scope_path) stays.
+    #[test]
+    fn manifest_v1_behavior_unchanged() {
+        use std::io::Cursor;
+
+        let db = mem_db_with_metadata();
+
+        let scan1 = r#"{"_pss_manifest": true, "visited_scope_paths": ["foo", "bar"]}
+{"type": "skill", "name": "foo-first", "source": "plugin:foo", "path": "foo/skills/first.md", "description": "stays", "enabled": true}
+{"type": "skill", "name": "foo-second", "source": "plugin:foo", "path": "foo/skills/second.md", "description": "goes away", "enabled": true}
+{"type": "skill", "name": "bar-only", "source": "plugin:bar", "path": "bar/skills/only.md", "description": "unvisited next scan", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan1), true).expect("scan 1");
+
+        let scan2 = r#"{"_pss_manifest": true, "visited_scope_paths": ["foo"]}
+{"type": "skill", "name": "foo-first", "source": "plugin:foo", "path": "foo/skills/first.md", "description": "stays", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan2), true).expect("scan 2");
+
+        assert_eq!(
+            removed_element_names(&db),
+            vec!["foo-second".to_string()],
+            "v1 manifest must keep the scope_path-membership rule exactly: \
+             partial removal detected, unvisited scope untouched"
+        );
+    }
+
+    /// F7 back-compat — the key present but EMPTY claims nothing, and must be
+    /// indistinguishable from a v1 manifest. This is what every filtered run
+    /// (`--name`, `--type`, `--project-only`) emits, so it is the common path.
+    #[test]
+    fn empty_exhaustive_scopes_is_a_no_op() {
+        use std::io::Cursor;
+
+        let db = mem_db_with_metadata();
+
+        let scan1 = r#"{"_pss_manifest": true, "_pss_manifest_version": 2, "visited_scope_paths": ["foo", "bar"], "exhaustive_scopes": []}
+{"type": "skill", "name": "foo-first", "source": "plugin:foo", "path": "foo/skills/first.md", "description": "stays", "enabled": true}
+{"type": "skill", "name": "foo-second", "source": "plugin:foo", "path": "foo/skills/second.md", "description": "goes away", "enabled": true}
+{"type": "skill", "name": "bar-only", "source": "plugin:bar", "path": "bar/skills/only.md", "description": "unvisited next scan", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan1), true).expect("scan 1");
+
+        let scan2 = r#"{"_pss_manifest": true, "_pss_manifest_version": 2, "visited_scope_paths": ["foo"], "exhaustive_scopes": []}
+{"type": "skill", "name": "foo-first", "source": "plugin:foo", "path": "foo/skills/first.md", "description": "stays", "enabled": true}
+"#;
+        cli::merge_events_from_reader(&db, Cursor::new(scan2), true).expect("scan 2");
+
+        assert_eq!(
+            removed_element_names(&db),
+            vec!["foo-second".to_string()],
+            "an empty claim must reproduce v1 behavior exactly (claim nothing)"
+        );
     }
 
     // ========================================================================
