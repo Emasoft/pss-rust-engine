@@ -14582,6 +14582,31 @@ const CONTRACT_VERSION: &str = "1";
 /// defeat the entire purpose of the subcommand. Hence this sibling helper
 /// always returns the resolved `PathBuf`.
 fn resolve_db_path_canonical(cli_index: Option<&str>) -> PathBuf {
+    let env_index = std::env::var("PSS_INDEX_PATH").ok();
+    resolve_db_path_canonical_gated(cli_index, env_index.as_deref())
+}
+
+/// The pure decision behind [`resolve_db_path_canonical`], with the env value
+/// passed IN rather than read from the process environment, so it is testable
+/// without `std::env::set_var` (process-global ⇒ racy under cargo's threaded
+/// harness). F14 (TRDD-1Z8SGQ7N): mirrors what F12 did for `get_db_path` /
+/// `resolve_db_path_gated` — pre-F14 the one existing test of this resolver
+/// SKIPPED whenever PSS_INDEX_PATH was set, the exact coverage hole that let
+/// F12 survive.
+///
+/// Deliberate properties (verbatim from the pre-F14 body — do NOT "fix"):
+///
+///   1. NO existence gate — this is the `db-path` subcommand's resolver; it
+///      reports the path PSS *would* use even before the file exists (see the
+///      doc-comment on the wrapper).
+///   2. The `.db` ASYMMETRY — `--index x.db` → `x.db` itself, but
+///      `PSS_INDEX_PATH=x.db` → the SIBLING `pss-skill-index.db`. Mirrored in
+///      `scripts/pss_cozodb.py` L150-153 and enforced by
+///      `tests/unit/test_pss_db_path_parity.py`.
+///   3. `--index ""` FALLS THROUGH to env → home default (see the inline
+///      comment in branch 1) — a documented divergence from the runtime
+///      resolver, pinned by `f14_cli_empty_index_falls_through_to_env_then_home`.
+fn resolve_db_path_canonical_gated(cli_index: Option<&str>, env_index: Option<&str>) -> PathBuf {
     // 1. Explicit --index.
     if let Some(path) = cli_index {
         if path.ends_with(".db") {
@@ -14592,12 +14617,24 @@ fn resolve_db_path_canonical(cli_index: Option<&str>) -> PathBuf {
         if let Some(parent) = json_path.parent() {
             return parent.join(DB_FILE);
         }
+        // `--index ""` reaches here (no `.db` suffix, and `Path::new("")`
+        // has no parent) and FALLS THROUGH to env → home default. This
+        // deliberately DIVERGES from the runtime resolver
+        // (`resolve_db_path_gated` returns None for the same input) —
+        // TRDD-1Z8SGQ7N F12 residual (a): a KNOWN, accepted divergence, only
+        // reachable by explicitly passing an empty flag, and
+        // `get_index_path("")` already errors on the JSON side. Keep it —
+        // changing it must be a conscious decision, not a refactor accident.
     }
 
-    // 2. PSS_INDEX_PATH env var → sibling DB in its directory.
-    if let Ok(path) = std::env::var("PSS_INDEX_PATH") {
+    // 2. PSS_INDEX_PATH env var → sibling DB in its directory. An empty value
+    //    means "unset" (`std::env::var` yields Ok("") for an
+    //    exported-but-empty var), so only a non-empty value engages this
+    //    branch. NOTE: no `.ends_with(".db")` shortcut here — the env branch
+    //    always takes the sibling (deliberate property 2 above).
+    if let Some(path) = env_index {
         if !path.is_empty() {
-            let json_path = PathBuf::from(&path);
+            let json_path = PathBuf::from(path);
             if let Some(parent) = json_path.parent() {
                 return parent.join(DB_FILE);
             }
@@ -22546,40 +22583,48 @@ mediapipe>=0.10
     // Issue #10 wave 1 — P-2 (db-path), P-6 (project-slug), P-9 (--contract-version)
     // ========================================================================
 
-    /// P-2: `resolve_db_path_canonical` honors an explicit `--index` that already
-    /// points at a `.db` file (returns it verbatim, no existence gate — a
-    /// `db-path` consumer wants the path it WOULD use, even before the file
-    /// exists).
+    /// P-2 / F14: `resolve_db_path_canonical_gated` honors an explicit `--index`
+    /// that already points at a `.db` file (returns it verbatim, no existence
+    /// gate — a `db-path` consumer wants the path it WOULD use, even before the
+    /// file exists). Also smoke-tests the thin wrapper: the CLI `.db` branch
+    /// wins before the env value can matter, so the wrapper call is
+    /// deterministic regardless of whatever PSS_INDEX_PATH holds.
     #[test]
     fn resolve_db_path_canonical_uses_explicit_db_file() {
-        let p = resolve_db_path_canonical(Some("/some/where/custom.db"));
+        let p = resolve_db_path_canonical_gated(Some("/some/where/custom.db"), None);
         assert_eq!(p, PathBuf::from("/some/where/custom.db"));
+        // Wrapper smoke assertion (env-independent for this input).
+        let w = resolve_db_path_canonical(Some("/some/where/custom.db"));
+        assert_eq!(w, PathBuf::from("/some/where/custom.db"));
     }
 
-    /// P-2: an explicit `--index` pointing at a JSON file derives the sibling DB
-    /// in the same directory using DB_FILE.
+    /// P-2 / F14: an explicit `--index` pointing at a JSON file derives the
+    /// sibling DB in the same directory using DB_FILE.
     #[test]
     fn resolve_db_path_canonical_derives_sibling_db_from_json() {
-        let p = resolve_db_path_canonical(Some("/tmp/pss/skill-index.json"));
+        let p = resolve_db_path_canonical_gated(Some("/tmp/pss/skill-index.json"), None);
         assert_eq!(p, PathBuf::from("/tmp/pss").join(DB_FILE));
     }
 
-    /// P-2: with no `--index` and no PSS_INDEX_PATH, the default is
-    /// `~/.claude/cache/pss-skill-index.db`.
+    /// P-2 / F14: with no `--index` and no PSS_INDEX_PATH, the default is
+    /// `~/.claude/cache/pss-skill-index.db`. Pre-F14 this test SKIPPED its
+    /// assertion whenever PSS_INDEX_PATH was set (the exact coverage hole that
+    /// let F12 survive); the pure helper takes the env value as a parameter, so
+    /// the test now ALWAYS asserts. Only the machine-independent suffix is
+    /// checked so the test passes on any home dir.
     #[test]
     fn resolve_db_path_canonical_default_is_home_cache_db() {
-        // Guard: only assert when a home dir is resolvable (always true in CI).
+        let p = resolve_db_path_canonical_gated(None, None);
+        let expected_suffix = PathBuf::from(".claude").join(CACHE_DIR).join(DB_FILE);
+        assert!(
+            p.ends_with(&expected_suffix),
+            "default must end with {:?}, got {:?}",
+            expected_suffix,
+            p
+        );
+        // When a home dir resolves (always true in CI), pin the full path too.
         if let Some(home) = dirs::home_dir() {
-            // Ensure no env override interferes with the default branch.
-            // (cargo test runs single-threaded per test process for env safety
-            //  is NOT guaranteed; we therefore only assert the suffix shape,
-            //  which is independent of any PSS_INDEX_PATH value.)
-            let expected = home.join(".claude").join(CACHE_DIR).join(DB_FILE);
-            // When PSS_INDEX_PATH is unset, the function returns `expected`.
-            if std::env::var_os("PSS_INDEX_PATH").is_none() {
-                let p = resolve_db_path_canonical(None);
-                assert_eq!(p, expected);
-            }
+            assert_eq!(p, home.join(".claude").join(CACHE_DIR).join(DB_FILE));
         }
     }
 
@@ -22731,6 +22776,89 @@ mediapipe>=0.10
             Some(default) if default.exists() => assert_eq!(got, Some(default)),
             _ => assert_eq!(got, None, "absent default must be gated to None"),
         }
+    }
+
+    // ========================================================================
+    // F14 (TRDD-1Z8SGQ7N) — `resolve_db_path_canonical` made env-testable.
+    //
+    // These drive `resolve_db_path_canonical_gated` (the pure decision) so no
+    // test reads or mutates PSS_INDEX_PATH — `std::env::set_var` is
+    // process-global and cargo runs tests on threads, so env-mutating tests
+    // race each other AND every other test that reads the same var. Unlike the
+    // f12_* family no scratch files are needed: the canonical resolver has NO
+    // existence gate (it reports the path PSS *would* use), so plain string
+    // paths suffice.
+    // ========================================================================
+
+    /// F14 test 1: `PSS_INDEX_PATH=<json>` resolves to the sibling
+    /// `pss-skill-index.db` in the JSON's directory — ungated (no file needed).
+    #[test]
+    fn f14_env_override_derives_sibling_db_from_json() {
+        let got =
+            resolve_db_path_canonical_gated(None, Some("/tmp/pss-f14-scratch/skill-index.json"));
+        assert_eq!(got, PathBuf::from("/tmp/pss-f14-scratch").join(DB_FILE));
+    }
+
+    /// F14 test 2 (asymmetry, env half): `PSS_INDEX_PATH=<x.db>` still resolves
+    /// to the SIBLING `pss-skill-index.db`, ignoring the given filename.
+    /// Deliberately unlike the CLI branch — `scripts/pss_cozodb.py` L150-153
+    /// mirrors this asymmetry and `test_pss_db_path_parity.py` enforces it.
+    #[test]
+    fn f14_env_index_pointing_at_db_file_still_uses_sibling() {
+        let got = resolve_db_path_canonical_gated(None, Some("/tmp/pss-f14-scratch/custom.db"));
+        assert_eq!(got, PathBuf::from("/tmp/pss-f14-scratch").join(DB_FILE));
+    }
+
+    /// F14 test 3: `--index` outranks `PSS_INDEX_PATH` — the documented
+    /// `--index` → `PSS_INDEX_PATH` → default resolution order.
+    #[test]
+    fn f14_cli_override_wins_over_env_override() {
+        let got = resolve_db_path_canonical_gated(
+            Some("/cli/dir/skill-index.json"),
+            Some("/env/dir/skill-index.json"),
+        );
+        assert_eq!(got, PathBuf::from("/cli/dir").join(DB_FILE));
+    }
+
+    /// F14 test 4: an empty PSS_INDEX_PATH is treated as unset (`std::env::var`
+    /// yields Ok("") for an exported-but-empty var) ⇒ home default.
+    #[test]
+    fn f14_empty_env_is_treated_as_unset() {
+        let got = resolve_db_path_canonical_gated(None, Some(""));
+        let expected_suffix = PathBuf::from(".claude").join(CACHE_DIR).join(DB_FILE);
+        assert!(
+            got.ends_with(&expected_suffix),
+            "empty env must fall to the home default, got {:?}",
+            got
+        );
+    }
+
+    /// F14 test 5 (THE pinned divergence): `--index ""` FALLS THROUGH to env →
+    /// home default. The empty string has no `.db` suffix and
+    /// `Path::new("").parent()` is None, so the CLI branch exits without
+    /// returning. This deliberately DIVERGES from the runtime resolver
+    /// (`resolve_db_path_gated` returns None there) — TRDD-1Z8SGQ7N F12
+    /// residual (a): a KNOWN, documented, accepted divergence, only reachable
+    /// by explicitly passing an empty flag, and `get_index_path("")` already
+    /// errors on the JSON side. Any future change to this behavior must be a
+    /// conscious decision, not a refactor accident.
+    #[test]
+    fn f14_cli_empty_index_falls_through_to_env_then_home() {
+        // Half A: with an env override present, the fall-through lands on it.
+        let with_env = resolve_db_path_canonical_gated(
+            Some(""),
+            Some("/tmp/pss-f14-scratch/skill-index.json"),
+        );
+        assert_eq!(with_env, PathBuf::from("/tmp/pss-f14-scratch").join(DB_FILE));
+
+        // Half B: with no env override, it lands on the home default.
+        let no_env = resolve_db_path_canonical_gated(Some(""), None);
+        let expected_suffix = PathBuf::from(".claude").join(CACHE_DIR).join(DB_FILE);
+        assert!(
+            no_env.ends_with(&expected_suffix),
+            "--index \"\" must fall through to the home default, got {:?}",
+            no_env
+        );
     }
 
     /// P-2: the bare (non-JSON) output is exactly the resolved path on one line.
