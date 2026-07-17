@@ -14486,38 +14486,75 @@ fn extract_use_context_from_body(body: &str) -> String {
 // ============================================================================
 
 /// Resolve the CozoDB index path. Returns None if the DB file does not exist.
-/// Derives from the JSON index path by replacing .json with .db extension.
+/// Derives from a JSON index path by taking the sibling `DB_FILE` in its
+/// directory (NOT by swapping the `.json` extension — the DB filename is fixed).
+///
+/// Resolution order: `--index` → `PSS_INDEX_PATH` → `~/.claude/cache/<DB_FILE>`.
+///
+/// An explicit override (`--index` / `PSS_INDEX_PATH`) is AUTHORITATIVE, never a
+/// hint: when one is set this resolves ONLY from it and returns None if that does
+/// not land on an existing file. It must NEVER fall through to a lower-priority
+/// source. This is F12 of TRDD-1Z8SGQ7N, and the "why" is not theoretical: the
+/// old code had no `else` on either override branch, so during F7 development an
+/// agent pointed `PSS_INDEX_PATH` at a scratch dir whose DB had a different
+/// filename — the sibling `pss-skill-index.db` did not exist, the override was
+/// silently discarded, resolution fell through to the home default, and
+/// `merge-events` wrote 1368 events (800 of them removals) into the USER'S REAL
+/// INDEX, which had to be restored from a snapshot. A silently-ignored override
+/// aims a destructive writer at whatever the fallback happens to be. Returning
+/// None instead is safe at every call site: the writers (merge-events,
+/// prune-history, migrate-element-ids) eprintln + exit, and the readers either
+/// raise IndexNotFound or fall back to the JSON index — which `get_index_path`
+/// resolves from the SAME override, so they can never silently read the real
+/// index either.
 fn get_db_path(cli_index: Option<&str>) -> Option<PathBuf> {
-    // If --index explicitly points to a .db file, use it directly
+    let env_index = std::env::var("PSS_INDEX_PATH").ok();
+    resolve_db_path_gated(cli_index, env_index.as_deref())
+}
+
+/// The pure decision behind [`get_db_path`], with the env value passed IN rather
+/// than read from the process environment, so it is testable without
+/// `std::env::set_var` (process-global ⇒ racy under cargo's threaded harness).
+///
+/// The two override branches look near-identical but are ASYMMETRIC ON PURPOSE
+/// and must not be merged into one shared helper:
+///
+///   * `--index x.db`        → `x.db` ITSELF
+///   * `PSS_INDEX_PATH=x.db` → the SIBLING `<dir>/pss-skill-index.db`
+///
+/// `resolve_db_path_canonical` and the Python twin (`scripts/pss_cozodb.py`
+/// L150-153) implement the same asymmetry, and `tests/unit/test_pss_db_path_parity.py`
+/// enforces the Rust↔Python parity. Unifying the branches would silently break it.
+fn resolve_db_path_gated(cli_index: Option<&str>, env_index: Option<&str>) -> Option<PathBuf> {
+    // 1. --index — authoritative when present: resolve from it or give up (None).
     if let Some(path) = cli_index {
+        // An --index that already names a .db file IS the DB (no sibling lookup).
         if path.ends_with(".db") {
             let p = PathBuf::from(path);
             return if p.exists() { Some(p) } else { None };
         }
-        // Derive DB path: same directory as JSON, using DB_FILE name
-        let json_path = PathBuf::from(path);
-        if let Some(parent) = json_path.parent() {
-            let db_path = parent.join(DB_FILE);
-            if db_path.exists() {
-                return Some(db_path);
-            }
-        }
+        // Otherwise it is the JSON index: take the sibling DB in its directory.
+        // `parent()` is None only for the degenerate empty string; that is a
+        // malformed override, and per the authority rule it yields None rather
+        // than deferring to the env var or the home default.
+        let db_path = PathBuf::from(path).parent()?.join(DB_FILE);
+        return if db_path.exists() { Some(db_path) } else { None };
     }
 
-    // Check PSS_INDEX_PATH env var — derive DB path from same directory
-    if let Ok(path) = std::env::var("PSS_INDEX_PATH") {
+    // 2. PSS_INDEX_PATH — likewise authoritative. An empty value means "unset"
+    //    (`std::env::var` yields Ok("") for an exported-but-empty var), so only a
+    //    non-empty value engages this branch.
+    if let Some(path) = env_index {
         if !path.is_empty() {
-            let json_path = PathBuf::from(&path);
-            if let Some(parent) = json_path.parent() {
-                let db_path = parent.join(DB_FILE);
-                if db_path.exists() {
-                    return Some(db_path);
-                }
-            }
+            // NOTE: no `.ends_with(".db")` shortcut here — see the asymmetry note
+            //       on this function. The env branch always takes the sibling.
+            let db_path = PathBuf::from(path).parent()?.join(DB_FILE);
+            return if db_path.exists() { Some(db_path) } else { None };
         }
     }
 
-    // Default: ~/.claude/cache/pss-skill-index.db
+    // 3. Default: ~/.claude/cache/pss-skill-index.db — reached only when NO
+    //    override was supplied.
     let home = dirs::home_dir()?;
     let db_path = home.join(".claude").join(CACHE_DIR).join(DB_FILE);
     if db_path.exists() { Some(db_path) } else { None }
@@ -22543,6 +22580,156 @@ mediapipe>=0.10
                 let p = resolve_db_path_canonical(None);
                 assert_eq!(p, expected);
             }
+        }
+    }
+
+    // ========================================================================
+    // F12 (TRDD-1Z8SGQ7N) — an explicit DB-path override is AUTHORITATIVE.
+    //
+    // These drive `resolve_db_path_gated` (the pure decision) instead of
+    // `get_db_path`, so no test mutates PSS_INDEX_PATH: `std::env::set_var` is
+    // process-global and cargo runs tests on threads, so env-mutating tests
+    // race each other AND every other test that reads the same var.
+    // ========================================================================
+
+    /// Scratch directory that deletes itself on drop. Hand-rolled because the
+    /// crate has no `tempfile` dev-dependency and F12's scope is main.rs only.
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "pss-f12-{}-{}-{}",
+                tag,
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).expect("create scratch dir");
+            TmpDir(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Create an empty file inside the scratch dir and return its path.
+        /// Only `.exists()` is ever consulted, so the content is irrelevant.
+        fn touch(&self, name: &str) -> PathBuf {
+            let p = self.0.join(name);
+            fs::write(&p, b"").expect("touch scratch file");
+            p
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// F12 test 1 (THE regression test): `PSS_INDEX_PATH` pointing at a directory
+    /// with NO sibling DB must resolve to None — NOT to the user's real index at
+    /// `~/.claude/cache/pss-skill-index.db`. This is the exact shape that wrote
+    /// 1368 events into a live index during F7 development.
+    #[test]
+    fn f12_env_override_without_sibling_db_is_none_not_home_default() {
+        let tmp = TmpDir::new("env-no-db");
+        let env_json = tmp.path().join("some-other-name.json");
+
+        let got = resolve_db_path_gated(None, Some(env_json.to_str().unwrap()));
+
+        assert_eq!(
+            got, None,
+            "an override that does not resolve must yield None; it leaked to {:?} \
+             — a tool aimed at a scratch DB would read/WRITE the user's real index",
+            got
+        );
+    }
+
+    /// F12 test 2: `PSS_INDEX_PATH` pointing at a directory that DOES hold a
+    /// sibling `pss-skill-index.db` resolves to that sibling.
+    #[test]
+    fn f12_env_override_with_sibling_db_resolves_to_sibling() {
+        let tmp = TmpDir::new("env-with-db");
+        let db = tmp.touch(DB_FILE);
+        let env_json = tmp.path().join("skill-index.json");
+
+        let got = resolve_db_path_gated(None, Some(env_json.to_str().unwrap()));
+
+        assert_eq!(got, Some(db));
+    }
+
+    /// F12 test 3: `--index` outranks `PSS_INDEX_PATH`. An `--index` whose sibling
+    /// DB is absent must yield None even when the env override points at a valid
+    /// DB — deferring to the env var would be a priority inversion of the
+    /// documented `--index` → `PSS_INDEX_PATH` → default order.
+    #[test]
+    fn f12_cli_override_does_not_defer_to_env_override() {
+        let cli_dir = TmpDir::new("cli-no-db"); // no DB here
+        let env_dir = TmpDir::new("env-valid-db");
+        env_dir.touch(DB_FILE); // ...but a perfectly good DB here
+
+        let cli_json = cli_dir.path().join("skill-index.json");
+        let env_json = env_dir.path().join("skill-index.json");
+
+        let got = resolve_db_path_gated(
+            Some(cli_json.to_str().unwrap()),
+            Some(env_json.to_str().unwrap()),
+        );
+
+        assert_eq!(
+            got, None,
+            "--index must be authoritative; it resolved to {:?} instead",
+            got
+        );
+    }
+
+    /// F12 test 4 (asymmetry, CLI half): `--index <x.db>` resolves to `x.db`
+    /// ITSELF, not to a sibling `pss-skill-index.db`.
+    #[test]
+    fn f12_cli_index_pointing_at_db_file_uses_that_file() {
+        let tmp = TmpDir::new("cli-db-file");
+        let custom = tmp.touch("custom.db");
+        // A sibling exists too — proving the CLI branch ignores it.
+        tmp.touch(DB_FILE);
+
+        let got = resolve_db_path_gated(Some(custom.to_str().unwrap()), None);
+
+        assert_eq!(got, Some(custom));
+    }
+
+    /// F12 test 5 (asymmetry, env half): `PSS_INDEX_PATH=<x.db>` resolves to the
+    /// SIBLING `pss-skill-index.db`, ignoring the given filename. Deliberately
+    /// unlike the CLI branch above — `scripts/pss_cozodb.py` L150-153 mirrors this
+    /// asymmetry on purpose, and `test_pss_db_path_parity.py` enforces it.
+    #[test]
+    fn f12_env_index_pointing_at_db_file_still_uses_sibling() {
+        let tmp = TmpDir::new("env-db-file");
+        let custom = tmp.touch("custom.db");
+        let sibling = tmp.touch(DB_FILE);
+
+        let got = resolve_db_path_gated(None, Some(custom.to_str().unwrap()));
+
+        assert_eq!(
+            got,
+            Some(sibling),
+            "the env branch must ignore the given .db filename and take the sibling"
+        );
+    }
+
+    /// F12 test 6: with no override at all, the default branch keeps its existence
+    /// gate — Some(path) when `~/.claude/cache/pss-skill-index.db` is present,
+    /// None when it is not (a legitimate first run). Unchanged by F12; asserted
+    /// both ways because the test cannot (and must not) touch the real cache dir.
+    #[test]
+    fn f12_no_override_keeps_gated_home_default() {
+        let got = resolve_db_path_gated(None, None);
+
+        match dirs::home_dir().map(|h| h.join(".claude").join(CACHE_DIR).join(DB_FILE)) {
+            Some(default) if default.exists() => assert_eq!(got, Some(default)),
+            _ => assert_eq!(got, None, "absent default must be gated to None"),
         }
     }
 
