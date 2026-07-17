@@ -24,7 +24,7 @@
 // Temporal history index — see design/tasks/TRDD-152e697f-*.md (v3.3.0+).
 mod temporal;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use colored::Colorize;
 use cozo::{DataValue, DbInstance, ScriptMutability};
@@ -17937,25 +17937,45 @@ fn cmd_coverage(db: &DbInstance, type_filter: Option<&str>, format: &str) -> Res
 // CLI without requiring Python. They mirror the helpers in
 // `scripts/pss_cozodb.py` byte-for-byte semantically, but run faster.
 //
-// Datetime formats accepted by parse_date (unified per COR-7 — audit 20260514):
+// Datetime formats accepted by parse_date_bound (unified per COR-7 —
+// audit 20260514; made direction-aware for TRDD-1Z8SGQ7N / F18):
 //   - RFC 3339 strings:  "2026-04-16T22:12:27Z" or "2026-04-16T22:12:27+00:00"
-//   - Date only:         "2026-04-16" (interpreted as 23:59:59 UTC end-of-day)
+//   - Date only:         "2026-04-16" — names a whole DAY. Which INSTANT the
+//                        cutoff resolves to depends on the bound's DIRECTION:
+//                        Start -> 00:00:00.000000000, End -> 23:59:59.999999999.
 //   - Relative to now:   "1d", "2w", "24h", "30m", "120s"
 //   - Keywords:          "now", "yesterday"
 
-/// Parse a user-supplied datetime string into an RFC 3339 UTC string matching
-/// the format stored in CozoDB (via Rust's `to_rfc3339_opts(Secs, true)`).
+/// A cutoff's DIRECTION. A bare date names an INTERVAL (a day); a cutoff needs
+/// an INSTANT, and which end of the day you want depends on whether the date
+/// is a lower (`Start`) or upper (`End`) bound. Every non-date form already
+/// names an instant, so `Bound` is irrelevant to it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Bound {
+    Start,
+    End,
+}
+
+/// Parse a user-supplied datetime into the exact INSTANT a cutoff denotes.
+///
+/// Returns a `DateTime<Utc>` — NOT a pre-formatted string. The wire format
+/// belongs to each STORAGE FAMILY, and a single literal cannot be correct for
+/// both (that is F9). The legacy `skills` table stores whole-second Z-form
+/// (`…T23:59:59Z`, via `to_rfc3339_opts(Secs, true)`); the temporal
+/// `events`/`scan_runs`/`elements_state` tables store offset-form with
+/// fractional seconds (`…T23:59:59.999999999+00:00`, via `to_rfc3339()`).
+/// Each caller formats the returned instant for ITS OWN table.
 ///
 /// Fail-fast on invalid input — callers are scripts/power-users who want
 /// clear errors, not silent fallbacks. Per COR-2 (audit 20260514): garbage
-/// inputs like "tomorrow" or "2026/05/14" now produce a clear error instead
-/// of being silently passed through to CozoDB and matching every row.
+/// inputs like "tomorrow" or "2026/05/14" produce a clear error instead of
+/// being silently passed through to CozoDB and matching every row.
 ///
-/// Per COR-7: this is the SINGLE date parser shared by every PSS subcommand
-/// — both the legacy `list-added-since` family and the temporal `as-of` /
-/// `timeline` / `diff` family. `temporal::cli::resolve_date` is a thin
-/// wrapper that converts the SuggesterError to a String.
-pub(crate) fn parse_date(arg: &str) -> Result<String, SuggesterError> {
+/// Per COR-7: this is the SINGLE date parser shared by every PSS subcommand —
+/// both the legacy `list-added-since` family and the temporal `as-of` /
+/// `timeline` / `diff` family. `temporal::cli::resolve_date` is a thin wrapper
+/// that formats offset-form and converts the SuggesterError to a String.
+pub(crate) fn parse_date_bound(arg: &str, bound: Bound) -> Result<DateTime<Utc>, SuggesterError> {
     let arg = arg.trim();
     if arg.is_empty() {
         return Err(SuggesterError::IndexParse(
@@ -17963,19 +17983,17 @@ pub(crate) fn parse_date(arg: &str) -> Result<String, SuggesterError> {
         ));
     }
 
-    // Keyword shortcuts. "now" matches current instant; "yesterday" matches
-    // 24h ago. Both produced as RFC 3339 with seconds precision so they
-    // string-compare correctly against stored event timestamps.
+    // Keyword shortcuts. "now" is the current instant; "yesterday" is 24h ago.
+    // Both already name an instant, so `bound` is irrelevant to them.
     if arg == "now" {
-        return Ok(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        return Ok(Utc::now());
     }
     if arg == "yesterday" {
-        let dt = Utc::now() - chrono::Duration::days(1);
-        return Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        return Ok(Utc::now() - chrono::Duration::days(1));
     }
 
-    // Try relative shorthand first (cheapest to check): N<unit> where unit is s/m/h/d/w
-    // Requires: last char is one of [smhdw], prefix is a positive integer.
+    // Relative shorthand N<unit> (unit s/m/h/d/w): also an instant, `bound` N/A.
+    // Cheapest to check: last char in [smhdw], prefix a positive integer.
     let last = arg.chars().last().unwrap();
     if matches!(last, 's' | 'm' | 'h' | 'd' | 'w') {
         let num_part = &arg[..arg.len() - last.len_utf8()];
@@ -17989,35 +18007,41 @@ pub(crate) fn parse_date(arg: &str) -> Result<String, SuggesterError> {
                     'w' => n * 86400 * 7,
                     _ => unreachable!(),
                 };
-                let dt = Utc::now() - chrono::Duration::seconds(seconds);
-                return Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+                return Ok(Utc::now() - chrono::Duration::seconds(seconds));
             }
         }
-        // Fall through — the string looks like a relative shorthand but didn't
-        // parse cleanly, let the RFC 3339 parser produce the final error.
+        // Fall through — looked like shorthand but didn't parse cleanly; let
+        // the RFC 3339 parser produce the final error.
     }
 
-    // Try full RFC 3339 / ISO 8601 (e.g. "2026-04-16T22:12:27Z")
+    // Full RFC 3339 / ISO 8601 (e.g. "2026-04-16T22:12:27Z"): already an instant.
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(arg) {
-        return Ok(dt
-            .with_timezone(&chrono::Utc)
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        return Ok(dt.with_timezone(&Utc));
     }
 
-    // Try date-only (YYYY-MM-DD → 23:59:59 UTC end-of-day). Using end-of-day
-    // matches the prior `resolve_date` semantics so `as-of 2026-04-16`
-    // captures everything that happened that day.
+    // Date-only YYYY-MM-DD names a DAY. TRDD-1Z8SGQ7N / F18: the cutoff instant
+    // is DIRECTION-aware — Start is the day's first instant, End its last —
+    // because a date-only LOWER bound resolved to end-of-day skipped the whole
+    // named day (`changed-between D D` collapsed to a 1-second window; the P1
+    // shipped in v3.10.7 returned "(no results)" for "what changed today?").
     if let Ok(date) = chrono::NaiveDate::parse_from_str(arg, "%Y-%m-%d") {
-        if let Some(ndt) = date.and_hms_opt(23, 59, 59) {
-            let dt = ndt.and_utc();
-            return Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        // Start -> the day's FIRST instant; End -> its LAST (max nanosecond, so
+        // no real event within the day can sort after an End cutoff). The nanos
+        // survive into the temporal offset-form cutoff (F9); the legacy Z-form
+        // path truncates End to `…T23:59:59Z`, which still matches a stored
+        // whole-second `…T23:59:59Z`.
+        let ndt = match bound {
+            Bound::Start => date.and_hms_opt(0, 0, 0),
+            Bound::End => date.and_hms_nano_opt(23, 59, 59, 999_999_999),
+        };
+        if let Some(ndt) = ndt {
+            return Ok(ndt.and_utc());
         }
     }
 
-    // Try naive datetime without timezone (e.g. "2026-04-16T22:12:27")
+    // Naive datetime without timezone (e.g. "2026-04-16T22:12:27"): an instant.
     if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(arg, "%Y-%m-%dT%H:%M:%S") {
-        let dt = ndt.and_utc();
-        return Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        return Ok(ndt.and_utc());
     }
 
     Err(SuggesterError::IndexParse(format!(
@@ -18590,7 +18614,10 @@ fn cmd_list_added_since(
     limit: usize,
     json: bool,
 ) -> Result<(), SuggesterError> {
-    let iso = parse_date(when)?;
+    // F18/F9: `since` is a LOWER bound (query `>= $since`) -> Bound::Start.
+    // Legacy `skills` table stores whole-second Z-form, so format Secs+Z.
+    let iso = parse_date_bound(when, Bound::Start)?
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let limit = limit.min(10000);
     let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
     params.insert("since".into(), DataValue::Str(iso.clone().into()));
@@ -18625,8 +18652,12 @@ fn cmd_list_added_between(
     limit: usize,
     json: bool,
 ) -> Result<(), SuggesterError> {
-    let start_iso = parse_date(start)?;
-    let end_iso = parse_date(end)?;
+    // F18/F9: `start` is a LOWER bound (>= $start) -> Start; `end` an UPPER
+    // bound (<= $end) -> End. Legacy `skills` table stores whole-second Z-form.
+    let start_iso = parse_date_bound(start, Bound::Start)?
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let end_iso = parse_date_bound(end, Bound::End)?
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let limit = limit.min(10000);
     let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
     params.insert("start".into(), DataValue::Str(start_iso.clone().into()));
@@ -18661,7 +18692,10 @@ fn cmd_list_updated_since(
     limit: usize,
     json: bool,
 ) -> Result<(), SuggesterError> {
-    let iso = parse_date(when)?;
+    // F18/F9: `since` is a LOWER bound (query `>= $since`) -> Bound::Start.
+    // Legacy `skills` table stores whole-second Z-form, so format Secs+Z.
+    let iso = parse_date_bound(when, Bound::Start)?
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let limit = limit.min(10000);
     let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
     params.insert("since".into(), DataValue::Str(iso.clone().into()));
@@ -22279,65 +22313,183 @@ mediapipe>=0.10
 
     // ====================================================================
     // Phase 1.1 — audit 20260514 (COR-2, COR-4, COR-7)
+    // + TRDD-1Z8SGQ7N (F18 direction-aware date bounds, F9 per-family format)
     // ====================================================================
 
     #[test]
-    fn parse_date_accepts_now_keyword() {
-        // COR-2 + COR-7: "now" returns current time as RFC3339.
-        let result = parse_date("now").expect("'now' must parse");
-        assert!(result.contains('T'), "RFC3339 has T separator: {}", result);
-        assert!(result.ends_with('Z'), "UTC suffix: {}", result);
+    fn parse_date_bound_accepts_now_keyword() {
+        // COR-2 + COR-7: "now" resolves to the current instant; bound irrelevant.
+        let before = Utc::now();
+        let dt = parse_date_bound("now", Bound::Start).expect("'now' must parse");
+        let after = Utc::now();
+        assert!(
+            dt >= before - chrono::Duration::seconds(2)
+                && dt <= after + chrono::Duration::seconds(2),
+            "now() must be ~current, got {}",
+            dt
+        );
     }
 
     #[test]
-    fn parse_date_accepts_yesterday_keyword() {
-        // COR-2: "yesterday" used to fall through and become a literal string
-        // that string-compared against every event. Now it produces a real
-        // timestamp 24h before now.
-        let result = parse_date("yesterday").expect("'yesterday' must parse");
-        assert!(result.contains('T'));
-        assert!(result.ends_with('Z'));
+    fn parse_date_bound_accepts_yesterday_keyword() {
+        // COR-2: "yesterday" used to fall through as a literal string that
+        // string-compared against every event. Now it is a real instant 24h ago.
+        let dt = parse_date_bound("yesterday", Bound::End).expect("'yesterday' must parse");
+        let expected = Utc::now() - chrono::Duration::days(1);
+        assert!(
+            (dt - expected).num_seconds().abs() <= 2,
+            "yesterday ≈ now-24h, got {}",
+            dt
+        );
     }
 
     #[test]
-    fn parse_date_accepts_relative_shorthand() {
-        // COR-7: relative shorthand is the legacy parse_datetime_arg shape.
+    fn parse_date_bound_accepts_relative_shorthand() {
+        // COR-7: relative shorthand N<unit>. Each resolves to now-minus-duration.
         for s in &["1d", "2w", "24h", "30m", "120s"] {
-            let r = parse_date(s).unwrap_or_else(|e| panic!("{} should parse: {:?}", s, e));
-            assert!(r.contains('T'), "{} → {}", s, r);
+            parse_date_bound(s, Bound::Start)
+                .unwrap_or_else(|e| panic!("{} should parse: {:?}", s, e));
         }
     }
 
     #[test]
-    fn parse_date_accepts_iso_date() {
-        // YYYY-MM-DD now produces 23:59:59 end-of-day (matches the prior
-        // resolve_date semantics so as-of YYYY-MM-DD captures the full day).
-        let r = parse_date("2026-04-16").expect("date-only must parse");
-        assert!(r.starts_with("2026-04-16T23:59:59"), "got {}", r);
+    fn parse_date_bound_date_only_direction_aware() {
+        // TRDD-1Z8SGQ7N / F18 (P1, shipped v3.10.7): a date names a DAY (an
+        // interval); the cutoff instant depends on DIRECTION — Start is the
+        // day's FIRST instant, End its LAST. Before the fix BOTH resolved to
+        // 23:59:59, so a date-only LOWER bound skipped the whole named day and
+        // `changed-between D D` was a 1-second window that always answered
+        // nothing. This test PINS the decision (it is a conscious flip, not a
+        // regression) so a future reader knows why date-only depends on bound.
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let start = parse_date_bound("2026-04-16", Bound::Start).expect("date-only Start");
+        let end = parse_date_bound("2026-04-16", Bound::End).expect("date-only End");
+        assert_eq!(
+            start,
+            day.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+            "Start = first instant of the day"
+        );
+        assert_eq!(
+            end,
+            day.and_hms_nano_opt(23, 59, 59, 999_999_999).unwrap().and_utc(),
+            "End = last instant of the day"
+        );
     }
 
     #[test]
-    fn parse_date_accepts_rfc3339() {
-        let r = parse_date("2026-04-16T22:12:27Z").expect("RFC3339 must parse");
-        assert_eq!(r, "2026-04-16T22:12:27Z");
+    fn parse_date_bound_accepts_rfc3339() {
+        // RFC3339 already names an instant; both bounds agree and pass through.
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 4, 16)
+            .unwrap()
+            .and_hms_opt(22, 12, 27)
+            .unwrap()
+            .and_utc();
+        assert_eq!(parse_date_bound("2026-04-16T22:12:27Z", Bound::Start).unwrap(), expected);
+        assert_eq!(parse_date_bound("2026-04-16T22:12:27Z", Bound::End).unwrap(), expected);
     }
 
     #[test]
-    fn parse_date_rejects_tomorrow() {
-        // COR-2 (audit 20260514): "tomorrow" used to be silently passed
-        // through and produced 9131 rows on `pss as-of 'tomorrow'`. Now
-        // it's a clear error.
-        let r = parse_date("tomorrow");
-        assert!(r.is_err(), "'tomorrow' must be rejected, got {:?}", r);
+    fn parse_date_bound_rejects_tomorrow() {
+        // COR-2 (audit 20260514): "tomorrow" used to be silently passed through
+        // and produced 9131 rows on `pss as-of 'tomorrow'`. Now a clear error
+        // under BOTH bounds.
+        assert!(parse_date_bound("tomorrow", Bound::Start).is_err());
+        assert!(parse_date_bound("tomorrow", Bound::End).is_err());
     }
 
     #[test]
-    fn parse_date_rejects_garbage() {
-        // COR-2: random strings rejected.
+    fn parse_date_bound_rejects_garbage() {
+        // COR-2: random strings rejected regardless of bound.
         for s in &["asdf", "not-a-date", "2026/05/14", "13/45/2026", ""] {
-            let r = parse_date(s);
-            assert!(r.is_err(), "{:?} must be rejected, got {:?}", s, r);
+            for b in &[Bound::Start, Bound::End] {
+                assert!(
+                    parse_date_bound(s, *b).is_err(),
+                    "{:?}/{:?} must be rejected",
+                    s,
+                    b
+                );
+            }
         }
+    }
+
+    #[test]
+    fn parse_date_bound_instant_forms_ignore_bound() {
+        // Every non-date form already names an instant, so Start and End agree.
+        // Deterministic forms compare exactly; now-relative forms advance between
+        // the two calls, so allow a 2s slack.
+        for s in &[
+            "2026-04-16T22:12:27Z",
+            "2026-04-16T22:12:27+00:00",
+            "2026-04-16T22:12:27",
+        ] {
+            assert_eq!(
+                parse_date_bound(s, Bound::Start).unwrap(),
+                parse_date_bound(s, Bound::End).unwrap(),
+                "{}: instant form must ignore bound",
+                s
+            );
+        }
+        for s in &["now", "yesterday", "1d", "30m"] {
+            let a = parse_date_bound(s, Bound::Start).unwrap();
+            let b = parse_date_bound(s, Bound::End).unwrap();
+            assert!(
+                (a - b).num_seconds().abs() <= 2,
+                "{}: bound must not shift a now-relative instant",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn parse_date_bound_temporal_format_is_offset_form() {
+        // F9: the temporal tables store observed_at in OFFSET form with
+        // fractional seconds (…+00:00), NOT Z-form. `temporal::cli::resolve_date`
+        // formats the returned instant with `.to_rfc3339()`; assert that path.
+        let end = parse_date_bound("2026-04-16", Bound::End).unwrap().to_rfc3339();
+        assert!(end.ends_with("+00:00"), "temporal End must be offset-form, got {}", end);
+        assert!(
+            end.contains(".999999999"),
+            "temporal End carries sub-second precision, got {}",
+            end
+        );
+        let start = parse_date_bound("2026-04-16", Bound::Start).unwrap().to_rfc3339();
+        assert_eq!(start, "2026-04-16T00:00:00+00:00");
+    }
+
+    #[test]
+    fn f9_offset_form_boundary_string_ordering() {
+        // F9 (proven on 19,258 offset-form rows): a real fractional row must
+        // sort >= a whole-second START cutoff and <= a max-nano END cutoff — but
+        // ONLY in OFFSET form. Z-form breaks it: '+'(0x2B) < '.'(0x2E), so a
+        // Z-form second sorts AFTER every fraction of its own second and wrongly
+        // excludes the row. This guards the storage-format reasoning.
+        let row = "2026-05-13T06:20:12.465658+00:00";
+        assert!(row >= "2026-05-13T06:20:12+00:00", "offset-form start must include the row");
+        assert!(
+            row <= "2026-05-13T06:20:12.999999999+00:00",
+            "offset-form end must include the row"
+        );
+        assert!(
+            !(row >= "2026-05-13T06:20:12Z"),
+            "Z-form start WRONGLY excludes the row (the F9 bug)"
+        );
+    }
+
+    #[test]
+    fn parse_date_bound_legacy_family_z_form() {
+        // F9: the legacy `skills` table stores whole-second Z-form. The legacy
+        // call sites format with `.to_rfc3339_opts(Secs, true)`. End-of-day
+        // truncates to 23:59:59Z, so a stored `…T23:59:59Z` still matches its
+        // own day's End bound.
+        use chrono::SecondsFormat;
+        let start = parse_date_bound("2026-04-16", Bound::Start)
+            .unwrap()
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let end = parse_date_bound("2026-04-16", Bound::End)
+            .unwrap()
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        assert_eq!(start, "2026-04-16T00:00:00Z");
+        assert_eq!(end, "2026-04-16T23:59:59Z");
     }
 
     #[test]

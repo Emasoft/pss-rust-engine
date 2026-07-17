@@ -1554,20 +1554,29 @@ pub mod cli {
         false
     }
 
-    /// Resolve a date string to RFC3339. Thin wrapper around the unified
-    /// `crate::parse_date` (per COR-7 — audit 20260514). Returns String error
-    /// on garbage input so the legacy `temporal::cli` module doesn't need to
-    /// know about `SuggesterError`.
+    /// Resolve a date string to an OFFSET-form RFC3339 cutoff for the temporal
+    /// tables. Thin wrapper around the unified `crate::parse_date_bound` (per
+    /// COR-7 — audit 20260514). Returns a String error on garbage input so the
+    /// `temporal::cli` module doesn't need to know about `SuggesterError`.
+    ///
+    /// TRDD-1Z8SGQ7N / F18: `bound` makes a date-only input DIRECTION-aware —
+    /// a lower bound (`Start`) resolves to the day's first instant, an upper
+    /// bound (`End`) to its last. Read the caller's comparison operator to pick
+    /// it: `>=`/`>` => `Start`, `<=`/`<` => `End`.
+    ///
+    /// F9: formats with `.to_rfc3339()` (OFFSET form, `…+00:00`, with fractional
+    /// seconds) because the temporal `events`/`scan_runs`/`elements_state`
+    /// tables store `observed_at` in that form (via `to_rfc3339()`), NOT the
+    /// legacy Z-form. A Z-form cutoff sorts AFTER every fraction of its own
+    /// second ('+'=0x2B < '.'=0x2E), so it wrongly excludes real sub-second rows.
     ///
     /// Per COR-2 (audit 20260514): garbage like "tomorrow" or "2026/05/14"
-    /// now produces a clear error instead of being silently passed through to
+    /// produces a clear error instead of being silently passed through to
     /// CozoDB (where it would string-compare-true against every row).
-    ///
-    /// Accepts: "now", "yesterday", "1d"/"2w"/"24h"/"30m"/"120s" relative
-    /// shorthand, "YYYY-MM-DD" (validated, end-of-day UTC), full RFC3339,
-    /// or naive datetime ("YYYY-MM-DDTHH:MM:SS").
-    fn resolve_date(input: &str) -> Result<String, String> {
-        crate::parse_date(input).map_err(|e| e.to_string())
+    fn resolve_date(input: &str, bound: crate::Bound) -> Result<String, String> {
+        crate::parse_date_bound(input, bound)
+            .map(|dt| dt.to_rfc3339())
+            .map_err(|e| e.to_string())
     }
 
     /// Format an `Invalid date` error consistently and emit `[]` to stdout
@@ -1836,7 +1845,9 @@ pub mod cli {
         scope_path_filter: Option<&str>,
         limit: usize,
     ) {
-        let cutoff = match resolve_date(date) {
+        // F18 (TRDD-1Z8SGQ7N): `as-of` shows state AT `date`; as_of_rows filters
+        // `observed_at <= $cutoff`, so `date` is an UPPER bound => Bound::End.
+        let cutoff = match resolve_date(date, crate::Bound::End) {
             Ok(s) => s,
             Err(e) => {
                 print_date_err("date", date, &e);
@@ -1863,7 +1874,9 @@ pub mod cli {
     /// the absolute path with the SAME algorithm `pss project-slug` uses, so
     /// the slug is the project-scope identity used inside `scope_path`.
     pub fn cmd_active_in(db: &DbInstance, slug: &str, date: &str, limit: usize) {
-        let cutoff = match resolve_date(date) {
+        // F18 (TRDD-1Z8SGQ7N): `active-in` snapshots state AT `date` (delegates
+        // to as_of_rows, `observed_at <= $cutoff`) => Bound::End.
+        let cutoff = match resolve_date(date, crate::Bound::End) {
             Ok(s) => s,
             Err(e) => {
                 print_date_err("as-of", date, &e);
@@ -2014,11 +2027,15 @@ pub mod cli {
         if handle_stub_format(format, "changed-between") {
             return;
         }
-        let start = match resolve_date(start) {
+        // F18 (TRDD-1Z8SGQ7N): the window is `observed_at >= $start,
+        // observed_at <= $end`. `start` is the LOWER bound => Bound::Start
+        // (THE P1 FIX — a date-only start no longer collapses to end-of-day and
+        // skips its own day); `end` is the UPPER bound => Bound::End.
+        let start = match resolve_date(start, crate::Bound::Start) {
             Ok(s) => s,
             Err(e) => { print_date_err("start date", start, &e); return; }
         };
-        let end = match resolve_date(end) {
+        let end = match resolve_date(end, crate::Bound::End) {
             Ok(s) => s,
             Err(e) => { print_date_err("end date", end, &e); return; }
         };
@@ -2518,7 +2535,10 @@ pub mod cli {
         if handle_stub_format(format, "changes-summary") {
             return;
         }
-        let cutoff = match resolve_date(window) {
+        // F18 (TRDD-1Z8SGQ7N): changes-summary aggregates events SINCE the
+        // window start; query is `observed_at >= $cutoff`, a LOWER bound
+        // => Bound::Start.
+        let cutoff = match resolve_date(window, crate::Bound::Start) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Invalid --window '{}': {}", window, e);
@@ -2643,7 +2663,9 @@ pub mod cli {
         if handle_stub_format(format, "compare-snapshots") {
             return;
         }
-        let c1 = match resolve_date(date1) {
+        // F18 (TRDD-1Z8SGQ7N): point-in-time snapshot at `date1`
+        // (`observed_at <= $cutoff` via read_event_at_or_before) => Bound::End.
+        let c1 = match resolve_date(date1, crate::Bound::End) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Invalid date1 '{}': {}", date1, e);
@@ -2651,7 +2673,9 @@ pub mod cli {
                 return;
             }
         };
-        let c2 = match resolve_date(date2) {
+        // F18 (TRDD-1Z8SGQ7N): point-in-time snapshot at `date2`
+        // (`observed_at <= $cutoff` via read_event_at_or_before) => Bound::End.
+        let c2 = match resolve_date(date2, crate::Bound::End) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Invalid date2 '{}': {}", date2, e);
@@ -2829,7 +2853,9 @@ pub mod cli {
 
     /// `pss removed-since <DATE>`
     pub fn cmd_removed_since(db: &DbInstance, date: &str, limit: usize) {
-        let cutoff = match resolve_date(date) {
+        // F18 (TRDD-1Z8SGQ7N): removed-since lists removals FROM `date` onward;
+        // query is `observed_at >= $cutoff`, a LOWER bound => Bound::Start.
+        let cutoff = match resolve_date(date, crate::Bound::Start) {
             Ok(s) => s,
             Err(e) => { print_date_err("date", date, &e); return; }
         };
@@ -4205,7 +4231,9 @@ pub mod cli {
 
     /// `pss show <ELEMENT_ID> --as-of <DATE>` — full snapshot at a date.
     pub fn cmd_show_at(db: &DbInstance, element_id: &str, date: &str) {
-        let cutoff = match resolve_date(date) {
+        // F18 (TRDD-1Z8SGQ7N): snapshot state AT `date` via
+        // read_event_at_or_before (`observed_at <= $cutoff`) => Bound::End.
+        let cutoff = match resolve_date(date, crate::Bound::End) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Invalid date '{}': {}", date, e);
@@ -4248,7 +4276,9 @@ pub mod cli {
 
     /// `pss size-at <ELEMENT_ID> --as-of <DATE>` — file_size at a date.
     pub fn cmd_size_at(db: &DbInstance, element_id: &str, date: &str) {
-        let cutoff = match resolve_date(date) {
+        // F18 (TRDD-1Z8SGQ7N): snapshot state AT `date` via
+        // read_event_at_or_before (`observed_at <= $cutoff`) => Bound::End.
+        let cutoff = match resolve_date(date, crate::Bound::End) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Invalid date '{}': {}", date, e);
@@ -4281,7 +4311,9 @@ pub mod cli {
 
     /// `pss tokens-at <ELEMENT_ID> --as-of <DATE>` — token_count at a date.
     pub fn cmd_tokens_at(db: &DbInstance, element_id: &str, date: &str) {
-        let cutoff = match resolve_date(date) {
+        // F18 (TRDD-1Z8SGQ7N): snapshot state AT `date` via
+        // read_event_at_or_before (`observed_at <= $cutoff`) => Bound::End.
+        let cutoff = match resolve_date(date, crate::Bound::End) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Invalid date '{}': {}", date, e);
@@ -4315,7 +4347,9 @@ pub mod cli {
     /// `pss diff <ELEMENT_ID> <DATE1> <DATE2>` — show the deltas between
     /// two snapshots of an element.
     pub fn cmd_diff(db: &DbInstance, element_id: &str, date1: &str, date2: &str) {
-        let c1 = match resolve_date(date1) {
+        // F18 (TRDD-1Z8SGQ7N): point-in-time snapshot at `date1`
+        // (`observed_at <= $cutoff` via read_event_at_or_before) => Bound::End.
+        let c1 = match resolve_date(date1, crate::Bound::End) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Invalid date1 '{}': {}", date1, e);
@@ -4323,7 +4357,9 @@ pub mod cli {
                 return;
             }
         };
-        let c2 = match resolve_date(date2) {
+        // F18 (TRDD-1Z8SGQ7N): point-in-time snapshot at `date2`
+        // (`observed_at <= $cutoff` via read_event_at_or_before) => Bound::End.
+        let c2 = match resolve_date(date2, crate::Bound::End) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Invalid date2 '{}': {}", date2, e);
@@ -4401,11 +4437,14 @@ pub mod cli {
         type_filter: Option<&str>,
         limit: usize,
     ) {
-        let s = match resolve_date(start) {
+        // F18 (TRDD-1Z8SGQ7N): the window is `observed_at >= $start,
+        // observed_at <= $end` (shared by installed-between & removed-between).
+        // `start` is the LOWER bound => Bound::Start; `end` the UPPER => End.
+        let s = match resolve_date(start, crate::Bound::Start) {
             Ok(s) => s,
             Err(e) => { print_date_err("start date", start, &e); return; }
         };
-        let e = match resolve_date(end) {
+        let e = match resolve_date(end, crate::Bound::End) {
             Ok(s) => s,
             Err(err) => { print_date_err("end date", end, &err); return; }
         };
