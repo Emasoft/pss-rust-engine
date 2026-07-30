@@ -30,6 +30,9 @@ use std::path::{Path, PathBuf};
 /// Which archetype to emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Archetype {
+    /// A plain subagent — no menu, no router, no micro-agent. The escape hatch
+    /// for when none of the orchestration shapes is warranted.
+    Normal,
     AllInOne,
     OneForAll,
     PluginOmni,
@@ -38,8 +41,9 @@ pub enum Archetype {
 impl Archetype {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "all-in-one" | "allinone" | "aio" => Some(Self::AllInOne),
-            "one-for-all" | "oneforall" | "ofa" => Some(Self::OneForAll),
+            "normal" | "plain" | "standard" => Some(Self::Normal),
+            "all-in-one" | "allinone" | "allin1" | "aio" => Some(Self::AllInOne),
+            "one-for-all" | "oneforall" | "1xall" | "ofa" => Some(Self::OneForAll),
             "plugin-omni" | "pluginomni" | "omni" => Some(Self::PluginOmni),
             _ => None,
         }
@@ -47,10 +51,48 @@ impl Archetype {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Normal => "normal",
             Self::AllInOne => "all-in-one",
             Self::OneForAll => "one-for-all",
             Self::PluginOmni => "plugin-omni",
         }
+    }
+}
+
+/// Which element types the generated agent may reference.
+///
+/// These are exclusions rather than inclusions because the useful default is
+/// "give the agent what the description calls for", and the flags exist for the
+/// cases where a caller knows a whole class is unwanted.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ElementFilters {
+    pub no_skill: bool,
+    pub no_agent: bool,
+    pub no_mcp: bool,
+}
+
+/// Turn a free-text specialization into a kebab-case agent name.
+///
+/// Only used when the caller gave a description but no `--name`. Stops at the
+/// first four meaningful words: a name derived from a whole paragraph is worse
+/// than no name at all.
+pub fn derive_name(description: &str) -> String {
+    const SKIP: &[&str] = &[
+        "a", "an", "the", "for", "that", "which", "with", "and", "or", "to", "of",
+        "in", "on", "is", "it", "this", "agent", "specialized", "specialises",
+        "specializes", "specialist",
+    ];
+    let words: Vec<String> = description
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| !SKIP.contains(&w.as_str()))
+        .take(4)
+        .collect();
+    if words.is_empty() {
+        "generated-agent".to_string()
+    } else {
+        format!("{}-agent", words.join("-"))
     }
 }
 
@@ -357,6 +399,13 @@ pub fn orchestrator_skills(
     verification_skill: &str,
 ) -> Vec<String> {
     match kind {
+        // A plain agent still gets the verification skill: it is the one thing
+        // every generated agent is held to regardless of shape.
+        Archetype::Normal => {
+            let mut v: Vec<String> = steps.iter().map(|s| s.name.clone()).collect();
+            v.push(verification_skill.to_string());
+            v
+        }
         // Skills execute in this same agent, so preloading them is the point.
         Archetype::AllInOne => {
             let mut v: Vec<String> = steps.iter().map(|s| s.name.clone()).collect();
@@ -446,6 +495,16 @@ pub struct GenSpec {
     pub allow_explore: bool,
     /// Directory the bundle is written under.
     pub out_dir: PathBuf,
+    /// Optional `effort:` pin.
+    pub effort: Option<String>,
+    /// Complementary agents the description selected. Emitted only as prose —
+    /// an agent references another agent by launching it, not by a frontmatter
+    /// field, so listing them anywhere else would be inventing a schema.
+    pub agents: Vec<String>,
+    /// MCP servers the description selected.
+    pub mcp: Vec<String>,
+    /// Which element classes are excluded.
+    pub filters: ElementFilters,
 }
 
 impl GenSpec {
@@ -516,11 +575,18 @@ pub fn emit(spec: &GenSpec) -> Emission {
     let mut em = Emission::default();
     let out = spec.out_dir.clone();
 
-    let gate = gate_preloadable(&spec.skills);
-    for (name, why) in &gate.rejected {
-        em.warnings.push(format!("skill `{}` {}", name, why.explain()));
-    }
-    let usable = gate.ok;
+    // `--no-skill` is applied BEFORE the gate: gating a set the caller has
+    // already excluded would emit warnings about skills that were never going
+    // to be referenced.
+    let usable = if spec.filters.no_skill {
+        Vec::new()
+    } else {
+        let gate = gate_preloadable(&spec.skills);
+        for (name, why) in &gate.rejected {
+            em.warnings.push(format!("skill `{}` {}", name, why.explain()));
+        }
+        gate.ok
+    };
 
     if spec.kind == Archetype::OneForAll {
         em.plan = usable
@@ -537,7 +603,9 @@ pub fn emit(spec: &GenSpec) -> Emission {
         contents: render_agent(spec, &usable, &preload, &em.plan),
     });
 
-    if spec.kind != Archetype::AllInOne {
+    // Normal and all-in-one reference their skills directly; only the two
+    // menu-driven archetypes need a menu file.
+    if matches!(spec.kind, Archetype::OneForAll | Archetype::PluginOmni) {
         em.files.push(EmittedFile {
             path: out.join("skills").join(&menu).join("SKILL.md"),
             contents: render_menu(spec, &usable, &menu, &em.plan),
@@ -576,19 +644,56 @@ fn render_agent(
     if let Some(m) = &spec.model {
         s.push_str(&format!("model: {}\n", m));
     }
+    if let Some(e) = &spec.effort {
+        s.push_str(&format!("effort: {}\n", e));
+    }
     s.push_str(&yaml_list("skills", preload));
     let tools = match spec.kind {
         // The router launches subagents, so it needs the Agent tool and little else.
         Archetype::OneForAll => vec!["Agent", "Read", "Bash", "Skill"],
         _ => vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill"],
     };
+    // An explicit `tools:` list is an ALLOWLIST — it is what keeps MCP tool
+    // schemas out of the agent's context, and every archetype emits one. So
+    // `--no-mcp` does not need to subtract anything here; what it additionally
+    // suppresses is the `mcpServers:` declaration below.
     s.push_str(&yaml_list(
         "tools",
         &tools.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
     ));
+    if !spec.filters.no_mcp && !spec.mcp.is_empty() {
+        s.push_str(&yaml_list("mcpServers", &spec.mcp));
+    }
     s.push_str("---\n\n");
 
     match spec.kind {
+        Archetype::Normal => {
+            s.push_str(&format!("# {}\n\n{}\n\n", spec.name, spec.description));
+            if !usable.is_empty() {
+                s.push_str(
+                    "The skills below are already loaded — invoke one with the Skill tool \
+                     when the work calls for it. Do not re-read a skill file; you already \
+                     have it.\n\n",
+                );
+                for sk in usable {
+                    s.push_str(&format!("- **`{}`** — {}\n", sk.name, sk.description));
+                }
+                s.push('\n');
+            }
+            if !spec.filters.no_agent && !spec.agents.is_empty() {
+                s.push_str(
+                    "When a task fits one of these better than you, launch it with the \
+                     Agent tool rather than doing the work yourself:\n\n",
+                );
+                for a in &spec.agents {
+                    s.push_str(&format!("- `{}`\n", a));
+                }
+                s.push('\n');
+            }
+            s.push_str(
+                "Report what you actually did, including anything you could not verify.\n",
+            );
+        }
         Archetype::AllInOne => {
             s.push_str(&format!("# {}\n\n", spec.name));
             s.push_str(
@@ -907,6 +1012,10 @@ mod tests {
             plugin: Some("demo-plugin".into()),
             allow_explore: true,
             out_dir: dir.join("out"),
+            effort: None,
+            agents: Vec::new(),
+            mcp: Vec::new(),
+            filters: ElementFilters::default(),
         }
     }
 
@@ -955,6 +1064,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parse_accepts_the_short_type_aliases() {
+        assert_eq!(Archetype::parse("allin1"), Some(Archetype::AllInOne));
+        assert_eq!(Archetype::parse("1xall"), Some(Archetype::OneForAll));
+        assert_eq!(Archetype::parse("omni"), Some(Archetype::PluginOmni));
+        assert_eq!(Archetype::parse("normal"), Some(Archetype::Normal));
+    }
+
+    #[test]
+    fn derive_name_skips_filler_and_bounds_length() {
+        assert_eq!(
+            derive_name("An agent that is specialized in auditing Rust memory safety"),
+            "auditing-rust-memory-safety-agent"
+        );
+        assert_eq!(derive_name("   "), "generated-agent");
+    }
+
+    #[test]
+    fn no_skill_emits_no_skills_and_no_gate_warnings() {
+        let dir = tmpdir("no-skill");
+        let bad = skill_file(&dir, "manual", "disable-model-invocation: true\n", "b");
+        let em = emit(&GenSpec {
+            skills: vec![bad],
+            filters: ElementFilters { no_skill: true, ..Default::default() },
+            ..spec_with(Archetype::Normal, &dir, &[])
+        });
+        let agent = &em.files[0].contents;
+        assert!(!agent.contains("- manual"));
+        // The gate never ran, so it cannot warn about a skill the caller excluded.
+        assert!(em.warnings.is_empty(), "got: {:?}", em.warnings);
+    }
+
+    #[test]
+    fn no_mcp_suppresses_mcp_servers_and_tools_stay_an_allowlist() {
+        let dir = tmpdir("no-mcp");
+        let base = spec_with(Archetype::Normal, &dir, &[("alpha", "b")]);
+
+        let with_mcp = emit(&GenSpec { mcp: vec!["ctx7".into()], ..base.clone() });
+        assert!(with_mcp.files[0].contents.contains("mcpServers:\n  - ctx7\n"));
+
+        let without = emit(&GenSpec {
+            mcp: vec!["ctx7".into()],
+            filters: ElementFilters { no_mcp: true, ..Default::default() },
+            ..base
+        });
+        let agent = &without.files[0].contents;
+        assert!(!agent.contains("mcpServers"));
+        // The explicit tools: allowlist is what actually keeps MCP tool schemas
+        // out of the agent's context; --no-mcp only drops the server declaration.
+        assert!(agent.contains("tools:\n"));
+    }
+
+    #[test]
+    fn no_agent_suppresses_the_complementary_agent_list() {
+        let dir = tmpdir("no-agent");
+        let base = spec_with(Archetype::Normal, &dir, &[("alpha", "b")]);
+        let with = emit(&GenSpec { agents: vec!["helper".into()], ..base.clone() });
+        assert!(with.files[0].contents.contains("`helper`"));
+        let without = emit(&GenSpec {
+            agents: vec!["helper".into()],
+            filters: ElementFilters { no_agent: true, ..Default::default() },
+            ..base
+        });
+        assert!(!without.files[0].contents.contains("`helper`"));
+    }
+
+    #[test]
+    fn normal_emits_one_file_and_no_menu() {
+        let dir = tmpdir("normal");
+        let em = emit(&spec_with(Archetype::Normal, &dir, &[("alpha", "b")]));
+        assert!(!em.files.iter().any(|f| f.path.ends_with("SKILL.md")));
+        assert!(!em.files.iter().any(|f| f.path.ends_with("-micro.md")));
+        assert!(em.plan.is_empty());
+        assert!(em.files[0].contents.contains("skills:\n  - alpha\n"));
+    }
+
+    #[test]
+    fn effort_and_model_reach_the_frontmatter() {
+        let dir = tmpdir("effort");
+        let em = emit(&GenSpec {
+            model: Some("opus".into()),
+            effort: Some("xhigh".into()),
+            ..spec_with(Archetype::Normal, &dir, &[("alpha", "b")])
+        });
+        let agent = &em.files[0].contents;
+        assert!(agent.contains("model: opus\n"));
+        assert!(agent.contains("effort: xhigh\n"));
     }
 
     #[test]
@@ -1042,6 +1240,10 @@ mod tests {
             plugin: None,
             allow_explore: true,
             out_dir: dir.join("out"),
+            effort: None,
+            agents: Vec::new(),
+            mcp: Vec::new(),
+            filters: ElementFilters::default(),
         };
         let em = emit(&base);
         assert!(
@@ -1081,6 +1283,10 @@ mod tests {
             plugin: None,
             allow_explore: true,
             out_dir: dir.join("out"),
+            effort: None,
+            agents: Vec::new(),
+            mcp: Vec::new(),
+            filters: ElementFilters::default(),
         });
         assert_eq!(em.warnings.len(), 1);
         assert!(em.warnings[0].contains("manual"));

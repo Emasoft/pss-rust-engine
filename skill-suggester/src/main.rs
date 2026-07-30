@@ -1467,25 +1467,55 @@ enum Commands {
     /// - `plugin-omni` — exactly one skill (the plugin menu); broad, not a tree.
     #[command(name = "make-agent")]
     MakeAgent {
-        /// Which archetype: all-in-one | one-for-all | plugin-omni.
-        #[arg(long)]
+        /// What the agent should specialize in — free text, or a path to a .md
+        /// file describing it. PSS scores this against the index to pick the
+        /// skills, so a specific description yields a better agent than a vague
+        /// one. Ignored for plugin-omni, which takes every skill of its plugin.
+        description: Option<String>,
+
+        /// Which archetype: normal | all-in-one | one-for-all | plugin-omni
+        /// (aliases: allin1, 1xall, omni).
+        #[arg(long, visible_alias = "type")]
         kind: String,
 
-        /// Name of the generated agent (also its filename stem).
+        /// Name of the generated agent (also its filename stem). Derived from
+        /// the description, or from a description file's frontmatter, if omitted.
         #[arg(long)]
-        name: String,
+        name: Option<String>,
 
-        /// Comma-separated skill names to reference.
+        /// Comma-separated skill names to reference. Overrides description-based
+        /// selection.
         #[arg(long)]
         skills: Option<String>,
+
+        /// How many skills to select from a description. Default 8.
+        #[arg(long, default_value_t = 8)]
+        top: usize,
+
+        /// Do not give the agent any MCP servers.
+        #[arg(long, default_value_t = false)]
+        no_mcp: bool,
+
+        /// Do not give the agent any skills.
+        #[arg(long, default_value_t = false)]
+        no_skill: bool,
+
+        /// Do not point the agent at any complementary agents.
+        #[arg(long, default_value_t = false)]
+        no_agent: bool,
+
+        /// Reasoning effort pin: low | medium | high | xhigh | max.
+        #[arg(long)]
+        effort: Option<String>,
 
         /// Reference every skill belonging to this plugin (plugin-omni's usual input).
         #[arg(long)]
         plugin: Option<String>,
 
-        /// One-line agent description.
-        #[arg(long)]
-        description: Option<String>,
+        /// One-line `description:` for the emitted frontmatter. Defaults to the
+        /// positional description, trimmed to its first sentence.
+        #[arg(long, visible_alias = "description")]
+        summary: Option<String>,
 
         /// Optional `model:` pin for the emitted agent.
         #[arg(long)]
@@ -14971,60 +15001,250 @@ fn resolve_plugin_skills(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_make_agent(
+/// Resolve the `description` argument to (text, name-from-frontmatter).
+///
+/// A caller may pass prose or a path to a `.md` file — the same latitude the
+/// plugin generator gives. The path branch is taken only when the file actually
+/// exists, so a description that merely *looks* path-like ("agent for src/api
+/// work") is still treated as prose rather than failing to open.
+fn resolve_description(raw: &str) -> Result<(String, Option<String>), SuggesterError> {
+    let candidate = Path::new(raw);
+    if !candidate.is_file() {
+        return Ok((raw.to_string(), None));
+    }
+    let content = fs::read_to_string(candidate).map_err(|e| {
+        SuggesterError::IndexParse(format!("reading description file {}: {}", raw, e))
+    })?;
+    // A description file may carry frontmatter (the plugin generator's format).
+    // Take `name:` from it when present, and score against the prose body —
+    // scoring the YAML too would let field names pollute the match.
+    let mut name = None;
+    let body = match agent_archetypes::frontmatter_block(&content) {
+        Some(fm) => {
+            for line in fm.lines() {
+                if let Some(v) = line.strip_prefix("name:") {
+                    let v = v.trim().trim_matches(['"', '\'']);
+                    if !v.is_empty() {
+                        name = Some(v.to_string());
+                    }
+                }
+            }
+            content[content.find(fm).map(|i| i + fm.len()).unwrap_or(0)..]
+                .trim_start_matches(['-', '\r', '\n'])
+                .to_string()
+        }
+        None => content,
+    };
+    Ok((body, name))
+}
+
+/// Pick the skills a description calls for, using PSS's own scorer.
+///
+/// Deliberately reuses `find_matches` — the same function the suggestion hook
+/// runs — rather than a bespoke query. "Which skills match this text" must have
+/// exactly one implementation, or the agent generator and the hook would
+/// disagree about the same index.
+fn select_skills_for_description(
+    cli: &Cli,
     db: &DbInstance,
-    kind: &str,
-    name: &str,
-    skills: Option<&str>,
-    plugin: Option<&str>,
-    description: Option<&str>,
-    model: Option<&str>,
-    output: &str,
+    description: &str,
+    top: usize,
+) -> Result<Vec<agent_archetypes::SkillRef>, SuggesterError> {
+    let index = match load_index_from_db(db) {
+        Ok(idx) => idx,
+        Err(e) => {
+            warn!("make-agent: CozoDB index load failed: {}, using JSON", e);
+            load_index(&get_index_path(cli.index.as_deref())?)?
+        }
+    };
+    // The domain registry and detected domains are NOT optional here. Without
+    // them find_matches runs with gate filtering disabled, and a request about
+    // "Rust memory safety" pulls in spark-optimization (memory tuning), the
+    // long-term `memory` skill, and Context Optimization — all matching the word
+    // "memory" with no domain to reject them. Measured on the real index: 4 of 8
+    // selected skills were off-domain until this was passed.
+    let registry = match load_domain_registry_from_db(db) {
+        Ok(Some(reg)) => Some(reg),
+        _ => get_registry_path(cli.registry.as_deref())
+            .and_then(|p| load_domain_registry(&p).ok().flatten()),
+    };
+
+    let corrected = correct_typos(description);
+    // Fold the description's own domain signals into the expanded query, the way
+    // the profiler does — that is what lets the taxonomy reject an off-domain
+    // skill instead of merely out-scoring it.
+    let domain_signals = infer_domains_from_text(description);
+    let expanded = format!(
+        "{} {}",
+        expand_synonyms(&corrected),
+        domain_signals.join(" ")
+    );
+    let detected_domains = match registry.as_ref() {
+        Some(reg) => detect_domains_from_prompt_with_context(&expanded, reg, &domain_signals),
+        None => HashMap::new(),
+    };
+
+    let matches = find_matches(
+        &corrected,
+        &expanded,
+        &index,
+        "",
+        &ProjectContext::default(),
+        false,
+        &detected_domains,
+        registry.as_ref(),
+    );
+    // `top` is a CEILING, not a quota. Taking exactly N regardless of score pads
+    // a narrow description out with whatever ranked 5th-8th — on a real index that
+    // is how a Rust-memory-safety agent ends up preloading a long-term-memory
+    // skill. Below Medium the match is a word collision, and an agent is better
+    // off with three right skills than eight of which five are noise.
+    // Dedup by name BEFORE taking `top`. The index holds the same skill under
+    // several sources (user, project, plugin), and find_matches returns each
+    // separately — measured, three `memory` rows filled three of eight slots for
+    // one prompt. Preloading a name twice is also meaningless: the agent gets one
+    // copy either way, so the duplicate slots were pure loss.
+    let mut seen: HashSet<String> = HashSet::new();
+    let selected: Vec<agent_archetypes::SkillRef> = matches
+        .into_iter()
+        .filter(|m| m.skill_type == "skill" && m.confidence != Confidence::Low)
+        .filter(|m| seen.insert(m.name.clone()))
+        .take(top)
+        .map(|m| agent_archetypes::SkillRef {
+            name: m.name,
+            path: m.path,
+            description: m.description,
+        })
+        .collect();
+
+    if selected.is_empty() {
+        return Err(SuggesterError::IndexParse(format!(
+            "no skill matched '{}' above low confidence — describe the specialization \
+             more concretely, or pass --skills explicitly",
+            description.chars().take(60).collect::<String>().trim()
+        )));
+    }
+    Ok(selected)
+}
+
+/// Everything `make-agent` was invoked with.
+///
+/// A struct rather than a dozen positional parameters: the flags are mostly
+/// `Option<&str>` and `bool`, so a caller that transposed two of them would
+/// still compile and silently generate the wrong agent.
+struct MakeAgentArgs<'a> {
+    description: Option<&'a str>,
+    kind: &'a str,
+    name: Option<&'a str>,
+    skills: Option<&'a str>,
+    plugin: Option<&'a str>,
+    summary: Option<&'a str>,
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
+    output: &'a str,
+    top: usize,
     dry_run: bool,
     explore: bool,
-    format: &str,
+    filters: agent_archetypes::ElementFilters,
+    format: &'a str,
+}
+
+fn cmd_make_agent(
+    cli: &Cli,
+    db: &DbInstance,
+    a: MakeAgentArgs<'_>,
 ) -> Result<(), SuggesterError> {
-    let archetype = agent_archetypes::Archetype::parse(kind).ok_or_else(|| {
+    let archetype = agent_archetypes::Archetype::parse(a.kind).ok_or_else(|| {
         SuggesterError::IndexParse(format!(
-            "unknown --kind '{}' (expected all-in-one, one-for-all or plugin-omni)",
-            kind
+            "unknown --kind '{}' (expected normal, all-in-one, one-for-all or plugin-omni)",
+            a.kind
         ))
     })?;
 
-    let refs = match (skills, plugin) {
-        (Some(list), _) => {
-            let names: Vec<String> = list
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if names.is_empty() {
-                return Err(SuggesterError::IndexParse("--skills was empty".into()));
-            }
-            resolve_skill_refs(db, &names)?
+    // A description may be prose or a path to a .md file; the file may name the
+    // agent in its frontmatter.
+    let (desc_text, desc_name) = match a.description {
+        Some(raw) => {
+            let (t, n) = resolve_description(raw)?;
+            (Some(t), n)
         }
-        (None, Some(p)) => resolve_plugin_skills(db, p)?,
-        (None, None) => {
+        None => (None, None),
+    };
+
+    // Selection precedence: explicit --skills, then --plugin (plugin-omni takes
+    // the WHOLE plugin by design), then the description. --no-skill short-circuits
+    // all of it — there is no point scoring an index whose result is discarded.
+    let refs = if a.filters.no_skill {
+        Vec::new()
+    } else {
+        match (a.skills, a.plugin, desc_text.as_deref()) {
+            (Some(list), _, _) => {
+                let names: Vec<String> = list
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if names.is_empty() {
+                    return Err(SuggesterError::IndexParse("--skills was empty".into()));
+                }
+                resolve_skill_refs(db, &names)?
+            }
+            (None, Some(p), _) if archetype == agent_archetypes::Archetype::PluginOmni => {
+                resolve_plugin_skills(db, p)?
+            }
+            (None, _, Some(text)) if !text.trim().is_empty() => {
+                select_skills_for_description(cli, db, text, a.top)?
+            }
+            (None, Some(p), _) => resolve_plugin_skills(db, p)?,
+            (None, None, _) => {
+                return Err(SuggesterError::IndexParse(
+                    "give a description, --skills <a,b,c>, or --plugin <name>".into(),
+                ))
+            }
+        }
+    };
+
+    // Name precedence: explicit flag, then a description file's frontmatter,
+    // then a slug derived from the prose. Failing with "no name" when the user
+    // gave a perfectly good description would be pedantry.
+    let name = match (a.name, desc_name.as_deref(), desc_text.as_deref()) {
+        (Some(n), _, _) => n.to_string(),
+        (None, Some(n), _) => n.to_string(),
+        (None, None, Some(text)) => agent_archetypes::derive_name(text),
+        (None, None, None) => {
             return Err(SuggesterError::IndexParse(
-                "give either --skills <a,b,c> or --plugin <name>".into(),
+                "give --name, or a description to derive it from".into(),
             ))
         }
     };
 
+    let description = a
+        .summary
+        .map(|d| d.to_string())
+        .or_else(|| {
+            desc_text.as_deref().map(|t| {
+                let first = t.trim().split(['.', '\n']).next().unwrap_or(t).trim();
+                if first.is_empty() { t.trim().to_string() } else { format!("{}.", first) }
+            })
+        })
+        .unwrap_or_else(|| format!("Generated {} agent.", archetype.as_str()));
+
     let spec = agent_archetypes::GenSpec {
         kind: archetype,
-        name: name.to_string(),
-        description: description
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| format!("Generated {} agent.", archetype.as_str())),
-        model: model.map(|m| m.to_string()),
+        name,
+        description,
+        model: a.model.map(|m| m.to_string()),
+        effort: a.effort.map(|e| e.to_string()),
         skills: refs,
-        plugin: plugin.map(|p| p.to_string()),
-        allow_explore: explore,
-        out_dir: PathBuf::from(output),
+        plugin: a.plugin.map(|p| p.to_string()),
+        allow_explore: a.explore,
+        out_dir: PathBuf::from(a.output),
+        agents: Vec::new(),
+        mcp: Vec::new(),
+        filters: a.filters,
     };
 
+    let (dry_run, format) = (a.dry_run, a.format);
     let em = agent_archetypes::emit(&spec);
     if !dry_run {
         em.commit().map_err(SuggesterError::IndexParse)?;
@@ -15080,12 +15300,30 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
                      category.as_deref(), file_type.as_deref(), keyword.as_deref(),
                      platform.as_deref(), source_prefix.as_deref(), sort, *top, fmt.as_str())
         }
-        Commands::MakeAgent { kind, name, skills, plugin, description, model,
+        Commands::MakeAgent { description, kind, name, skills, top, no_mcp, no_skill,
+                              no_agent, effort, plugin, summary, model,
                               output, dry_run, explore, format, json } => {
             let fmt = resolve_format(*json, *format);
-            cmd_make_agent(&db, kind, name, skills.as_deref(), plugin.as_deref(),
-                           description.as_deref(), model.as_deref(), output,
-                           *dry_run, *explore, fmt.as_str())
+            cmd_make_agent(cli, &db, MakeAgentArgs {
+                description: description.as_deref(),
+                kind,
+                name: name.as_deref(),
+                skills: skills.as_deref(),
+                plugin: plugin.as_deref(),
+                summary: summary.as_deref(),
+                model: model.as_deref(),
+                effort: effort.as_deref(),
+                output,
+                top: *top,
+                dry_run: *dry_run,
+                explore: *explore,
+                filters: agent_archetypes::ElementFilters {
+                    no_skill: *no_skill,
+                    no_agent: *no_agent,
+                    no_mcp: *no_mcp,
+                },
+                format: fmt.as_str(),
+            })
         }
         Commands::Inspect { name, format, json } => {
             let fmt = resolve_format(*json, *format);
