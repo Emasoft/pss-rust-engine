@@ -3988,6 +3988,25 @@ pub struct SkillEntry {
     #[serde(default)]
     pub source: String,
 
+    /// Owning plugin's MANIFEST name, absent for standalone elements.
+    ///
+    /// Resolved at discovery (`pss_discover.py::_resolve_ownership`) rather than
+    /// parsed out of `source` here: `source` names the plugin for only ~14% of
+    /// indexed elements — the rest are `marketplace:<mp>` rows carrying no
+    /// plugin at all, and those are exactly the ones emitting ambiguous bare
+    /// names. `#[serde(default)]` is load-bearing: an index written by an older
+    /// PSS simply lacks the field, so suggestions render bare (the
+    /// pre-namespace behaviour) instead of failing to deserialize, and heal on
+    /// the next reindex.
+    #[serde(default)]
+    pub plugin: Option<String>,
+
+    /// Marketplace origin (repo owner, host/org, or local path) — the tier-3
+    /// disambiguator, used only when `<plugin>:<name>@<marketplace>` is still
+    /// not unique because two marketplaces share a name.
+    #[serde(default)]
+    pub origin: Option<String>,
+
     /// Full path to SKILL.md
     pub path: String,
 
@@ -4280,6 +4299,147 @@ fn sanitize_for_context(name: &str) -> String {
     match cleaned.char_indices().nth(120) {
         Some((idx, _)) => cleaned[..idx].to_string(),
         None => cleaned.to_string(),
+    }
+}
+
+/// Ownership columns, keyed by the skills relation's own primary key.
+///
+/// Fetched by a SEPARATE query rather than by widening the loaders' projections,
+/// and deliberately swallowing the error: `plugin`/`origin` did not exist before
+/// namespacing, and Cozo rejects an ENTIRE query that names a column the
+/// relation lacks. Widening the main projection would therefore turn "user has
+/// upgraded PSS but has not reindexed yet" into "the suggestion hook fails
+/// outright" — a hard regression for every existing install. Isolated here, that
+/// same case just yields an empty map and names render bare until the next
+/// reindex fills the columns in.
+fn load_ownership_columns(db: &DbInstance) -> HashMap<(String, String), (Option<String>, Option<String>)> {
+    let Ok(result) = db.run_script(
+        "?[name, source, plugin, origin] := *skills{ name, source, plugin, origin }",
+        Default::default(),
+        ScriptMutability::Immutable,
+    ) else {
+        return HashMap::new();
+    };
+    let as_str = |v: Option<&DataValue>| -> String {
+        match v {
+            Some(DataValue::Str(s)) => s.to_string(),
+            _ => String::new(),
+        }
+    };
+    let mut map = HashMap::new();
+    for row in &result.rows {
+        if row.len() < 4 {
+            continue;
+        }
+        let plugin = as_str(row.get(2));
+        let origin = as_str(row.get(3));
+        map.insert(
+            (as_str(row.first()), as_str(row.get(1))),
+            (
+                // "" is how a standalone element is stored; it must read back as
+                // absent, not as a plugin literally named "".
+                (!plugin.is_empty()).then_some(plugin),
+                (!origin.is_empty()).then_some(origin),
+            ),
+        );
+    }
+    map
+}
+
+/// The marketplace that owns an element, read out of its `source` label.
+///
+/// `source` is PSS's own grammar (written by `pss_discover.py`), not a
+/// filesystem path — parsing it here is reading a structured label, not
+/// scraping a directory layout.
+fn marketplace_of(source: &str) -> Option<&str> {
+    match source.strip_prefix("plugin:") {
+        // `plugin:<marketplace>/<plugin>` is the version-pinned install cache;
+        // a bare `plugin:<plugin>` is a user- or project-local plugin, which
+        // belongs to no marketplace.
+        Some(rest) => rest.split_once('/').map(|(mp, _)| mp),
+        None => source.strip_prefix("marketplace:"),
+    }
+}
+
+/// How many distinct elements share each namespace tier, across the WHOLE index.
+///
+/// Counted globally rather than within the handful of items being emitted: a
+/// batch-local count would render the same element differently from one prompt
+/// to the next, purely on which neighbours happened to score alongside it.
+#[derive(Debug, Default)]
+pub struct NameCounts {
+    tier1: HashMap<String, usize>,
+    tier2: HashMap<String, usize>,
+}
+
+impl NameCounts {
+    /// Build from every indexed element.
+    ///
+    /// Deduped by resolved identity (plugin, name, path) because one physical
+    /// element can be indexed twice — installed plugins appear under the cache
+    /// (`plugin:<mp>/<plugin>`) while their marketplace checkout is also scanned
+    /// (`marketplace:<mp>`); 9 marketplaces overlap that way here. Counting the
+    /// duplicates would read as a collision and escalate names that are in fact
+    /// unique.
+    pub fn build(entries: impl Iterator<Item = (String, Option<String>, Option<String>, String)>) -> Self {
+        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        let mut counts = NameCounts::default();
+        for (name, plugin, marketplace, path) in entries {
+            let ident = (
+                plugin.clone().unwrap_or_default(),
+                name.clone(),
+                path,
+            );
+            if !seen.insert(ident) {
+                continue;
+            }
+            let t1 = match &plugin {
+                Some(p) => format!("{p}:{name}"),
+                None => name.clone(),
+            };
+            *counts.tier1.entry(t1.clone()).or_insert(0) += 1;
+            let t2 = match &marketplace {
+                Some(m) => format!("{t1}@{m}"),
+                None => t1,
+            };
+            *counts.tier2.entry(t2).or_insert(0) += 1;
+        }
+        counts
+    }
+}
+
+/// Render an element's name at the least-qualified tier that is still unique.
+///
+/// `<plugin>:<name>` is the DEFAULT for anything a plugin owns — it is what
+/// makes a suggestion attributable, so it is applied whether or not the bare
+/// name collides. Escalation past it happens only on a real collision:
+/// `@<marketplace>` when two plugins of the same name come from different
+/// marketplaces, then `@<origin>/<marketplace>` when the marketplace names
+/// collide too. Standalone elements own no plugin and stay bare.
+fn namespaced_name(
+    name: &str,
+    plugin: Option<&str>,
+    marketplace: Option<&str>,
+    origin: Option<&str>,
+    counts: &NameCounts,
+) -> String {
+    let Some(plugin) = plugin else {
+        return name.to_string();
+    };
+    let tier1 = format!("{plugin}:{name}");
+    if counts.tier1.get(&tier1).copied().unwrap_or(0) <= 1 {
+        return tier1;
+    }
+    let Some(marketplace) = marketplace else {
+        return tier1;
+    };
+    let tier2 = format!("{tier1}@{marketplace}");
+    if counts.tier2.get(&tier2).copied().unwrap_or(0) <= 1 {
+        return tier2;
+    }
+    match origin {
+        Some(origin) => format!("{tier1}@{origin}/{marketplace}"),
+        None => tier2,
     }
 }
 
@@ -7568,6 +7728,12 @@ struct MatchedSkill {
     score: i32,
     confidence: Confidence,
     evidence: Vec<String>,
+    /// Ownership, carried through so the emitted name can be namespaced.
+    /// Without these the identity is lost at this hop and the hook can only
+    /// print a bare, unattributable name.
+    plugin: Option<String>,
+    marketplace: Option<String>,
+    origin: Option<String>,
 }
 
 /// Find matching skills with weighted scoring (combines reliable + LimorAI approaches)
@@ -9217,6 +9383,9 @@ fn find_matches(
                 score,
                 confidence,
                 evidence,
+                plugin: entry.plugin.clone(),
+                marketplace: marketplace_of(&entry.source).map(str::to_string),
+                origin: entry.origin.clone(),
             })
         } else {
             None
@@ -9290,6 +9459,9 @@ fn find_matches(
                     path: entry.path.clone(),
                     skill_type: entry.skill_type.clone(),
                     description: entry.description.clone(),
+                    plugin: entry.plugin.clone(),
+                    marketplace: marketplace_of(&entry.source).map(str::to_string),
+                    origin: entry.origin.clone(),
                     score,
                     // Derive confidence from score thresholds (not hardcoded)
                     confidence: if score >= thresholds.high {
@@ -9658,6 +9830,10 @@ fn load_pss_file(pss_path: &PathBuf, index: &mut SkillIndex) -> Result<(), io::E
             name: skill_name.clone(),
             source,
             path,
+            // A hand-authored .pss file describes matchers, not provenance —
+            // there is no plugin manifest behind it, so it renders bare.
+            plugin: None,
+            origin: None,
             skill_type: pss.skill.skill_type.clone(),
             keywords: pss.matchers.keywords.clone(),
             intents: pss.matchers.intents.clone(),
@@ -13241,7 +13417,7 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
         };
 
         // Build enriched output object
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "name": name,
             "type": elem_type,
             "source": source,
@@ -13273,6 +13449,23 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
             // consumers can filter on it instead of re-parsing the .md.
             "agent_metadata": agent_metadata_json,
         });
+
+        // Ownership for the `<plugin>:<name>` suggestion namespace. Enrichment
+        // REBUILDS the record from named fields instead of mutating the input,
+        // so anything not copied here is dropped between discover and the
+        // merge writer — the DB column then exists and is empty for every row.
+        // Only inserted when present, so a standalone element stays absent
+        // (the merge side reads absent as "") rather than gaining a null owner.
+        if let Some(v) = input.get("plugin").and_then(|v| v.as_str()) {
+            if !v.is_empty() {
+                output["plugin"] = serde_json::Value::String(v.to_string());
+            }
+        }
+        if let Some(v) = input.get("origin").and_then(|v| v.as_str()) {
+            if !v.is_empty() {
+                output["origin"] = serde_json::Value::String(v.to_string());
+            }
+        }
 
         // Write enriched JSONL line to stdout
         if let Err(e) = writeln!(out, "{}", serde_json::to_string(&output).unwrap_or_default()) {
@@ -13961,7 +14154,9 @@ fn create_db_schema(db: &DbInstance) -> Result<(), SuggesterError> {
             domains_json: String,
             path_gates_json: String,
             first_indexed_at: String,
-            last_updated_at: String
+            last_updated_at: String,
+            plugin: String,
+            origin: String
         }}
         "#,
         Default::default(),
@@ -14580,6 +14775,7 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
         }
     };
 
+    let ownership = load_ownership_columns(db);
     let mut skills: HashMap<String, SkillEntry> = HashMap::new();
     for row in &main_result.rows {
         if row.len() < 32 { continue; }
@@ -14587,6 +14783,12 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
         let source = dv_str(&row[3]);
         // Use entry ID as HashMap key (collision-safe: same name + different source = different ID)
         let entry_id = make_entry_id(&name, &source);
+        // Keyed on (name, source) — the skills relation's own primary key, so
+        // two same-named elements from different sources keep distinct owners.
+        let (plugin, origin) = ownership
+            .get(&(name.clone(), source.clone()))
+            .cloned()
+            .unwrap_or((None, None));
         let entry = SkillEntry {
             name: name.clone(),
             path: dv_str(&row[1]),
@@ -14620,6 +14822,8 @@ fn load_index_from_db(db: &DbInstance) -> Result<SkillIndex, SuggesterError> {
             path_gates: serde_json::from_str(&dv_str(&row[29])).unwrap_or_default(),
             first_indexed_at: dv_str(&row[30]),
             last_updated_at: dv_str(&row[31]),
+            plugin,
+            origin,
         };
         skills.insert(entry_id, entry);
     }
@@ -14755,12 +14959,17 @@ fn load_candidates_from_db(
         }
     }
 
+    let ownership = load_ownership_columns(db);
     for row in &main_result.rows {
         if row.len() < 32 { continue; }
         let name = dv_str(&row[0]);
         let source = dv_str(&row[3]);
         let entry_id = make_entry_id(&name, &source);
         let mut corrupt_in_row: usize = 0;
+        let (plugin, origin) = ownership
+            .get(&(name.clone(), source.clone()))
+            .cloned()
+            .unwrap_or((None, None));
         let entry = SkillEntry {
             name: name.clone(),
             path: dv_str(&row[1]),
@@ -14794,6 +15003,8 @@ fn load_candidates_from_db(
             path_gates: parse_json_col(&dv_str(&row[29]), "path_gates_json", &name, &mut corrupt_in_row),
             first_indexed_at: dv_str(&row[30]),
             last_updated_at: dv_str(&row[31]),
+            plugin,
+            origin,
         };
         if corrupt_in_row > 0 {
             rows_with_corruption += 1;
@@ -18839,6 +19050,49 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
         load_pss_files(&mut index);
     }
 
+    // SUGGESTION BOUNDARY: the hook may only offer elements the user can
+    // actually invoke, so catalog-only rows leave the candidate pool here.
+    //
+    // `marketplace:<mp>` rows come from the recursive scan of
+    // ~/.claude/plugins/marketplaces/<mp>/ — a CATALOG of installable plugins,
+    // not an install. An installed plugin's elements are indexed separately
+    // under `plugin:<marketplace>/<plugin>` (path under ~/.claude/plugins/cache/).
+    // Measured on the live index: 12503 of 15854 rows are marketplace-scope and
+    // NOT ONE of them lives under an installed-plugin dir, so a catalog row is
+    // unreachable at runtime. Suggesting them wasted the model's attention on
+    // things like `claude` (a stray agents/CLAUDE.md) or `missing-name-agent`
+    // (a unit-test fixture vendored inside a marketplace checkout).
+    //
+    // Applied BEFORE scoring, not to the result list: find_matches() truncates
+    // to MAX_SUGGESTIONS, and the catalog holds dozens of near-identical copies
+    // of every popular element (26 `code-reviewer` rows, 24 of them catalog).
+    // Measured post-hoc, 42 of the 50 returned matches were catalog dupes that
+    // had crowded the installed originals out of the window entirely — the
+    // filter then emptied the block instead of revealing them. Removing the
+    // rows up front lets the invocable copies compete for those 50 slots.
+    //
+    // Hook-only (`--format hook`). Profiling / search / list deliberately need
+    // the FULL corpus (see pss_discover.py section "5b"). The predicate is
+    // prompt-independent, so namespacing built from this index below is still
+    // decided identically on every prompt.
+    if cli.format == "hook" {
+        let before = index.skills.len();
+        index
+            .skills
+            .retain(|_, e| !e.source.starts_with("marketplace:"));
+        // MANDATORY after any retain: `name_to_ids` maps a name to entry IDs and
+        // get_by_name() takes the FIRST id. Leaving it stale would resolve a
+        // co-usage lookup to a just-removed catalog id and return None even
+        // though an installed entry with that name survived — a silent loss of
+        // exactly the elements this filter exists to surface.
+        index.build_name_index();
+        debug!(
+            "Catalog filter: dropped {} marketplace-scope candidate(s), {} remain",
+            before - index.skills.len(),
+            index.skills.len()
+        );
+    }
+
     // Load domain registry: try CozoDB first, then JSON file fallback
     let registry = if let Some(ref db) = db {
         // Try loading from CozoDB (domain tables inside pss-skill-index.db)
@@ -19112,9 +19366,30 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
     // Get max score for relative scoring
     let max_score = matches.iter().map(|m| m.score).max().unwrap_or(1);
 
-    // Build output with confidence-based formatting (from reliable)
+    // Namespace tiers are decided against the WHOLE index, not just the items
+    // being emitted, so an element renders the same way on every prompt
+    // regardless of which neighbours happened to score alongside it.
+    let name_counts = NameCounts::build(index.skills.values().map(|e| {
+        (
+            e.name.clone(),
+            e.plugin.clone(),
+            marketplace_of(&e.source).map(str::to_string),
+            e.path.clone(),
+        )
+    }));
+
+    // One physical file can be indexed under several sources — a user-scope
+    // agent is also seen as project-scope, and an installed plugin's element is
+    // also seen in its marketplace checkout. Those rows are distinct index
+    // entries but the SAME element, and emitting each of them offered the
+    // identical name twice with nothing to tell them apart (measured: two
+    // `python-test-writer` rows, one path, both surfaced). Namespacing cannot
+    // fix that — the duplicates agree on their namespace precisely because they
+    // are the same element — so collapse on resolved identity before emitting.
+    let mut emitted: HashSet<(Option<String>, String, String)> = HashSet::new();
     let context_items: Vec<ContextItem> = matches
         .iter()
+        .filter(|m| emitted.insert((m.plugin.clone(), m.name.clone(), m.path.clone())))
         .map(|m| {
             // Add commitment reminder for HIGH confidence (from reliable)
             let commitment = if m.confidence == Confidence::High {
@@ -19125,7 +19400,16 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
 
             ContextItem {
                 item_type: m.skill_type.clone(),
-                name: m.name.clone(),
+                // The namespaced form IS the display name: a bare name is not
+                // enough to tell the model which of several same-named elements
+                // it is being offered, nor where it came from.
+                name: namespaced_name(
+                    &m.name,
+                    m.plugin.as_deref(),
+                    m.marketplace.as_deref(),
+                    m.origin.as_deref(),
+                    &name_counts,
+                ),
                 path: m.path.clone(),
                 description: m.description.clone(),
                 score: calculate_relative_score(m.score, max_score),
@@ -19631,6 +19915,8 @@ mod tests {
             language_ids: vec![],
             first_indexed_at: String::new(),
             last_updated_at: String::new(),
+            plugin: None,
+            origin: None,
         });
 
         test_insert(&mut skills, SkillEntry {
@@ -19671,6 +19957,8 @@ mod tests {
             language_ids: vec![],
             first_indexed_at: String::new(),
             last_updated_at: String::new(),
+            plugin: None,
+            origin: None,
         });
 
         test_skill_index(skills)
@@ -19825,6 +20113,8 @@ mod tests {
             language_ids: vec![],
             first_indexed_at: String::new(),
             last_updated_at: String::new(),
+            plugin: None,
+            origin: None,
         });
 
         test_insert(&mut skills, SkillEntry {
@@ -19860,6 +20150,8 @@ mod tests {
             language_ids: vec![],
             first_indexed_at: String::new(),
             last_updated_at: String::new(),
+            plugin: None,
+            origin: None,
         });
 
         let index = test_skill_index(skills);
@@ -19992,6 +20284,8 @@ mod tests {
             language_ids: vec![],
             first_indexed_at: String::new(),
             last_updated_at: String::new(),
+            plugin: None,
+            origin: None,
         });
 
         let index = test_skill_index(skills);
@@ -20093,6 +20387,9 @@ mod tests {
             score: 15,
             confidence: Confidence::High,
             evidence: vec!["keyword:docker".to_string()],
+            plugin: None,
+            marketplace: None,
+            origin: None,
         };
 
         let match2_same = MatchedSkill {
@@ -20103,6 +20400,9 @@ mod tests {
             score: 12,
             confidence: Confidence::Medium,
             evidence: vec!["keyword:container".to_string()],
+            plugin: None,
+            marketplace: None,
+            origin: None,
         };
 
         let match3 = MatchedSkill {
@@ -20113,6 +20413,9 @@ mod tests {
             score: 10,
             confidence: Confidence::Medium,
             evidence: vec!["keyword:kubernetes".to_string()],
+            plugin: None,
+            marketplace: None,
+            origin: None,
         };
 
         let all_matches = vec![
@@ -20548,6 +20851,8 @@ mod tests {
             language_ids: vec![],
             first_indexed_at: String::new(),
             last_updated_at: String::new(),
+            plugin: None,
+            origin: None,
         });
 
         test_insert(&mut skills, SkillEntry {
@@ -20587,6 +20892,8 @@ mod tests {
             language_ids: vec![],
             first_indexed_at: String::new(),
             last_updated_at: String::new(),
+            plugin: None,
+            origin: None,
         });
 
         let index = test_skill_index(skills);
@@ -21437,6 +21744,8 @@ mediapipe>=0.10
             language_ids: vec![],
             first_indexed_at: String::new(),
             last_updated_at: String::new(),
+            plugin: None,
+            origin: None,
         });
 
         let index = test_skill_index(skills);
@@ -21569,6 +21878,8 @@ mediapipe>=0.10
             language_ids: vec![],
             first_indexed_at: String::new(),
             last_updated_at: String::new(),
+            plugin: None,
+            origin: None,
         });
 
         let index = test_skill_index(skills);
@@ -21641,6 +21952,8 @@ mediapipe>=0.10
                 language_ids: vec![],
                 first_indexed_at: String::new(),
                 last_updated_at: String::new(),
+                plugin: None,
+                origin: None,
             });
         }
 
@@ -21797,6 +22110,8 @@ mediapipe>=0.10
                 language_ids: vec![],
                 first_indexed_at: String::new(),
                 last_updated_at: String::new(),
+                plugin: None,
+                origin: None,
             });
         }
 
@@ -22692,5 +23007,127 @@ mediapipe>=0.10
     #[test]
     fn contract_version_constant_is_one() {
         assert_eq!(CONTRACT_VERSION, "1");
+    }
+
+    /// An element with no plugin renders bare, even when its name collides
+    /// with other bare or plugin-owned elements.
+    #[test]
+    fn standalone_element_renders_bare() {
+        let counts = NameCounts::build(
+            vec![
+                ("foo".to_string(), None, None, "/a/foo".to_string()),
+                ("foo".to_string(), None, None, "/b/foo".to_string()),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(namespaced_name("foo", None, None, None, &counts), "foo");
+    }
+
+    /// A plugin-owned element always renders `<plugin>:<name>` even with zero
+    /// collisions — tier 1 is unconditional attribution, not collision-triggered.
+    #[test]
+    fn plugin_owned_element_always_gets_tier1_prefix() {
+        let counts = NameCounts::build(
+            vec![("foo".to_string(), Some("acme".to_string()), None, "/a/foo".to_string())].into_iter(),
+        );
+        assert_eq!(
+            namespaced_name("foo", Some("acme"), None, None, &counts),
+            "acme:foo"
+        );
+    }
+
+    /// Two distinct elements sharing the same `<plugin>:<name>` tier-1 string
+    /// (different marketplaces) escalate to `<plugin>:<name>@<marketplace>`.
+    #[test]
+    fn tier1_collision_escalates_to_marketplace() {
+        let counts = NameCounts::build(
+            vec![
+                (
+                    "foo".to_string(),
+                    Some("acme".to_string()),
+                    Some("mp1".to_string()),
+                    "/a/foo".to_string(),
+                ),
+                (
+                    "foo".to_string(),
+                    Some("acme".to_string()),
+                    Some("mp2".to_string()),
+                    "/b/foo".to_string(),
+                ),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            namespaced_name("foo", Some("acme"), Some("mp1"), None, &counts),
+            "acme:foo@mp1"
+        );
+    }
+
+    /// When even the tier-2 `<plugin>:<name>@<marketplace>` string collides
+    /// (same marketplace name, different origin), escalate to the full
+    /// `<plugin>:<name>@<origin>/<marketplace>` form.
+    #[test]
+    fn tier2_collision_escalates_to_origin() {
+        let counts = NameCounts::build(
+            vec![
+                (
+                    "foo".to_string(),
+                    Some("acme".to_string()),
+                    Some("mp1".to_string()),
+                    "/a/foo".to_string(),
+                ),
+                (
+                    "foo".to_string(),
+                    Some("acme".to_string()),
+                    Some("mp1".to_string()),
+                    "/b/foo".to_string(),
+                ),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            namespaced_name("foo", Some("acme"), Some("mp1"), Some("origin-a"), &counts),
+            "acme:foo@origin-a/mp1"
+        );
+    }
+
+    /// NameCounts::build dedups by (plugin, name, path): the same element
+    /// indexed twice (once from the install cache, once from a marketplace
+    /// checkout) must not be counted as a collision.
+    #[test]
+    fn name_counts_build_dedups_identical_plugin_name_path() {
+        let counts = NameCounts::build(
+            vec![
+                (
+                    "foo".to_string(),
+                    Some("acme".to_string()),
+                    Some("mp1".to_string()),
+                    "/same/path/foo".to_string(),
+                ),
+                (
+                    "foo".to_string(),
+                    Some("acme".to_string()),
+                    Some("mp1".to_string()),
+                    "/same/path/foo".to_string(),
+                ),
+            ]
+            .into_iter(),
+        );
+        // Only one distinct element was seen, so tier1 must not escalate.
+        assert_eq!(
+            namespaced_name("foo", Some("acme"), Some("mp1"), None, &counts),
+            "acme:foo"
+        );
+    }
+
+    /// marketplace_of parses PSS's `source` label grammar: a pinned install
+    /// cache path yields the marketplace, a bare plugin path yields None.
+    #[test]
+    fn marketplace_of_parses_plugin_and_marketplace_sources() {
+        assert_eq!(marketplace_of("plugin:mp/pl"), Some("mp"));
+        assert_eq!(marketplace_of("plugin:pl"), None);
+        assert_eq!(marketplace_of("marketplace:mp"), Some("mp"));
+        assert_eq!(marketplace_of("user"), None);
+        assert_eq!(marketplace_of("project:x"), None);
     }
 }
