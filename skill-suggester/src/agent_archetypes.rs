@@ -212,26 +212,33 @@ pub fn frontmatter_block(content: &str) -> Option<&str> {
 
 /// Read a scalar boolean field out of a frontmatter block.
 ///
-/// Hand-rolled rather than pulling in a YAML parser: the gate needs exactly one
-/// boolean, and the frontmatter it reads is authored by third parties whose files
-/// must not be able to fail the whole generation because of an unrelated YAML
-/// quirk elsewhere in the block.
+/// Hand-rolled scanning rather than pulling in a YAML parser: the gate needs
+/// exactly one boolean, and the frontmatter it reads is authored by third parties
+/// whose files must not be able to fail the whole generation because of an
+/// unrelated YAML quirk elsewhere in the block.
+///
+/// The truthiness decision itself is delegated to `agent_meta::parse_frontmatter_bool`
+/// so this reader and the agent-frontmatter reader cannot disagree about what `on`
+/// or `1` means — they did, until CC 2.1.218 made that divergence load-bearing.
 fn frontmatter_bool(block: &str, key: &str) -> Option<bool> {
     for line in block.lines() {
         let line = line.trim_end();
         if line.starts_with([' ', '\t']) {
             continue; // nested — not a top-level field
         }
-        let (k, v) = line.split_once(':')?;
+        // `continue`, NOT `?`. A colon-less line is simply one we do not care
+        // about — a blank line, a `#` comment, a bare list item. Aborting the whole
+        // scan there meant a single blank line above `disable-model-invocation: true`
+        // returned None, which `gate_preloadable` reads via `.unwrap_or(false)` as
+        // "not user-only" and happily preloads a skill the harness then silently
+        // refuses to load — the exact failure this gate exists to prevent.
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         if k.trim() != key {
             continue;
         }
-        let v = v.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
-        return match v.as_str() {
-            "true" | "yes" | "on" => Some(true),
-            "false" | "no" | "off" => Some(false),
-            _ => None,
-        };
+        return crate::agent_meta::parse_frontmatter_bool(v);
     }
     None
 }
@@ -887,6 +894,61 @@ mod tests {
         assert!(res.ok.is_empty());
         assert_eq!(res.rejected.len(), 1);
         assert_eq!(res.rejected[0].1, RejectReason::UserOnly);
+    }
+
+    #[test]
+    fn gate_reads_user_only_below_a_blank_line() {
+        // Regression: the scanner used `?` on `split_once(':')`, so the first
+        // colon-less line — a blank one — aborted the whole scan and yielded None.
+        // `gate_preloadable` reads None via `.unwrap_or(false)` as "not user-only",
+        // so this skill got preloaded and was then silently dropped by the harness.
+        let dir = tmpdir("gate-blankline");
+        let s = skill_file(
+            &dir,
+            "deployer",
+            "\ndisable-model-invocation: true\n",
+            "Deploy it.",
+        );
+        let res = gate_preloadable(&[s]);
+        assert_eq!(
+            res.rejected.first().map(|r| &r.1),
+            Some(&RejectReason::UserOnly),
+            "a blank line above the field must not hide it"
+        );
+    }
+
+    #[test]
+    fn gate_honours_every_boolean_spelling_cc_2_1_218_legalized() {
+        for truthy in ["true", "yes", "on", "1", "YES", "On"] {
+            let dir = tmpdir(&format!("gate-true-{truthy}"));
+            let s = skill_file(
+                &dir,
+                "deployer",
+                &format!("disable-model-invocation: {truthy}\n"),
+                "Deploy it.",
+            );
+            let res = gate_preloadable(&[s]);
+            assert_eq!(
+                res.rejected.first().map(|r| &r.1),
+                Some(&RejectReason::UserOnly),
+                "disable-model-invocation: {truthy} must gate the skill out"
+            );
+        }
+        for falsy in ["false", "no", "off", "0"] {
+            let dir = tmpdir(&format!("gate-false-{falsy}"));
+            let s = skill_file(
+                &dir,
+                "tester",
+                &format!("disable-model-invocation: {falsy}\n"),
+                "Run the tests.",
+            );
+            let res = gate_preloadable(&[s]);
+            assert_eq!(
+                res.ok.len(),
+                1,
+                "disable-model-invocation: {falsy} must leave the skill preloadable"
+            );
+        }
     }
 
     #[test]

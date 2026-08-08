@@ -4346,6 +4346,46 @@ fn load_ownership_columns(db: &DbInstance) -> HashMap<(String, String), (Option<
     map
 }
 
+/// Entry ids of skills the model is not allowed to invoke.
+///
+/// A `disable-model-invocation: true` skill is USER-only — it runs from its slash
+/// command and the model cannot call it — so offering one spends a suggestion slot
+/// on something Claude is forbidden to act on. Measured 27 such skills across 2674
+/// installed on a real machine.
+///
+/// A SEPARATE query, error swallowed, for exactly the reason spelled out on
+/// `load_ownership_columns`: `disable_model_invocation` did not exist before v3.13,
+/// and Cozo rejects an ENTIRE query naming a column the relation lacks. Widening
+/// the main projection would turn "upgraded PSS but has not reindexed yet" into
+/// "the suggestion hook fails outright". Isolated here, that case yields an empty
+/// set and the hook simply behaves as it did before — the flag starts working at
+/// the next reindex.
+///
+/// Keyed by entry id (not name) so the caller can test `index.skills`' own map key
+/// and avoid cloning two Strings per candidate on every prompt.
+fn load_noninvocable_ids(db: &DbInstance) -> std::collections::HashSet<String> {
+    let Ok(result) = db.run_script(
+        "?[name, source] := *skills{ name, source, disable_model_invocation }, \
+         disable_model_invocation == true",
+        Default::default(),
+        ScriptMutability::Immutable,
+    ) else {
+        return std::collections::HashSet::new();
+    };
+    let as_str = |v: Option<&DataValue>| -> String {
+        match v {
+            Some(DataValue::Str(s)) => s.to_string(),
+            _ => String::new(),
+        }
+    };
+    result
+        .rows
+        .iter()
+        .filter(|row| row.len() >= 2)
+        .map(|row| make_entry_id(&as_str(row.first()), &as_str(row.get(1))))
+        .collect()
+}
+
 /// The marketplace that owns an element, read out of its `source` label.
 ///
 /// `source` is PSS's own grammar (written by `pss_discover.py`), not a
@@ -5133,6 +5173,24 @@ fn expand_synonyms(prompt: &str) -> String {
     }
     if msg.contains("react native") {
         expanded.push_str(" ios android mobile javascript typescript");
+    }
+
+    // Language abbreviations. Measured 2026-08-02: without these, "write ts tests"
+    // expanded to a prompt containing no "typescript" token at all, so every
+    // typescript-gated entry was excluded by its own programming_language gate and
+    // PSS returned an EMPTY suggestion block. The gate is doing the right thing —
+    // the abbreviation simply never reached it.
+    if RE_LANG_TS.is_match(&msg) {
+        expanded.push_str(" typescript");
+    }
+    if RE_LANG_JS.is_match(&msg) {
+        expanded.push_str(" javascript");
+    }
+    if RE_LANG_PY.is_match(&msg) {
+        expanded.push_str(" python");
+    }
+    if RE_LANG_RS.is_match(&msg) {
+        expanded.push_str(" rust");
     }
 
     // Gaps & Sync
@@ -7668,9 +7726,38 @@ fn check_domain_gates(
             continue;
         }
 
-        // Check if any gate keyword appears in the prompt
+        // Check if any gate keyword appears in the prompt as a WHOLE TOKEN.
+        //
+        // Substring matching is wrong here, and silently so: synonym expansion
+        // injects index element NAMES into the prompt text, so "write rust tests"
+        // expands to a string containing the literal "python-test-writer" — which
+        // CONTAINS "python" and therefore satisfied that agent's
+        // {programming_language: [python, shell]} gate on a Rust prompt. The gate
+        // was admitting the very element whose name it was matching against.
+        //
+        // Splitting on whitespace ONLY (never on '-') keeps "python-test-writer" a
+        // single token that cannot equal "python". Synonym expansion still satisfies
+        // gates, because every expansion is appended as its own whitespace-separated
+        // token. Inner '-', '+' and '#' are preserved so "c++", "c#" and
+        // "objective-c" remain matchable.
+        //
+        // NB: the W5 comment at the call site claims "ts" expands to "typescript";
+        // measured 2026-08-02, it does not — "write ts tests" expands without any
+        // "typescript" token, so typescript-gated entries are excluded under BOTH
+        // the old substring and this token match. That is a separate recall gap in
+        // the synonym table, not something this comparison can fix.
         let gate_passes = gate_keywords.iter().any(|kw| {
-            prompt_lower.contains(&kw.to_lowercase())
+            let kw_l = kw.to_lowercase();
+            if kw_l.contains(' ') {
+                // Multi-word keyword ("react native") has no single-token form.
+                prompt_lower.contains(&kw_l)
+            } else {
+                prompt_lower.split_whitespace().any(|w| {
+                    w.trim_matches(|c: char| {
+                        !c.is_alphanumeric() && c != '-' && c != '+' && c != '#'
+                    }) == kw_l
+                })
+            }
         });
 
         if !gate_passes {
@@ -8017,6 +8104,33 @@ fn find_matches(
     ];
     for &lang in direct_lang_names {
         if prompt_words_for_lang.iter().any(|w| *w == lang) {
+            prompt_langs.insert(lang.to_string());
+        }
+    }
+    // Language abbreviations and file extensions -> canonical language.
+    //
+    // These CANNOT go in lang_signal_patterns below: that table uses `contains`,
+    // which would fire "ts" on "tests"/"artifacts" and "py" on "numpy" — silently
+    // marking a Rust or Python prompt as TypeScript. Matched here as a whole word
+    // (after trimming surrounding punctuation, so "ts." and "ts," still count) or
+    // as a trailing file extension, so "write ts tests" and "fix main.ts" both
+    // resolve while "tests" never does.
+    //
+    // Without this, the LANGUAGE CONFLICT GATE saw `prompt langs: empty` for
+    // "write ts tests" and excluded every typescript-tagged entry, so PSS returned
+    // an empty suggestion block (measured 2026-08-02).
+    let lang_abbreviations: &[(&str, &str)] = &[
+        ("ts", "typescript"),
+        ("js", "javascript"),
+        ("py", "python"),
+        ("rs", "rust"),
+    ];
+    for &(abbr, lang) in lang_abbreviations {
+        let dot_ext = format!(".{}", abbr);
+        if prompt_words_for_lang.iter().any(|w| {
+            let w = w.trim_matches(|c: char| !c.is_alphanumeric());
+            w == abbr || w.ends_with(&dot_ext)
+        }) {
             prompt_langs.insert(lang.to_string());
         }
     }
@@ -9722,6 +9836,34 @@ fn load_domain_registry(path: &PathBuf) -> Result<Option<DomainRegistry>, Sugges
         serde_json::from_str(&content).map_err(|e| SuggesterError::IndexParse(
             format!("Failed to parse domain registry: {}", e)
         ))?;
+
+    // A registry that parses but carries ZERO domains is the worst of both worlds and
+    // must never be used silently. `detect_domains_from_prompt_with_context` iterates
+    // `registry.domains`, so an empty map yields an empty `detected_domains`, and
+    // `check_domain_gates` then takes its `if !domain_detected` branch for EVERY gated
+    // entry — excluding all of them. PSS returns a near-empty suggestion block and
+    // nothing anywhere says why.
+    //
+    // This is a real on-disk state, not a hypothetical: a stale 234-byte
+    // `domain-registry.json` with `"domain_count": 0` sits in the plugin data dir
+    // (2026-07-16). It is inert today only because `get_registry_path()` resolves to
+    // ~/.claude/cache/ while the DB resolves via `get_data_dir()` — align those two
+    // and every gated element vanishes from suggestions.
+    //
+    // Degrade the way the rest of the hot path does (warn loudly, keep working) rather
+    // than exiting: this runs inside UserPromptSubmit, where a hard failure would take
+    // the user's prompt down with it. Treating it as ABSENT restores the documented
+    // "gates not enforced" behaviour, which is over-permissive but visible, instead of
+    // silently suppressing every gated suggestion.
+    if registry.domains.is_empty() {
+        eprintln!(
+            "PSS WARNING: domain registry at {:?} contains ZERO domains. \
+             Treating it as absent — domain gates will NOT be enforced. \
+             Re-run `/pss-reindex-skills` to regenerate it.",
+            path
+        );
+        return Ok(None);
+    }
 
     info!(
         "Loaded domain registry: {} domains from {:?}",
@@ -13448,6 +13590,15 @@ fn run_pass1_batch() -> Result<(), SuggesterError> {
             // declared capability surface, kept structured so downstream
             // consumers can filter on it instead of re-parsing the .md.
             "agent_metadata": agent_metadata_json,
+            // A `disable-model-invocation: true` skill is user-only: the model
+            // cannot invoke it, so suggesting it wastes a slot on something
+            // Claude is not allowed to call. Carried through enrichment as a
+            // named field so the hook can drop these BEFORE scoring — see the
+            // rebuild note directly below, which is why it must be copied here.
+            "disable_model_invocation": input
+                .get("disable_model_invocation")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         });
 
         // Ownership for the `<plugin>:<name>` suggestion namespace. Enrichment
@@ -19077,9 +19228,18 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
     // decided identically on every prompt.
     if cli.format == "hook" {
         let before = index.skills.len();
+        // Same boundary, second class of un-invocable element: a skill whose
+        // frontmatter says `disable-model-invocation: true` can only be run by the
+        // USER from its slash command. Dropped here, BEFORE scoring, for the very
+        // reason spelled out above — filtering the result list instead would let
+        // these occupy slots and then blank them.
+        let noninvocable = db
+            .as_ref()
+            .map(load_noninvocable_ids)
+            .unwrap_or_default();
         index
             .skills
-            .retain(|_, e| !e.source.starts_with("marketplace:"));
+            .retain(|id, e| !e.source.starts_with("marketplace:") && !noninvocable.contains(id));
         // MANDATORY after any retain: `name_to_ids` maps a name to entry IDs and
         // get_by_name() takes the FIRST id. Leaving it stale would resolve a
         // co-usage lookup to a just-removed catalog id and return None even
@@ -19087,7 +19247,7 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
         // exactly the elements this filter exists to surface.
         index.build_name_index();
         debug!(
-            "Catalog filter: dropped {} marketplace-scope candidate(s), {} remain",
+            "Invocability filter: dropped {} catalog-scope + user-only candidate(s), {} remain",
             before - index.skills.len(),
             index.skills.len()
         );

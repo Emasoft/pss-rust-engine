@@ -221,11 +221,10 @@ pub fn parse_agent_definition(content: &str) -> AgentMeta {
         skills: list("skills"),
         mcp_servers: list("mcpServers"),
         memory: get("memory"),
-        background: get("background").and_then(|v| match v.to_ascii_lowercase().as_str() {
-            "true" | "yes" => Some(true),
-            "false" | "no" => Some(false),
-            _ => None,
-        }),
+        // Goes through the one shared coercion. An inline `match` here is exactly
+        // how this drifted from `agent_archetypes::frontmatter_bool` and ended up
+        // accepting a different set of spellings than the sibling parser.
+        background: get("background").as_deref().and_then(parse_frontmatter_bool),
         effort: get("effort"),
         isolation: get("isolation"),
         color: get("color"),
@@ -233,9 +232,85 @@ pub fn parse_agent_definition(content: &str) -> AgentMeta {
     }
 }
 
+/// Coerce one frontmatter scalar to a boolean — the single source of truth for
+/// truthiness anywhere PSS reads authored YAML frontmatter.
+///
+/// Claude Code 2.1.218 widened skill and plugin frontmatter booleans to accept
+/// `yes`/`no`/`on`/`off`/`1`/`0` case-insensitively alongside `true`/`false`. All
+/// eight spellings are therefore legal input that authors will actually write, and
+/// every one of them has to land on the same answer — which is why this lives in
+/// one function instead of being re-matched at each call site.
+///
+/// An unrecognized value is `None`, deliberately **not** `false`: that is a
+/// malformed field, and collapsing it to `false` would invent a setting the author
+/// never wrote and hide the typo forever.
+///
+/// Hand-rolled rather than pulling in a YAML crate because callers read files
+/// authored by third parties — an unrelated YAML quirk elsewhere in the block must
+/// not be able to fail the read of the one field we came for.
+pub fn parse_frontmatter_bool(value: &str) -> Option<bool> {
+    match value
+        .trim()
+        .trim_matches(['"', '\''])
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_frontmatter_bool_accepts_every_spelling_cc_2_1_218_legalized() {
+        for truthy in ["true", "yes", "on", "1", "TRUE", "Yes", "ON", "\"yes\"", " on "] {
+            assert_eq!(
+                parse_frontmatter_bool(truthy),
+                Some(true),
+                "{truthy:?} should parse as true"
+            );
+        }
+        for falsy in ["false", "no", "off", "0", "FALSE", "No", "OFF", "'off'"] {
+            assert_eq!(
+                parse_frontmatter_bool(falsy),
+                Some(false),
+                "{falsy:?} should parse as false"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_frontmatter_bool_returns_none_not_false_for_garbage() {
+        // None and Some(false) are different answers: None means "the author wrote
+        // something we do not understand", and must never be silently downgraded
+        // into a real `false` setting.
+        for junk in ["", "maybe", "2", "truthy", "y", "n"] {
+            assert_eq!(parse_frontmatter_bool(junk), None, "{junk:?} should be None");
+        }
+    }
+
+    #[test]
+    fn background_field_reads_the_widened_spellings() {
+        for (raw, want) in [
+            ("on", Some(true)),
+            ("OFF", Some(false)),
+            ("1", Some(true)),
+            ("0", Some(false)),
+            ("Yes", Some(true)),
+            ("banana", None),
+        ] {
+            let doc = format!("---\nname: a\ndescription: d\nbackground: {raw}\n---\nbody\n");
+            assert_eq!(
+                parse_agent_definition(&doc).background,
+                want,
+                "background: {raw} misparsed"
+            );
+        }
+    }
 
     const SAMPLE: &str = r#"---
 name: code-reviewer

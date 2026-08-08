@@ -416,6 +416,15 @@ lazy_static! {
     pub(crate) static ref RE_AZURE: Regex = Regex::new(r"(?i)\b(azure|blob|functions|cosmos)\b").unwrap();
     pub(crate) static ref RE_SECURITY: Regex = Regex::new(r"(?i)\b(security|auth|oauth|jwt|encryption)\b").unwrap();
     pub(crate) static ref RE_PERF: Regex = Regex::new(r"(?i)\b(performance|slow|latency|optimize|profil)\b").unwrap();
+    // Language abbreviations -> canonical language name, for domain-gate satisfaction.
+    // WORD-BOUNDARY ONLY, never `contains`: a bare substring test for "ts" matches
+    // "tests", "artifacts" and "components", which would inject "typescript" into
+    // prompts that never mentioned it. `\b` also makes a file extension match, so
+    // "fix main.ts" and "run foo.py" resolve to the right language too.
+    pub(crate) static ref RE_LANG_TS: Regex = Regex::new(r"(?i)\bts\b").unwrap();
+    pub(crate) static ref RE_LANG_JS: Regex = Regex::new(r"(?i)\bjs\b").unwrap();
+    pub(crate) static ref RE_LANG_PY: Regex = Regex::new(r"(?i)\bpy\b").unwrap();
+    pub(crate) static ref RE_LANG_RS: Regex = Regex::new(r"(?i)\brs\b").unwrap();
 }
 
 // ============================================================================
