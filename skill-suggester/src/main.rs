@@ -19711,7 +19711,13 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
             // it repeats within the TTL. Empty sets never touch the state
             // file, so a quiet prompt can't "use up" the window.
             let mut items = limited_items;
-            if cli.format == "hook" && !items.is_empty() {
+            // Dedupe ONLY when a session_id is present: real CC hook input
+            // always carries one, while test harnesses and manual invocations
+            // don't — and deduping across unrelated session-less invocations
+            // through the shared state file is wrong (it turned the CI e2e
+            // suite red on v3.13.1: Phase 5 scored a prompt, Phase 6 re-sent
+            // the same prompt seconds later and got an empty emission).
+            if cli.format == "hook" && !items.is_empty() && !input.session_id.is_empty() {
                 let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
                 if suggest_dedupe::should_suppress_and_record(
                     cli.index.as_deref(),
