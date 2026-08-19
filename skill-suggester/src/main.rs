@@ -40,6 +40,11 @@ pub(crate) use data::*;
 mod suggest_mode;
 pub(crate) use suggest_mode::SuggestionMode;
 
+// Suppresses a hook emission when the exact same suggestion set was already
+// emitted to the same session within the TTL — repeated identical sets on
+// consecutive prompts are pure noise-tokens (fleet request, 2026-08-18).
+mod suggest_dedupe;
+
 // Agent-definition frontmatter + body key-phrase extraction. Agents are now a
 // first-class suggestion target, so they must be indexed as richly as skills —
 // including the `skills:` they preload, which is what makes an agent reachable
@@ -19699,8 +19704,26 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
             println!("{}", serde_json::to_string_pretty(&candidates)?);
         }
         _ => {
-            // Default hook format for Claude Code integration
-            let output = HookOutput::with_suggestions(limited_items, active_mode);
+            // Default hook format for Claude Code integration.
+            //
+            // Dedupe window (fleet request 2026-08-18): the exact set the
+            // model just saw carries no new information — emit nothing when
+            // it repeats within the TTL. Empty sets never touch the state
+            // file, so a quiet prompt can't "use up" the window.
+            let mut items = limited_items;
+            if cli.format == "hook" && !items.is_empty() {
+                let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+                if suggest_dedupe::should_suppress_and_record(
+                    cli.index.as_deref(),
+                    &input.session_id,
+                    active_mode.as_str(),
+                    &names,
+                ) {
+                    debug!("suggest-dedupe: identical set within TTL — suppressing emission");
+                    items.clear();
+                }
+            }
+            let output = HookOutput::with_suggestions(items, active_mode);
             println!("{}", serde_json::to_string(&output)?);
         }
     }
@@ -19763,6 +19786,32 @@ fn is_skip_prompt(prompt: &str) -> bool {
 
     // Slash commands like /plugin, /help, /exit
     if trimmed.starts_with('/') || trimmed.starts_with("<command-name>/") {
+        return true;
+    }
+
+    // Automation-shaped prompts (fleet request, 2026-08-18): machine-generated
+    // traffic — cron marker fires and cross-session peer messages — is not a
+    // user ask, so a suggestion on it is pure noise. Two detectable shapes:
+    //
+    //  * Marker fire: the FIRST LINE is exactly `[token]` (lowercase ASCII
+    //    letters/digits/hyphens), e.g. a `[janitor-heartbeat]` cron prompt.
+    //    Whole-line on purpose: "[bug] parser crashes" stays suggestible.
+    //  * Peer envelope: cross-session messages arrive wrapped in a
+    //    `<cross-session-message …>` tag.
+    let first_line = trimmed.lines().next().unwrap_or("").trim_end();
+    if let Some(inner) = first_line
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        if !inner.is_empty()
+            && inner
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return true;
+        }
+    }
+    if trimmed.contains("<cross-session-message") {
         return true;
     }
 
@@ -22696,6 +22745,32 @@ mediapipe>=0.10
         ] {
             assert!(!is_skip_prompt(p), "{:?} must NOT be skipped", p);
         }
+    }
+
+    #[test]
+    fn is_skip_prompt_skips_marker_fires() {
+        // A cron/automation fire: bare `[token]` alone on the first line.
+        assert!(is_skip_prompt(
+            "[janitor-heartbeat]\n/path/to/dispatcher-stub.py\nHandle stdout per the rule."
+        ));
+        assert!(is_skip_prompt("[janitor-resume]\ncontinue your pending task"));
+        assert!(is_skip_prompt("[loop-tick-2]"));
+    }
+
+    #[test]
+    fn is_skip_prompt_keeps_bracket_prefixed_human_prompts() {
+        // The marker must be the WHOLE first line and lowercase — a human
+        // writing a bracketed tag inline or in caps still gets suggestions.
+        assert!(!is_skip_prompt("[bug] the parser crashes on empty input"));
+        assert!(!is_skip_prompt("[BUG]\nthe parser crashes on empty input"));
+        assert!(!is_skip_prompt("[see attached] fix the flaky test"));
+    }
+
+    #[test]
+    fn is_skip_prompt_skips_cross_session_envelopes() {
+        assert!(is_skip_prompt(
+            "Another Claude session sent a message:\n<cross-session-message from=\"x\">hello</cross-session-message>"
+        ));
     }
 
     #[test]
