@@ -70,6 +70,13 @@ fn run_self_test(tokenizer: &NlpTokenizer) {
             &["redux"],
             &[],
         ),
+        // No-"like" avoidance with a contrastive clause (TRDD-DHD7PEHV):
+        // exercises the general-scope path, not detect_avoidance_like.
+        (
+            "Avoid React, use Vue for the frontend",
+            &["react"],
+            &["vue"],
+        ),
     ];
 
     let mut passed = 0;

@@ -490,9 +490,12 @@ impl PatternDetector {
         let is_avoidance = marker.all_pos.iter().any(|p| p.starts_with("VB"))
             && crate::tokenizer::AVOIDANCE_VERBS.contains(&marker.text_lower.as_str());
 
-        // For avoidance verbs, scope extends to end of sentence
+        // For avoidance verbs the scope extends past ordinary list commas
+        // ("avoid react, angular and vue" negates all three), but MUST stop at
+        // a contrastive clause ("avoid react, use vue" — vue is wanted), which
+        // the plain end-of-sentence rule wrongly negated (TRDD-DHD7PEHV).
         let effective_end = if is_avoidance {
-            sentence.tokens.len() - 1
+            Self::find_avoidance_boundary(sentence, negation_idx)
         } else {
             scope_end
         };
@@ -516,6 +519,48 @@ impl PatternDetector {
             negated_terms: negated,
             non_negated_terms: vec![],
         })
+    }
+
+    /// Scope boundary for an avoidance verb (TRDD-DHD7PEHV).
+    /// Unlike `find_clause_boundary`, a comma alone does NOT end the scope —
+    /// "avoid react, angular and vue" is one exclusion list. The scope ends at:
+    /// - ";" / "." / SENT_END / "but"(CC), or
+    /// - a comma whose following word starts a contrastive clause: a verb
+    ///   (VB*) or a known contrastive imperative ("avoid react, use vue").
+    fn find_avoidance_boundary(sentence: &AnnotatedSentence, start_idx: usize) -> usize {
+        let tokens = &sentence.tokens;
+        for (i, token) in tokens.iter().enumerate() {
+            if token.index <= start_idx {
+                continue;
+            }
+            if token.text_lower == ";"
+                || token.text_lower == "."
+                || token.all_pos.iter().any(|p| p == "SENT_END")
+            {
+                return token.index.saturating_sub(1);
+            }
+            if token.text_lower == "but" && token.all_pos.iter().any(|p| p == "CC") {
+                return token.index.saturating_sub(1);
+            }
+            if token.text_lower == "," {
+                // Peek past the comma: a verb there starts a contrastive
+                // clause (stop); a noun continues the exclusion list (go on).
+                // The word list backs up the POS tag because imperatives at
+                // clause starts are routinely mistagged as nouns.
+                if let Some(next) = tokens.get(i + 1) {
+                    let is_verb = next.all_pos.iter().any(|p| p.starts_with("VB"));
+                    let is_contrastive = matches!(
+                        next.text_lower.as_str(),
+                        "use" | "prefer" | "choose" | "pick" | "stick" | "go"
+                            | "keep" | "try" | "opt" | "switch" | "just" | "instead"
+                    );
+                    if is_verb || is_contrastive {
+                        return token.index.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        tokens.len().saturating_sub(1)
     }
 
     /// Find the clause boundary after a given token index.
@@ -589,6 +634,36 @@ mod tests {
         let scope = avoidance.unwrap();
         assert!(scope.negated_terms.contains(&"vue".to_string()), "Expected 'vue' negated");
         assert!(scope.negated_terms.contains(&"angular".to_string()), "Expected 'angular' negated");
+    }
+
+    /// "avoid X, use Y" with no "like": Phase 1's detect_avoidance_like cannot
+    /// fire, so this drives Phase 2 compute_general_negation_scope directly —
+    /// the previously untested path (TRDD-DHD7PEHV). Y must NOT be negated.
+    #[test]
+    fn test_avoidance_contrastive_clause_not_negated() {
+        let tok = make_tokenizer();
+        // Capitalized names: lowercase "react" POS-tags as a VERB (to react)
+        // and is filtered by is_noun — a separate, pre-existing limitation
+        // recorded on TRDD-DHD7PEHV. Capitalized forms tag NNP and isolate
+        // the scope logic under test.
+        let sentences = tok.analyze("Avoid React, use Vue for the frontend.");
+        let scopes = PatternDetector::detect_all(&sentences[0]);
+        let neg: Vec<&String> = scopes.iter().flat_map(|s| &s.negated_terms).collect();
+        assert!(neg.iter().any(|t| *t == "react"), "react must be negated, got {:?}", neg);
+        assert!(!neg.iter().any(|t| *t == "vue"), "vue must NOT be negated, got {:?}", neg);
+    }
+
+    /// No-"like" avoidance where end-of-sentence scope IS correct: list commas
+    /// must not truncate the exclusion list (TRDD-DHD7PEHV).
+    #[test]
+    fn test_avoidance_list_scope_to_end_of_sentence() {
+        let tok = make_tokenizer();
+        let sentences = tok.analyze("Avoid React, Angular and Vue.");
+        let scopes = PatternDetector::detect_all(&sentences[0]);
+        let neg: Vec<&String> = scopes.iter().flat_map(|s| &s.negated_terms).collect();
+        for t in ["react", "angular", "vue"] {
+            assert!(neg.iter().any(|x| *x == t), "{} must be negated, got {:?}", t, neg);
+        }
     }
 
     #[test]
