@@ -20027,14 +20027,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_wait_child_with_deadline_returns_fast_child_output() {
-        let child = std::process::Command::new("/bin/sh")
-            .args(["-c", "printf hello"])
+        // Direct binary, no shell — a `sh -c` here trips the release
+        // security scanner (SHELL_EXEC) and blocks the publish gate.
+        let child = std::process::Command::new("/bin/echo")
+            .arg("hello")
             .stdout(std::process::Stdio::piped())
             .spawn()
-            .expect("spawn sh");
+            .expect("spawn /bin/echo");
         let out = wait_child_with_deadline(child, std::time::Duration::from_millis(2000))
             .expect("fast child must yield output");
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "hello");
     }
 
     /// The stdin request built for pss-nlp must stay far below the OS pipe
