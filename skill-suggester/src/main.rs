@@ -7925,6 +7925,39 @@ fn find_pss_nlp_binary() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Deadline on the pss-nlp subprocess call (TRDD-AXZAXMDQ). The hook fires on
+/// every UserPromptSubmit, so a wedged child must never block the prompt.
+const PSS_NLP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Wait for `child` up to `timeout`; on expiry (or a wait error) kill and reap
+/// it, returning None. Poll-based (`try_wait`) so no extra crate is needed.
+/// A child that fills the stdout pipe and blocks also hits the deadline and is
+/// killed — fail-safe, matching the caller's silent-skip contract.
+fn wait_child_with_deadline(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap — no zombie left behind
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Call the pss-nlp binary to detect negated terms in a prompt.
 /// Returns a set of lowercase negated terms, or empty set if pss-nlp is unavailable.
 /// This is the key integration point between PSS scoring and NLP-based negation detection.
@@ -7945,7 +7978,7 @@ fn detect_prompt_negations(prompt: &str) -> std::collections::HashSet<String> {
         "text": prompt
     });
 
-    // Call pss-nlp as subprocess with timeout (500ms max to keep prompt scoring fast)
+    // Call pss-nlp as subprocess, bounded by PSS_NLP_TIMEOUT (500ms) below
     let child = std::process::Command::new(&binary)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -7967,11 +8000,12 @@ fn detect_prompt_negations(prompt: &str) -> std::collections::HashSet<String> {
         // Drop stdin to signal EOF, which triggers pss-nlp to process and respond
     }
 
-    // Read response from stdout with timeout
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => {
-            debug!("pss-nlp wait failed: {}", e);
+    // Wait for the child under a real deadline: a wedged pss-nlp is killed and
+    // negation detection silently skipped, so the prompt hook can never hang.
+    let output = match wait_child_with_deadline(child, PSS_NLP_TIMEOUT) {
+        Some(o) => o,
+        None => {
+            debug!("pss-nlp timed out or failed within {:?}, killed; skipping NLP negation detection", PSS_NLP_TIMEOUT);
             return result;
         }
     };
@@ -14279,149 +14313,6 @@ fn acquire_db_flock(db_path: &Path, suffix: &str) -> std::fs::File {
     f
 }
 
-/// Create the CozoDB schema with all relations needed for skill indexing.
-///
-/// Kept as a reference implementation alongside
-/// `scripts/pss_cozodb.py::_create_db_schema` after the Phase C (v3.0.0)
-/// removal of `run_build_db`. No Rust code path calls this function.
-#[allow(dead_code)]
-fn create_db_schema(db: &DbInstance) -> Result<(), SuggesterError> {
-    // Main skills table: scalar fields + JSON-serialized vector fields
-    // `id` is a deterministic 13-char hash of the entry key for stable references
-    db.run_script(
-        r#"
-        {:create skills {
-            name: String, source: String =>
-            id: String,
-            path: String,
-            skill_type: String,
-            description: String,
-            tier: String,
-            boost: Int,
-            category: String,
-            server_type: String,
-            server_command: String,
-            server_args_json: String,
-            language_ids_json: String,
-            negative_kw_json: String,
-            patterns_json: String,
-            directories_json: String,
-            path_patterns_json: String,
-            use_cases_json: String,
-            co_usage_json: String,
-            alternatives_json: String,
-            domain_gates_json: String,
-            file_types_json: String,
-            keywords_json: String,
-            intents_json: String,
-            tools_json: String,
-            services_json: String,
-            frameworks_json: String,
-            languages_json: String,
-            platforms_json: String,
-            domains_json: String,
-            path_gates_json: String,
-            first_indexed_at: String,
-            last_updated_at: String,
-            plugin: String,
-            origin: String
-        }}
-        "#,
-        Default::default(),
-        ScriptMutability::Mutable,
-    ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (skills) failed: {}", e)))?;
-
-    // Pre-filter relations: normalized for Datalog joins during candidate selection
-    let relations = [
-        "skill_keywords", "skill_intents", "skill_tools", "skill_services",
-        "skill_frameworks", "skill_languages", "skill_platforms", "skill_domains",
-        "skill_file_types",
-    ];
-    for rel in &relations {
-        let script = format!(
-            "{{:create {} {{ skill_name: String, value: String }}}}",
-            rel
-        );
-        db.run_script(&script, Default::default(), ScriptMutability::Mutable)
-            .map_err(|e| SuggesterError::IndexParse(
-                format!("Schema create ({}) failed: {}", rel, e)
-            ))?;
-    }
-
-    // Domain registry table: stores canonical domain entries
-    db.run_script(
-        r#"{:create domain_registry {
-            canonical_name: String =>
-            has_generic: Bool,
-            skill_count: Int
-        }}"#,
-        Default::default(),
-        ScriptMutability::Mutable,
-    ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (domain_registry) failed: {}", e)))?;
-
-    // Domain registry aliases: maps alias names to canonical domains
-    db.run_script(
-        "{:create domain_aliases { alias: String, canonical_name: String }}",
-        Default::default(),
-        ScriptMutability::Mutable,
-    ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (domain_aliases) failed: {}", e)))?;
-
-    // Domain registry keywords: keywords for each domain used in detection
-    db.run_script(
-        "{:create domain_keywords { canonical_name: String, keyword: String }}",
-        Default::default(),
-        ScriptMutability::Mutable,
-    ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (domain_keywords) failed: {}", e)))?;
-
-    // Domain registry skills: which skills are gated by each domain
-    db.run_script(
-        "{:create domain_skills { canonical_name: String, skill_name: String }}",
-        Default::default(),
-        ScriptMutability::Mutable,
-    ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (domain_skills) failed: {}", e)))?;
-
-    // Unified inverted lookup: keyword_lower is the FIRST key for fast prefix scans.
-    // Populated from ALL inverted tables (keywords, frameworks, intents, tools, services,
-    // languages, platforms, domains) plus skill name parts.
-    // At hook time: query by keyword_lower to get candidate skill_names in O(log n).
-    db.run_script(
-        "{:create kw_lookup { keyword_lower: String, skill_name: String }}",
-        Default::default(),
-        ScriptMutability::Mutable,
-    ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (kw_lookup) failed: {}", e)))?;
-
-    // ID lookup table: maps 13-char deterministic IDs to entry (name, source) pairs
-    db.run_script(
-        "{:create skill_ids { id: String => name: String, source: String }}",
-        Default::default(),
-        ScriptMutability::Mutable,
-    ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (skill_ids) failed: {}", e)))?;
-
-    // Metadata table for version, generated timestamp, etc.
-    db.run_script(
-        "{:create pss_metadata { key: String => value: String }}",
-        Default::default(),
-        ScriptMutability::Mutable,
-    ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (metadata) failed: {}", e)))?;
-
-    // Rules table: stores rule file metadata separately from skills.
-    // Rules are auto-injected (not suggestable), but indexed for get-description
-    // lookups and agent profiling.  Populated on-demand via `pss index-rules`.
-    db.run_script(
-        r#"{:create rules {
-            name: String, scope: String =>
-            description: String,
-            source_path: String,
-            summary: String,
-            keywords_json: String
-        }}"#,
-        Default::default(),
-        ScriptMutability::Mutable,
-    ).map_err(|e| SuggesterError::IndexParse(format!("Schema create (rules) failed: {}", e)))?;
-
-    Ok(())
-}
-
 /// Helper: build inline Datalog data from a vec of (skill_name, value) pairs.
 /// Returns a string like: [["skill1", "kw1"], ["skill1", "kw2"], ...]
 fn build_inline_data(pairs: &[(String, String)]) -> String {
@@ -14695,11 +14586,12 @@ fn insert_skills_batch(
 // Phase C (v3.0.0): `run_build_db` has been removed. The Python merge writer
 // (`scripts/pss_merge_queue.py::_sync_cozodb`) populates CozoDB directly
 // during each merge — see `scripts/pss_cozodb.py::atomic_write_cozodb`. The
-// auxiliary helpers `create_db_schema`, `insert_skills_batch`, and
-// `insert_domain_registry_batch` are retained below with `#[allow(dead_code)]`
-// as reference implementations that the Python port mirrors byte-for-byte.
-// Removing them here would make it harder to diff the two implementations
-// when hunting schema drift or compatibility bugs.
+// schema is DEFINED ONLY in `scripts/pss_cozodb.py::_create_db_schema`; the
+// Rust `create_db_schema` copy was deleted (TRDD-AS90UUQ5) after it silently
+// drifted from the live schema (missing `disable_model_invocation`), proving
+// a dead "reference copy" guards nothing. The data helpers
+// `insert_skills_batch` and `insert_domain_registry_batch` remain below with
+// `#[allow(dead_code)]` as insert-shape references only.
 
 /// Batch-insert domain registry data into CozoDB.
 /// Populates domain_registry, domain_aliases, domain_keywords, domain_skills tables.
@@ -20078,6 +19970,41 @@ fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stalled child is killed at the deadline and does not stall the caller
+    /// (TRDD-AXZAXMDQ) — this is the exact mechanism detect_prompt_negations
+    /// runs pss-nlp under. Real subprocess, no env mutation, unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn test_wait_child_with_deadline_kills_stalled_child() {
+        let start = std::time::Instant::now();
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let out = wait_child_with_deadline(child, std::time::Duration::from_millis(200));
+        let elapsed = start.elapsed();
+        assert!(out.is_none(), "stalled child must yield None");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "caller stalled for {:?} — deadline did not fire",
+            elapsed
+        );
+    }
+
+    /// A child that exits within the deadline returns its full output.
+    #[cfg(unix)]
+    #[test]
+    fn test_wait_child_with_deadline_returns_fast_child_output() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf hello"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let out = wait_child_with_deadline(child, std::time::Duration::from_millis(2000))
+            .expect("fast child must yield output");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    }
 
     /// Helper to insert a SkillEntry into a HashMap using the proper entry ID key.
     fn test_insert(skills: &mut HashMap<String, SkillEntry>, entry: SkillEntry) {
