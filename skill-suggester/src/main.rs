@@ -7929,6 +7929,16 @@ fn find_pss_nlp_binary() -> Option<std::path::PathBuf> {
 /// every UserPromptSubmit, so a wedged child must never block the prompt.
 const PSS_NLP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Cap on the text sent to pss-nlp over its stdin pipe. The write at the call
+/// site is synchronous and happens BEFORE wait_child_with_deadline, so it is
+/// outside the deadline: a request larger than the OS pipe buffer (~64 KiB)
+/// written to a child that is wedged before reading stdin would block the
+/// parent in the write itself and hang the prompt hook. Keeping the request
+/// far below the pipe buffer guarantees the write always fits in the buffer
+/// and returns immediately regardless of child state. Negation phrases live
+/// in normal-length prompts; a 100 KB paste gains nothing from full coverage.
+const PSS_NLP_MAX_TEXT_BYTES: usize = 8 * 1024;
+
 /// Wait for `child` up to `timeout`; on expiry (or a wait error) kill and reap
 /// it, returning None. Poll-based (`try_wait`) so no extra crate is needed.
 /// A child that fills the stdout pipe and blocks also hits the deadline and is
@@ -7958,6 +7968,17 @@ fn wait_child_with_deadline(
     }
 }
 
+/// Truncate the text destined for pss-nlp's stdin at a char boundary, capped
+/// at PSS_NLP_MAX_TEXT_BYTES — see that constant for why this must never be
+/// removed (an uncapped write can block outside the deadline).
+fn cap_nlp_text(prompt: &str) -> &str {
+    let mut end = PSS_NLP_MAX_TEXT_BYTES.min(prompt.len());
+    while !prompt.is_char_boundary(end) {
+        end -= 1;
+    }
+    &prompt[..end]
+}
+
 /// Call the pss-nlp binary to detect negated terms in a prompt.
 /// Returns a set of lowercase negated terms, or empty set if pss-nlp is unavailable.
 /// This is the key integration point between PSS scoring and NLP-based negation detection.
@@ -7972,10 +7993,12 @@ fn detect_prompt_negations(prompt: &str) -> std::collections::HashSet<String> {
         }
     };
 
+    let capped = cap_nlp_text(prompt);
+
     // Build JSON request for prompt-mode negation detection
     let request = serde_json::json!({
         "mode": "prompt",
-        "text": prompt
+        "text": capped
     });
 
     // Call pss-nlp as subprocess, bounded by PSS_NLP_TIMEOUT (500ms) below
@@ -20004,6 +20027,25 @@ mod tests {
         let out = wait_child_with_deadline(child, std::time::Duration::from_millis(2000))
             .expect("fast child must yield output");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    }
+
+    /// The stdin request built for pss-nlp must stay far below the OS pipe
+    /// buffer (~64 KiB) even for a huge multibyte prompt, or the synchronous
+    /// pre-deadline write can block against a wedged child (TRDD-AXZAXMDQ
+    /// residual: the deadline guards the wait, not the write).
+    #[test]
+    fn test_cap_nlp_text_keeps_request_under_pipe_buffer() {
+        let huge = "é".repeat(100_000); // 200 KB of 2-byte chars
+        let capped = cap_nlp_text(&huge);
+        assert!(capped.len() <= PSS_NLP_MAX_TEXT_BYTES);
+        let request = serde_json::json!({"mode": "prompt", "text": capped}).to_string();
+        assert!(
+            request.len() < 60 * 1024,
+            "serialized request {} bytes — could block in the pipe write",
+            request.len()
+        );
+        // Short prompts pass through untouched.
+        assert_eq!(cap_nlp_text("avoid react, use vue"), "avoid react, use vue");
     }
 
     /// Helper to insert a SkillEntry into a HashMap using the proper entry ID key.
