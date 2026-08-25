@@ -7937,7 +7937,15 @@ const PSS_NLP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50
 /// far below the pipe buffer guarantees the write always fits in the buffer
 /// and returns immediately regardless of child state. Negation phrases live
 /// in normal-length prompts; a 100 KB paste gains nothing from full coverage.
-const PSS_NLP_MAX_TEXT_BYTES: usize = 8 * 1024;
+///
+/// 2 KiB, not more, because BOTH bounds below are worst-case:
+/// - JSON escaping inflates up to 6x (control chars become \uXXXX), so 2 KiB
+///   of text can serialize to ~12 KiB;
+/// - a macOS pipe starts at 16 KiB and only grows opportunistically — under
+///   pipe-memory pressure it stays 16 KiB.
+/// 12 KiB < 16 KiB keeps the write non-blocking even when both worst cases
+/// stack. The test bounds the SERIALIZED request, not the raw text.
+const PSS_NLP_MAX_TEXT_BYTES: usize = 2 * 1024;
 
 /// Wait for `child` up to `timeout`; on expiry (or a wait error) kill and reap
 /// it, returning None. Poll-based (`try_wait`) so no extra crate is needed.
@@ -20035,15 +20043,22 @@ mod tests {
     /// residual: the deadline guards the wait, not the write).
     #[test]
     fn test_cap_nlp_text_keeps_request_under_pipe_buffer() {
-        let huge = "é".repeat(100_000); // 200 KB of 2-byte chars
-        let capped = cap_nlp_text(&huge);
+        // Worst case for BOTH bounds: control chars escape at 6x (), and
+        // a macOS pipe under memory pressure stays at 16 KiB. The SERIALIZED
+        // request must clear an un-grown 16 KiB pipe, so bound it at 14 KiB.
+        let worst = "\u{1}".repeat(200_000);
+        let capped = cap_nlp_text(&worst);
         assert!(capped.len() <= PSS_NLP_MAX_TEXT_BYTES);
         let request = serde_json::json!({"mode": "prompt", "text": capped}).to_string();
         assert!(
-            request.len() < 60 * 1024,
-            "serialized request {} bytes — could block in the pipe write",
+            request.len() < 14 * 1024,
+            "serialized worst-case request {} bytes — could block in an un-grown macOS pipe",
             request.len()
         );
+        // Multibyte truncation lands on a char boundary.
+        let multibyte = "é".repeat(100_000);
+        let capped_mb = cap_nlp_text(&multibyte);
+        assert!(capped_mb.len() <= PSS_NLP_MAX_TEXT_BYTES);
         // Short prompts pass through untouched.
         assert_eq!(cap_nlp_text("avoid react, use vue"), "avoid react, use vue");
     }
