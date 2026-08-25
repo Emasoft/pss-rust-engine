@@ -10419,6 +10419,18 @@ fn extract_rule_paths(frontmatter: &HashMap<String, String>) -> Vec<String> {
 
 /// Extract the markdown body (everything after frontmatter).
 fn extract_md_body(content: &str) -> &str {
+    // Strip a UTF-8 BOM first, same as parse_frontmatter. CC 2.1.240 made
+    // Claude Code honor BOM'd .md elements; without this the bare
+    // starts_with("---") below sees the BOM byte instead of "---" and returns
+    // the WHOLE file (frontmatter included) as "body", poisoning keyword
+    // extraction with YAML. parse_frontmatter rebinds its own local when it
+    // strips the BOM, so its caller's original `content` here still carries
+    // it — this function must strip independently, not rely on the caller.
+    // trim_start_matches (not strip_prefix) removes ALL leading BOMs, matching
+    // the Python side's `lstrip(chr(0xFEFF))` — a single-strip/repeat-strip
+    // mismatch is exactly the kind of divergence documented at
+    // agent_meta.rs:238.
+    let content = content.trim_start_matches('\u{feff}');
     if content.starts_with("---") {
         let after_first = &content[3..];
         if let Some(end) = after_first.find("\n---") {
@@ -22580,6 +22592,23 @@ mediapipe>=0.10
         let fm = parse_frontmatter("\u{feff}---\nname: bommed\ndescription: ok\n---\n");
         assert_eq!(fm.get("name").map(String::as_str), Some("bommed"));
         assert_eq!(fm.get("description").map(String::as_str), Some("ok"));
+    }
+
+    #[test]
+    fn extract_md_body_tolerates_utf8_bom() {
+        // Without stripping the BOM, starts_with("---") missed it and the
+        // whole file (frontmatter included) was returned as "body", poisoning
+        // keyword extraction with YAML.
+        let no_bom = extract_md_body("---\nname: x\n---\n\nBODY");
+        let with_bom = extract_md_body("\u{feff}---\nname: x\n---\n\nBODY");
+        assert_eq!(with_bom, no_bom);
+        assert!(!with_bom.contains("name: x"));
+        assert_eq!(with_bom, "BODY");
+
+        // Doubled BOM (some tools double-encode) must be fully stripped too.
+        let double_bom = extract_md_body("\u{feff}\u{feff}---\nname: x\n---\n\nBODY");
+        assert!(!double_bom.contains("name: x"));
+        assert_eq!(double_bom, "BODY");
     }
 
     #[test]
