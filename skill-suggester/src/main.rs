@@ -19251,12 +19251,37 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
         // `is_foreign_project_element` for why the index contains any, and why
         // comparing against the live `input.cwd` is what fixes a mid-session
         // `/cd` without a hook. Computed once, outside the closure.
+        //
+        // `HookInput::cwd` is `#[serde(default)]`, so a payload without the
+        // field yields "". That is NOT a project we can compare against: the
+        // degenerate slug matches nothing, so the filter would drop EVERY
+        // project-scoped element — all 689 of them, in every project, on every
+        // prompt — while looking like it worked. So an empty cwd disables this
+        // predicate rather than applying it.
+        //
+        // This is deliberately the OPPOSITE of the per-element unprovable-path
+        // rule inside the predicate, and the asymmetry is the point: an unknown
+        // that is local to one element costs one suggestion when it fails
+        // closed, whereas an unknown that destroys the comparison BASIS costs an
+        // entire scope class. Both directions minimise the blast radius of the
+        // thing we do not know. Degrading to the pre-v3.14.2 behaviour (a
+        // cross-project leak) is recoverable and visible; silently emptying a
+        // scope is neither.
+        let cwd_known = !input.cwd.trim().is_empty();
         let here_slug = project_slug(Path::new(&input.cwd));
         let here_path = python_resolve(Path::new(&input.cwd));
+        if !cwd_known {
+            debug!(
+                "cross-project filter DISABLED: the hook payload carried no `cwd`, \
+                 so project membership is undecidable; keeping every project-scoped \
+                 element rather than dropping all of them"
+            );
+        }
         index.skills.retain(|id, e| {
             !e.source.starts_with("marketplace:")
                 && !noninvocable.contains(id)
-                && !is_foreign_project_element(&e.source, &e.path, &here_slug, &here_path)
+                && !(cwd_known
+                    && is_foreign_project_element(&e.source, &e.path, &here_slug, &here_path))
         });
         // MANDATORY after any retain: `name_to_ids` maps a name to entry IDs and
         // get_by_name() takes the FIRST id. Leaving it stale would resolve a
@@ -23351,6 +23376,46 @@ mediapipe>=0.10
         assert!(
             f("project", "/tmpother/.claude/skills/x/SKILL.md"),
             "prefix-sharing sibling dir must not count as containment"
+        );
+    }
+
+    /// An EMPTY `cwd` must disable the cross-project filter, not apply it.
+    ///
+    /// `HookInput::cwd` is `#[serde(default)]`, so a payload missing the field
+    /// deserializes to `""`. Applied naively, the resulting degenerate slug
+    /// matches no real project and the predicate reports EVERY project-scoped
+    /// element as foreign — silently emptying a whole scope class on every
+    /// prompt. This asserts the raw predicate really does behave that way (so
+    /// nobody "simplifies" the caller's guard away believing it is redundant),
+    /// and pins the guard condition the caller keys on.
+    #[test]
+    fn empty_cwd_would_condemn_everything_so_the_caller_must_gate_on_it() {
+        let empty_slug = project_slug(Path::new(""));
+        let empty_path = python_resolve(Path::new(""));
+
+        // The predicate ALONE, under an empty cwd, calls a real project foreign.
+        assert!(
+            is_foreign_project_element(
+                "project:perfect-skill-suggester-f246da48",
+                "/anywhere/x/SKILL.md",
+                &empty_slug,
+                &empty_path,
+            ),
+            "an empty cwd makes every slugged project look foreign — which is \
+             exactly why the caller must not apply the predicate in that state"
+        );
+
+        // Hence the caller's guard. `cwd_known` is this expression; if it ever
+        // stops matching the one in `run()`, this test is the tripwire.
+        for absent in ["", "   ", "\t\n"] {
+            assert!(
+                absent.trim().is_empty(),
+                "{absent:?} must count as an unknown cwd and disable the filter"
+            );
+        }
+        assert!(
+            !"/tmp".trim().is_empty(),
+            "a real cwd must leave the filter ENABLED"
         );
     }
 
