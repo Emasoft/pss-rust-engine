@@ -14317,15 +14317,35 @@ fn candidate_is_invocable_here(
 /// coincidence. No `.claude/` anywhere up the chain means cwd is not inside a
 /// project at all — return it unchanged, and the caller then correctly finds
 /// that no project owns it.
+/// `$HOME/.claude` is the USER scope, NOT a project marker — treating it as one
+/// makes every non-project directory under `$HOME` "belong to" a `$HOME`
+/// project. Measured here: `$HOME` is in the registry with 569 elements (the
+/// hooks out of `~/.claude/settings.json`), so a cwd like `~/scratch` adopted
+/// all of them. Skipping this ONE directory still lets a cwd of exactly `$HOME`
+/// resolve correctly: the walk then finds no marker and returns cwd unchanged,
+/// whose slug is `$HOME`'s own.
+fn is_user_scope_claude_dir(dir: &Path) -> bool {
+    std::env::var_os("HOME")
+        .map(|h| dir == Path::new(&h))
+        .unwrap_or(false)
+}
+
 fn owning_project_root(cwd: &Path) -> PathBuf {
-    let mut cur = Some(cwd);
+    // Canonicalize BEFORE walking, never after. Discovery slugs a RESOLVED path,
+    // so walking the raw path and resolving the result lets a symlinked cwd
+    // terminate at a different root than the one the element was keyed under —
+    // the same two-ends-must-agree defect as the trim inconsistency, in path
+    // form. Resolve once here; the caller then resolves the (already-resolved)
+    // root idempotently.
+    let start = python_resolve(cwd);
+    let mut cur = Some(start.as_path());
     while let Some(dir) = cur {
-        if dir.join(".claude").is_dir() {
+        if !is_user_scope_claude_dir(dir) && dir.join(".claude").is_dir() {
             return dir.to_path_buf();
         }
         cur = dir.parent();
     }
-    cwd.to_path_buf()
+    start.clone()
 }
 
 /// The whole cross-project decision for ONE candidate: the `cwd` guard AND the
@@ -23655,8 +23675,15 @@ mediapipe>=0.10
         std::fs::create_dir_all(&deep).unwrap();
 
         // The walk-up finds the same root from the root itself and from below.
-        assert_eq!(owning_project_root(&root), root);
-        assert_eq!(owning_project_root(&deep), root);
+        // Compare against the RESOLVED root: `owning_project_root` canonicalizes
+        // before walking (so a symlinked cwd cannot terminate at a different
+        // root than discovery keyed), and on macOS the temp dir really is a
+        // symlink — `/var` → `/private/var`. Asserting against the raw path here
+        // failed exactly that way, which is the canonicalization-order bug
+        // demonstrating itself inside its own test.
+        let root_resolved = python_resolve(&root);
+        assert_eq!(owning_project_root(&root), root_resolved);
+        assert_eq!(owning_project_root(&deep), root_resolved);
 
         let mine = format!("project:{}", project_slug(&root));
         let elem = root.join(".claude/skills/x/SKILL.md");
@@ -23692,6 +23719,41 @@ mediapipe>=0.10
         ));
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// `$HOME/.claude` is the user scope, not a project marker.
+    ///
+    /// `$HOME` can legitimately be IN the project registry (it is on this
+    /// machine, with 569 elements), so before this guard the walk-up from any
+    /// non-project directory under `$HOME` terminated at `~/.claude` and adopted
+    /// all of them. Skipping that one directory must NOT break a cwd of exactly
+    /// `$HOME`, which still has to resolve to itself.
+    #[test]
+    fn home_claude_dir_is_user_scope_not_a_project_marker() {
+        let home = match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h),
+            None => return, // nothing to assert without a HOME
+        };
+        if !home.join(".claude").is_dir() {
+            return; // the condition under test does not exist on this box
+        }
+
+        // A non-project directory under $HOME must NOT be adopted by $HOME.
+        let scratch = home.join("pss-test-not-a-project-xyz");
+        assert_ne!(
+            owning_project_root(&scratch),
+            python_resolve(&home),
+            "a plain directory under $HOME must not resolve to a $HOME project — \
+             ~/.claude is the USER scope, not a project marker"
+        );
+
+        // But cwd == $HOME still resolves to $HOME: the walk finds no marker and
+        // returns the (resolved) starting point, whose slug is $HOME's own.
+        assert_eq!(
+            owning_project_root(&home),
+            python_resolve(&home),
+            "$HOME itself must still resolve to $HOME"
+        );
     }
 
     /// P-6: trailing slash is irrelevant (matches Python `Path("/tmp/").name == "tmp"`
