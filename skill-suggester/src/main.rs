@@ -14275,6 +14275,59 @@ fn cwd_is_usable_basis(cwd: &str) -> bool {
     p.is_absolute() && p.parent().is_some()
 }
 
+/// The COMPLETE retain predicate — all three exclusion classes in one place,
+/// so the whole decision is unit-testable and `run()`'s closure is a single
+/// call rather than a conjunction assembled at the call site.
+///
+/// HONEST LIMIT, stated because the previous two versions of this comment
+/// overclaimed: extracting this shrinks the untested boundary to one line
+/// (the `retain(...)` call itself) but cannot eliminate it. Deleting that call
+/// still leaves the suite green. Moving a boundary is not closing it, and only
+/// an integration test that drives `run()` end-to-end would close this one.
+/// What IS covered is every rule and their composition; what is not is the
+/// single act of calling it.
+fn candidate_is_invocable_here(
+    cwd: &str,
+    source: &str,
+    path: &str,
+    id: &str,
+    noninvocable: &HashSet<String>,
+) -> bool {
+    !source.starts_with("marketplace:")
+        && !noninvocable.contains(id)
+        && !should_drop_as_foreign_project(cwd, source, path)
+}
+
+/// Resolve `cwd` to the root of the project that OWNS it.
+///
+/// This is the fix for the structural error the first four `cwd` guards were
+/// all patching around. Discovery derives every slug from a project ROOT (the
+/// registry in `~/.claude.json`, or the cwd's own `.claude/`), so comparing a
+/// slug computed from a RAW cwd answers "is cwd exactly a project root?" — not
+/// "which project owns cwd?". Those differ the moment anyone prompts from a
+/// subdirectory: from `/Users/me/proj/src` the slug is `src-<hash(.../src)>`
+/// while the element carries `proj-<hash(.../proj)>`, so a project's own
+/// elements read as foreign and are dropped. Measured on v3.14.4:
+/// `cwd=.../SVG-MATRIX` suggested that project's agents, `cwd=.../SVG-MATRIX/src`
+/// suggested none.
+///
+/// Walking up to the nearest ancestor containing `.claude/` mirrors what
+/// discovery actually scans (`pss_discover.py` adds `cwd/.claude` for the
+/// current project), so the two ends agree by construction rather than by
+/// coincidence. No `.claude/` anywhere up the chain means cwd is not inside a
+/// project at all — return it unchanged, and the caller then correctly finds
+/// that no project owns it.
+fn owning_project_root(cwd: &Path) -> PathBuf {
+    let mut cur = Some(cwd);
+    while let Some(dir) = cur {
+        if dir.join(".claude").is_dir() {
+            return dir.to_path_buf();
+        }
+        cur = dir.parent();
+    }
+    cwd.to_path_buf()
+}
+
 /// The whole cross-project decision for ONE candidate: the `cwd` guard AND the
 /// origin predicate, composed. `run()` calls exactly this, so the WIRING
 /// between guard and predicate is covered by tests rather than living as an
@@ -14295,8 +14348,11 @@ fn should_drop_as_foreign_project(cwd: &str, source: &str, path: &str) -> bool {
     if !cwd_is_usable_basis(cwd) {
         return false; // undecidable basis → keep everything; never mass-condemn
     }
-    let here = Path::new(cwd);
-    is_foreign_project_element(source, path, &project_slug(here), &python_resolve(here))
+    // Compare against the OWNING PROJECT ROOT, never the raw cwd — see
+    // `owning_project_root`. Using the raw cwd asks "is cwd exactly a project
+    // root", which drops a project's own elements from any subdirectory.
+    let here = owning_project_root(Path::new(cwd));
+    is_foreign_project_element(source, path, &project_slug(&here), &python_resolve(&here))
 }
 
 /// True when `source` names a project OTHER than the one we are prompting from.
@@ -19369,11 +19425,9 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
                  element rather than dropping all of them"
             );
         }
-        index.skills.retain(|id, e| {
-            !e.source.starts_with("marketplace:")
-                && !noninvocable.contains(id)
-                && !should_drop_as_foreign_project(&input.cwd, &e.source, &e.path)
-        });
+        index
+            .skills
+            .retain(|id, e| candidate_is_invocable_here(&input.cwd, &e.source, &e.path, id, &noninvocable));
         // MANDATORY after any retain: `name_to_ids` maps a name to entry IDs and
         // get_by_name() takes the FIRST id. Leaving it stale would resolve a
         // co-usage lookup to a just-removed catalog id and return None even
@@ -23582,6 +23636,62 @@ mediapipe>=0.10
             assert!(!should_drop_as_foreign_project(cwd, "user:codex", "/x"));
             assert!(!should_drop_as_foreign_project(cwd, "plugin:ponytail", "/x"));
         }
+    }
+
+    /// Prompting from a SUBDIRECTORY must not drop the project's own elements.
+    ///
+    /// This is the defect four successive `cwd` guards failed to catch, because
+    /// each patched an INPUT to a membership test that was itself the wrong
+    /// test: comparing a slug computed from the raw cwd asks "is cwd exactly a
+    /// project root", so from `<root>/src` a project's own elements read as
+    /// foreign. Uses a real temp tree — the walk-up does filesystem I/O, so a
+    /// synthetic path would prove nothing.
+    #[test]
+    fn a_subdirectory_still_belongs_to_its_project() {
+        let base = std::env::temp_dir().join(format!("pss-owner-{}", std::process::id()));
+        let root = base.join("myproj");
+        let deep = root.join("src/inner");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+
+        // The walk-up finds the same root from the root itself and from below.
+        assert_eq!(owning_project_root(&root), root);
+        assert_eq!(owning_project_root(&deep), root);
+
+        let mine = format!("project:{}", project_slug(&root));
+        let elem = root.join(".claude/skills/x/SKILL.md");
+        let (elem, deep_s, root_s) = (
+            elem.to_string_lossy().to_string(),
+            deep.to_string_lossy().to_string(),
+            root.to_string_lossy().to_string(),
+        );
+
+        for cwd in [&root_s, &deep_s] {
+            assert!(
+                !should_drop_as_foreign_project(cwd, &mine, &elem),
+                "own project element must survive from {cwd}"
+            );
+            assert!(
+                !should_drop_as_foreign_project(cwd, "project", &elem),
+                "bare-source own element must survive from {cwd}"
+            );
+            assert!(
+                should_drop_as_foreign_project(cwd, "project:other-deadbeef", "/e/S.md"),
+                "a genuinely foreign project must still be dropped from {cwd}"
+            );
+        }
+
+        // A directory with no `.claude/` anywhere above is not in a project, so
+        // nothing owns it and project-scoped elements are correctly dropped.
+        let orphan = base.join("not-a-project");
+        std::fs::create_dir_all(&orphan).unwrap();
+        assert!(should_drop_as_foreign_project(
+            &orphan.to_string_lossy(),
+            &mine,
+            &elem
+        ));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// P-6: trailing slash is irrelevant (matches Python `Path("/tmp/").name == "tmp"`
