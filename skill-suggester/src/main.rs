@@ -14228,6 +14228,60 @@ fn python_resolve(input: &Path) -> PathBuf {
     resolved
 }
 
+/// Whether `cwd` is a usable basis for deciding project membership.
+///
+/// This gates the cross-project filter, so it answers "can we decide?", NOT
+/// "is this a project?". The two failure directions are not symmetric, which is
+/// the whole reason this is a named function rather than an inline expression:
+/// when the basis is undecidable the filter must be DISABLED (keep everything,
+/// degrading to the pre-v3.14.2 cross-project leak — visible and recoverable),
+/// because applying it would condemn every project-scoped element at once and
+/// look exactly like working software.
+///
+/// Undecidable, so the filter is disabled:
+///   - empty / whitespace — `HookInput::cwd` is `#[serde(default)]`, so a
+///     payload without the field lands here (the v3.14.2 defect).
+///   - RELATIVE — a malformed payload. `python_resolve` would resolve it
+///     against the BINARY's own working directory and answer confidently about
+///     a location the caller never named. Measured on v3.14.3, which guarded
+///     emptiness alone: `cwd: "relative/path"` condemned every project-scoped
+///     element exactly as `cwd: ""` used to.
+///
+/// Decidable, so the filter stays ENABLED even though it owns nothing:
+///   - an absolute path that is not a project (`/`, a deleted directory). The
+///     filter then correctly concludes no project owns the caller and drops
+///     project-scoped elements because none belong to them. Decidable-and-
+///     negative is a right answer, not a failure — do NOT "fix" this by also
+///     requiring the path to exist.
+fn cwd_is_usable_basis(cwd: &str) -> bool {
+    let trimmed = cwd.trim();
+    !trimmed.is_empty() && Path::new(trimmed).is_absolute()
+}
+
+/// The whole cross-project decision for ONE candidate: the `cwd` guard AND the
+/// origin predicate, composed. `run()` calls exactly this, so the WIRING
+/// between guard and predicate is covered by tests rather than living as an
+/// untested expression at the call site.
+///
+/// That is the point of the composition. A previous version applied the guard
+/// inline in `run()` and unit-tested the guard separately, which meant deleting
+/// or inverting the guard left every test green while re-arming a 689-element
+/// wipe. A test of the parts is not a test of the assembly.
+///
+/// **`cwd` is trimmed ONCE here and the trimmed value feeds BOTH the guard and
+/// the slug/path computation.** They must not disagree: guarding on the trimmed
+/// string while hashing the raw one lets `" /Users/me/proj"` pass the guard and
+/// then hash to a slug that matches no project — condemning everything through
+/// a door the guard held open.
+fn should_drop_as_foreign_project(cwd: &str, source: &str, path: &str) -> bool {
+    let cwd = cwd.trim();
+    if !cwd_is_usable_basis(cwd) {
+        return false; // undecidable basis → keep everything; never mass-condemn
+    }
+    let here = Path::new(cwd);
+    is_foreign_project_element(source, path, &project_slug(here), &python_resolve(here))
+}
+
 /// True when `source` names a project OTHER than the one we are prompting from.
 ///
 /// The index is CROSS-PROJECT by construction: `pss_reindex.py` invokes
@@ -19098,6 +19152,16 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
 
     // Parse input
     let mut input: HookInput = serde_json::from_str(&input_json)?;
+    // Normalise `cwd` ONCE, here, so every consumer agrees which project we are
+    // in. Two of them read it — `scan_project_context` for context inference and
+    // the cross-project filter for membership — and if they disagree about
+    // surrounding whitespace they disagree about the project itself: the filter
+    // would keep an element the context scoring had already ranked as though it
+    // came from somewhere else. Trimming at the single point of entry removes
+    // that whole class rather than patching each reader.
+    if input.cwd != input.cwd.trim() {
+        input.cwd = input.cwd.trim().to_string();
+    }
     perf_log("json parse", perf_t0);
 
     // PERF-1 (audit 20260514): strip <system-reminder> blocks BEFORE skip
@@ -19267,10 +19331,21 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
         // thing we do not know. Degrading to the pre-v3.14.2 behaviour (a
         // cross-project leak) is recoverable and visible; silently emptying a
         // scope is neither.
-        let cwd_known = !input.cwd.trim().is_empty();
-        let here_slug = project_slug(Path::new(&input.cwd));
-        let here_path = python_resolve(Path::new(&input.cwd));
-        if !cwd_known {
+        // "Usable basis" is ABSOLUTE-and-non-empty, not merely non-empty. A
+        // RELATIVE `cwd` is a malformed payload, and it is the dangerous shape:
+        // `python_resolve` would silently resolve it against the BINARY's own
+        // working directory, yielding a confident answer about a location the
+        // caller never named — and every project-scoped element would be
+        // condemned against that phantom root. Measured on v3.14.3, which
+        // guarded emptiness alone: `cwd: "relative/path"` dropped every
+        // project-scoped element exactly as `cwd: ""` used to.
+        //
+        // An absolute path that is NOT a project (`/`, a deleted directory) is
+        // deliberately left ENABLED: the filter then correctly finds that no
+        // project owns the caller, and drops project-scoped elements because
+        // none of them belong to them. That is the right answer, not a failure —
+        // the distinction is decidable-and-negative versus undecidable.
+        if !cwd_is_usable_basis(&input.cwd) {
             debug!(
                 "cross-project filter DISABLED: the hook payload carried no `cwd`, \
                  so project membership is undecidable; keeping every project-scoped \
@@ -19280,8 +19355,7 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
         index.skills.retain(|id, e| {
             !e.source.starts_with("marketplace:")
                 && !noninvocable.contains(id)
-                && !(cwd_known
-                    && is_foreign_project_element(&e.source, &e.path, &here_slug, &here_path))
+                && !should_drop_as_foreign_project(&input.cwd, &e.source, &e.path)
         });
         // MANDATORY after any retain: `name_to_ids` maps a name to entry IDs and
         // get_by_name() takes the FIRST id. Leaving it stale would resolve a
@@ -23405,18 +23479,71 @@ mediapipe>=0.10
              exactly why the caller must not apply the predicate in that state"
         );
 
-        // Hence the caller's guard. `cwd_known` is this expression; if it ever
-        // stops matching the one in `run()`, this test is the tripwire.
-        for absent in ["", "   ", "\t\n"] {
+        // Hence the caller's guard — asserted through the SAME function `run()`
+        // calls, not re-expressed here. An earlier version of this test asserted
+        // `"".trim().is_empty()`, which is a fact about `str::trim` that cannot
+        // fail while the real guard drifts underneath it. Testing a copy of the
+        // logic is not testing the logic.
+        for undecidable in ["", "   ", "\t\n", "relative/path", "./x", "x"] {
             assert!(
-                absent.trim().is_empty(),
-                "{absent:?} must count as an unknown cwd and disable the filter"
+                !cwd_is_usable_basis(undecidable),
+                "{undecidable:?} is not a usable basis — the filter MUST be disabled, \
+                 or every project-scoped element is condemned at once"
             );
         }
+        // Absolute paths are decidable even when they own nothing, so the
+        // filter stays ENABLED and correctly finds no owning project.
+        for decidable in ["/tmp", "/", "/nonexistent/zzz"] {
+            assert!(
+                cwd_is_usable_basis(decidable),
+                "{decidable:?} is absolute, so membership is decidable — do not \
+                 disable the filter merely because the path owns no elements"
+            );
+        }
+    }
+
+    /// The COMPOSED decision `run()` actually calls — guard AND predicate.
+    ///
+    /// This is the regression tripwire the guard needs. Testing the guard alone
+    /// could not detect its removal from the call site: delete it and every
+    /// other test here still passes while a 689-element wipe is re-armed. These
+    /// assertions fail if the guard is deleted, inverted, or stops trimming.
+    #[test]
+    fn composed_decision_keeps_everything_when_the_cwd_basis_is_undecidable() {
+        let foreign = "project:other-deadbeef";
+        let mine = format!("project:{}", project_slug(Path::new("/tmp")));
+
+        // Guard OPEN: an undecidable basis must keep even a plainly foreign
+        // element. Inverting or deleting the guard flips every one of these.
+        for bad in ["", "   ", "relative/path", "./x"] {
+            assert!(
+                !should_drop_as_foreign_project(bad, foreign, "/anywhere/SKILL.md"),
+                "cwd {bad:?} is undecidable — dropping here would condemn EVERY \
+                 project-scoped element at once"
+            );
+        }
+
+        // Guard CLOSED: a usable basis must still filter normally.
+        assert!(should_drop_as_foreign_project("/tmp", foreign, "/x/SKILL.md"));
+        assert!(!should_drop_as_foreign_project("/tmp", &mine, "/x/SKILL.md"));
+
+        // Trimming must be CONSISTENT between the guard and the slug it feeds.
+        // Guarding on the trimmed string while hashing the raw one lets a padded
+        // cwd pass and then match no project — the wipe, through an open door.
         assert!(
-            !"/tmp".trim().is_empty(),
-            "a real cwd must leave the filter ENABLED"
+            !should_drop_as_foreign_project("  /tmp  ", &mine, "/x/SKILL.md"),
+            "a padded cwd must resolve to the SAME project as the unpadded one"
         );
+        assert!(
+            should_drop_as_foreign_project("  /tmp  ", foreign, "/x/SKILL.md"),
+            "and must still filter foreign elements rather than disabling itself"
+        );
+
+        // Global scopes are never project-bound, under any cwd.
+        for cwd in ["", "/tmp", "  ", "relative"] {
+            assert!(!should_drop_as_foreign_project(cwd, "user:codex", "/x"));
+            assert!(!should_drop_as_foreign_project(cwd, "plugin:ponytail", "/x"));
+        }
     }
 
     /// P-6: trailing slash is irrelevant (matches Python `Path("/tmp/").name == "tmp"`
