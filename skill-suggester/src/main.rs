@@ -14247,15 +14247,32 @@ fn python_resolve(input: &Path) -> PathBuf {
 ///     emptiness alone: `cwd: "relative/path"` condemned every project-scoped
 ///     element exactly as `cwd: ""` used to.
 ///
+///   - the filesystem ROOT, `/`. This one is subtle and was wrong in v3.14.4.
+///     `Path::starts_with` is component-wise, so `/` is a prefix of EVERY
+///     absolute path — containment carries zero information there. The two
+///     source families then disagree: slugged `project:<slug>` rows mismatch
+///     and drop, while bare `project` / `project:agentskills` rows are judged
+///     by containment, trivially match, and are KEPT. Dropping one shape and
+///     keeping the other is not a decision, it is an artefact of spelling.
+///     `/` is the ONLY path whose containment test is vacuous — hence
+///     `parent().is_some()`, which excludes exactly it.
+///
 /// Decidable, so the filter stays ENABLED even though it owns nothing:
-///   - an absolute path that is not a project (`/`, a deleted directory). The
-///     filter then correctly concludes no project owns the caller and drops
-///     project-scoped elements because none belong to them. Decidable-and-
-///     negative is a right answer, not a failure — do NOT "fix" this by also
-///     requiring the path to exist.
+///   - an absolute path with a parent that is not a project (a deleted
+///     directory, an unregistered checkout). The filter then correctly
+///     concludes no project owns the caller and drops project-scoped elements
+///     because none belong to them. Decidable-and-negative is a right answer,
+///     not a failure — do NOT "fix" this by also requiring the path to EXIST.
+///     Existence is not the test; a meaningful comparison basis is.
 fn cwd_is_usable_basis(cwd: &str) -> bool {
     let trimmed = cwd.trim();
-    !trimmed.is_empty() && Path::new(trimmed).is_absolute()
+    if trimmed.is_empty() {
+        return false;
+    }
+    let p = Path::new(trimmed);
+    // `parent()` is None only at a root, which is the one absolute path where
+    // the containment half of the predicate cannot discriminate anything.
+    p.is_absolute() && p.parent().is_some()
 }
 
 /// The whole cross-project decision for ONE candidate: the `cwd` guard AND the
@@ -23484,16 +23501,25 @@ mediapipe>=0.10
         // `"".trim().is_empty()`, which is a fact about `str::trim` that cannot
         // fail while the real guard drifts underneath it. Testing a copy of the
         // logic is not testing the logic.
-        for undecidable in ["", "   ", "\t\n", "relative/path", "./x", "x"] {
+        for undecidable in ["", "   ", "\t\n", "relative/path", "./x", "x", "/"] {
             assert!(
                 !cwd_is_usable_basis(undecidable),
                 "{undecidable:?} is not a usable basis — the filter MUST be disabled, \
                  or every project-scoped element is condemned at once"
             );
         }
-        // Absolute paths are decidable even when they own nothing, so the
-        // filter stays ENABLED and correctly finds no owning project.
-        for decidable in ["/tmp", "/", "/nonexistent/zzz"] {
+        // `/` specifically: containment is vacuous at a root, so the two source
+        // families would disagree (slugged rows dropped, unslugged rows kept by
+        // trivial containment). That is spelling, not a decision.
+        assert!(
+            Path::new("/Users/x/p/.claude/s/S.md").starts_with(Path::new("/")),
+            "this is WHY `/` is excluded — if starts_with ever stopped matching \
+             at the root, the parent() guard could be revisited"
+        );
+
+        // Absolute paths WITH A PARENT are decidable even when they own nothing,
+        // so the filter stays ENABLED and correctly finds no owning project.
+        for decidable in ["/tmp", "/nonexistent/zzz"] {
             assert!(
                 cwd_is_usable_basis(decidable),
                 "{decidable:?} is absolute, so membership is decidable — do not \
@@ -23515,13 +23541,25 @@ mediapipe>=0.10
 
         // Guard OPEN: an undecidable basis must keep even a plainly foreign
         // element. Inverting or deleting the guard flips every one of these.
-        for bad in ["", "   ", "relative/path", "./x"] {
+        for bad in ["", "   ", "relative/path", "./x", "/"] {
             assert!(
                 !should_drop_as_foreign_project(bad, foreign, "/anywhere/SKILL.md"),
                 "cwd {bad:?} is undecidable — dropping here would condemn EVERY \
                  project-scoped element at once"
             );
         }
+        // At `/` the two source families must not disagree. Before the
+        // parent() guard, the slugged row below dropped while the bare
+        // `project` row was KEPT by vacuous containment — same cwd, opposite
+        // verdicts, decided by how the source happened to be spelled.
+        assert!(
+            !should_drop_as_foreign_project("/", "project", "/Users/x/p/.claude/s/S.md"),
+            "unslugged row at the root"
+        );
+        assert!(
+            !should_drop_as_foreign_project("/", foreign, "/Users/x/p/.claude/s/S.md"),
+            "slugged row at the root — must agree with the unslugged one"
+        );
 
         // Guard CLOSED: a usable basis must still filter normally.
         assert!(should_drop_as_foreign_project("/tmp", foreign, "/x/SKILL.md"));
