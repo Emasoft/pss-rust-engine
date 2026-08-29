@@ -59,6 +59,9 @@ pub struct AgentMeta {
     pub effort: Option<String>,
     pub isolation: Option<String>,
     pub color: Option<String>,
+    /// Prompt-cache TTL — Claude Code 2.1.248's `experimental.cacheTtl`. Only
+    /// the two documented values (`5m`, `1h`) are kept; see `parse_cache_ttl`.
+    pub cache_ttl: Option<String>,
     /// True when the description asks Claude to reach for this agent on its
     /// own ("use proactively", "MUST BE USED"). A strong ranking signal: such
     /// agents are written to be auto-delegated.
@@ -228,6 +231,10 @@ pub fn parse_agent_definition(content: &str) -> AgentMeta {
         effort: get("effort"),
         isolation: get("isolation"),
         color: get("color"),
+        // `experimental:` / `cacheTtl:` is nested YAML, but `parse_frontmatter`
+        // doesn't track indentation outside block scalars — it already flattens
+        // the block into a top-level `cacheTtl` key, so the plain `get` finds it.
+        cache_ttl: get("cacheTtl").and_then(|v| parse_cache_ttl(&v)),
         key_phrases: key_phrases_from_body(body, 40),
     }
 }
@@ -257,6 +264,16 @@ pub fn parse_frontmatter_bool(value: &str) -> Option<bool> {
     {
         "true" | "yes" | "on" | "1" => Some(true),
         "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Gate `experimental.cacheTtl` to the two values Claude Code 2.1.248
+/// documents. An unrecognized value is `None` (a typo, or a future TTL PSS
+/// doesn't know about yet) rather than being indexed as if it were valid.
+fn parse_cache_ttl(value: &str) -> Option<String> {
+    match value.trim() {
+        v @ ("5m" | "1h") => Some(v.to_string()),
         _ => None,
     }
 }
@@ -397,6 +414,21 @@ Look for injection in `Bash` calls.
         let m = parse_agent_definition(bad);
         assert_eq!(m.max_turns, None, "unparseable maxTurns must degrade to None");
         assert_eq!(m.model.as_deref(), Some("opus"), "and must not lose sibling fields");
+    }
+
+    #[test]
+    fn cache_ttl_reads_the_nested_experimental_block() {
+        // `experimental.cacheTtl` is nested YAML, but the flat frontmatter
+        // parser flattens it to a top-level `cacheTtl` key — no nested-lookup
+        // path needed.
+        let doc = "---\nname: a\ndescription: d\nexperimental:\n  cacheTtl: \"1h\"\n---\nbody\n";
+        assert_eq!(parse_agent_definition(doc).cache_ttl, Some("1h".to_string()));
+    }
+
+    #[test]
+    fn cache_ttl_rejects_undocumented_values() {
+        let doc = "---\nname: a\ndescription: d\nexperimental:\n  cacheTtl: 10m\n---\nbody\n";
+        assert_eq!(parse_agent_definition(doc).cache_ttl, None);
     }
 
     #[test]

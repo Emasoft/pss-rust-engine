@@ -14228,6 +14228,76 @@ fn python_resolve(input: &Path) -> PathBuf {
     resolved
 }
 
+/// True when `source` names a project OTHER than the one we are prompting from.
+///
+/// The index is CROSS-PROJECT by construction: `pss_reindex.py` invokes
+/// `pss_discover.py` with `--all-projects`, so every registered project's
+/// `project:`/`local:` elements live in one DB (measured on the live index
+/// 2026-08-29: 689 `project:` rows spanning 20 distinct projects, plus 111
+/// `local:` rows). Nothing downstream keys on an element's origin, so without
+/// this predicate a prompt typed in project B is scored against B's elements
+/// AND all 19 others'. Those are not merely irrelevant — the harness has not
+/// loaded them, so a suggestion naming one is unactionable by construction.
+///
+/// Comparing against the LIVE cwd is also what makes a mid-session `/cd`
+/// correct for free: every prompt carries its own `cwd`, so the first prompt
+/// after the move already filters to the new project — no reindex, no
+/// `CwdChanged` hook, no window in which the stale set is still scoreable.
+///
+/// Two per-project source shapes exist and they are NOT spelled the same way;
+/// this is why the check cannot be one `starts_with`:
+///   - `project:<slug>` and `project:<slug>/plugin:<name>` — a SLUG
+///     (`<basename>-<8 hex>`), compared with `project_slug`.
+///   - `local:<absolute path>` — a raw PATH, compared after `python_resolve`.
+///
+/// Everything else is deliberately kept: `user:`, `plugin:`, `built-in:` are
+/// global, and `marketplace:` is already dropped by the caller.
+///
+/// Two shapes carry NO slug and mean "whatever the cwd was AT INDEX TIME", so
+/// neither can be judged from the source string alone — bare `project` (that
+/// project's `.claude/`) and `project:agentskills` (its `.agents/`, a literal
+/// label, `pss_discover.py:827`). They are decided by `path` instead, and the
+/// asymmetry matters in both directions:
+///   - Keeping them unconditionally leaks the INDEX-TIME project's elements
+///     into every other project — the same bug this function exists to fix,
+///     surviving in the one case a slug comparison cannot see.
+///   - Dropping them unconditionally is just as wrong, and this is the
+///     non-obvious half: `pss_discover.py:946` seeds `seen_project_paths` with
+///     `{cwd}` and skips it in the registry loop, so the cwd project is emitted
+///     ONLY in bare form — there is no slugged duplicate to fall back on.
+///     Dropping it would erase the current project's own elements outright.
+/// A path test is the only honest discriminator, and it is exact: those
+/// elements live under `<project>/.claude/` or `<project>/.agents/` by
+/// construction, so containment in the live cwd IS project membership.
+fn is_foreign_project_element(
+    source: &str,
+    path: &str,
+    here_slug: &str,
+    here_path: &Path,
+) -> bool {
+    // Unslugged, index-time-bound shapes → decide by path containment.
+    let unslugged = source == "project"
+        || source == "project:agentskills"
+        || source.starts_with("project:agentskills/");
+    if unslugged {
+        // An empty path cannot be proven to belong here. Treat it as foreign:
+        // a false drop costs one missing suggestion, a false keep silently
+        // reintroduces the cross-project leak for every prompt.
+        if path.is_empty() {
+            return true;
+        }
+        return !python_resolve(Path::new(path)).starts_with(here_path);
+    }
+    if let Some(rest) = source.strip_prefix("project:") {
+        // `project:<slug>/plugin:<name>` — the slug ends at the first '/'.
+        return rest.split('/').next().unwrap_or("") != here_slug;
+    }
+    if let Some(p) = source.strip_prefix("local:") {
+        return python_resolve(Path::new(p)) != here_path;
+    }
+    false
+}
+
 /// P-6: compute the scope-path slug EXACTLY as
 /// `scripts/pss_discover.py::_slugify_project_path` does:
 /// `"<basename>-<first 8 hex chars of sha256(resolved_abs_path)>"`.
@@ -19177,9 +19247,17 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
             .as_ref()
             .map(load_noninvocable_ids)
             .unwrap_or_default();
-        index
-            .skills
-            .retain(|id, e| !e.source.starts_with("marketplace:") && !noninvocable.contains(id));
+        // Third class: an element belonging to a DIFFERENT project. See
+        // `is_foreign_project_element` for why the index contains any, and why
+        // comparing against the live `input.cwd` is what fixes a mid-session
+        // `/cd` without a hook. Computed once, outside the closure.
+        let here_slug = project_slug(Path::new(&input.cwd));
+        let here_path = python_resolve(Path::new(&input.cwd));
+        index.skills.retain(|id, e| {
+            !e.source.starts_with("marketplace:")
+                && !noninvocable.contains(id)
+                && !is_foreign_project_element(&e.source, &e.path, &here_slug, &here_path)
+        });
         // MANDATORY after any retain: `name_to_ids` maps a name to entry IDs and
         // get_by_name() takes the FIRST id. Leaving it stale would resolve a
         // co-usage lookup to a just-removed catalog id and return None even
@@ -23213,6 +23291,67 @@ mediapipe>=0.10
         // through the /private symlink — exercising the symlink-resolution parity.
         assert_eq!(project_slug(Path::new("/tmp")), "tmp-11fe14a5");
         assert_eq!(project_slug(Path::new("/var")), "var-6c43d0c2");
+    }
+
+    /// The cross-project filter. Uses `/tmp` as "here" so the slug is the
+    /// parity-tested `tmp-11fe14a5` rather than a value invented for the test.
+    #[test]
+    fn foreign_project_elements_are_dropped_and_local_ones_kept() {
+        let here_slug = project_slug(Path::new("/tmp"));
+        let here_path = python_resolve(Path::new("/tmp"));
+        // Slugged sources ignore `path`; the unslugged ones are tested below.
+        let foreign = |s: &str| is_foreign_project_element(s, "", &here_slug, &here_path);
+
+        // KEPT — this project, by slug.
+        assert!(!foreign(&format!("project:{here_slug}")));
+        assert!(!foreign(&format!("project:{here_slug}/plugin:demo")));
+        assert!(!foreign("local:/tmp"), "same path, spelled as a local: source");
+
+        // KEPT — global scopes are not project-bound at all.
+        for s in ["user:codex", "plugin:ponytail", "built-in:explore", "marketplace:x"] {
+            assert!(!foreign(s), "{s} is not project-scoped and must survive");
+        }
+
+        // DROPPED — a different project, by slug and by path.
+        assert!(foreign("project:other-deadbeef"));
+        assert!(
+            foreign("project:other-deadbeef/plugin:svg-matrix-tester"),
+            "the plugin suffix must not hide the foreign slug in front of it"
+        );
+        assert!(foreign("local:/etc"));
+    }
+
+    /// The unslugged shapes (`project`, `project:agentskills`) carry no slug,
+    /// so they are decided by PATH. Both directions are load-bearing: keeping
+    /// them blindly leaks the index-time project, dropping them blindly erases
+    /// the current project's own elements (there is no slugged duplicate —
+    /// `pss_discover.py:946` skips the cwd in the registry loop).
+    #[test]
+    fn unslugged_project_sources_are_decided_by_path_not_by_source() {
+        let here_slug = project_slug(Path::new("/tmp"));
+        let here_path = python_resolve(Path::new("/tmp"));
+        let f = |s: &str, p: &str| is_foreign_project_element(s, p, &here_slug, &here_path);
+
+        for src in ["project", "project:agentskills"] {
+            // KEPT — the file really is inside the live project.
+            assert!(
+                !f(src, "/tmp/.claude/skills/demo/SKILL.md"),
+                "{src} under the live cwd is the CURRENT project's own element"
+            );
+            // DROPPED — same source string, a file in a different project.
+            assert!(
+                f(src, "/etc/.claude/skills/demo/SKILL.md"),
+                "{src} outside the live cwd belongs to the INDEX-TIME project"
+            );
+            // DROPPED — unprovable membership fails closed.
+            assert!(f(src, ""), "{src} with no path cannot be proven to belong here");
+        }
+
+        // A sibling whose path merely shares a prefix is NOT inside /tmp.
+        assert!(
+            f("project", "/tmpother/.claude/skills/x/SKILL.md"),
+            "prefix-sharing sibling dir must not count as containment"
+        );
     }
 
     /// P-6: trailing slash is irrelevant (matches Python `Path("/tmp/").name == "tmp"`
