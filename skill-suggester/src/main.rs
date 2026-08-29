@@ -14275,7 +14275,109 @@ fn cwd_is_usable_basis(cwd: &str) -> bool {
     p.is_absolute() && p.parent().is_some()
 }
 
-/// The COMPLETE retain predicate — all three exclusion classes in one place,
+/// The `enabledPlugins` key for an element's `source`, or `None` when the
+/// source does not name an installed plugin.
+///
+/// The ONLY shape that carries both halves of the key is
+/// `plugin:<marketplace>/<plugin-name>`, and the key spells them in the
+/// opposite order: `<plugin-name>@<marketplace>`.
+///
+/// Built from `source` and NOT from the `plugin` / `origin` columns, which look
+/// like the obvious source of truth and are not:
+///   - `plugin` is `None` for a large share of real rows (measured on this
+///     machine: every `plugin:ai-maestro-plugins/*` row bar two), so keying on
+///     it silently skips the filter for exactly those elements.
+///   - `origin` is the marketplace's REPO OWNER (`github.com/davepoon`), not
+///     its local name (`buildwithclaude`). `agents-language-specialists@github.com/davepoon`
+///     matches nothing in settings, so the filter would read as a clean no-op.
+/// `source` carries the local marketplace name, which is what settings keys use.
+///
+/// `project:<slug>/plugin:<name>` is deliberately NOT handled: a project-local
+/// plugin has no marketplace, so no `<name>@<marketplace>` key can exist for it
+/// and there is nothing to look up. It falls through as enabled.
+fn plugin_enablement_key(source: &str) -> Option<String> {
+    let rest = source.strip_prefix("plugin:")?;
+    let (marketplace, name) = rest.split_once('/')?;
+    if marketplace.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(format!("{name}@{marketplace}"))
+}
+
+/// Every plugin key whose EFFECTIVE enablement is `false`, resolved at USE time
+/// with Claude Code's own precedence: user < project < project-local.
+///
+/// Read on every prompt rather than baked into the index, because enablement is
+/// live state: `pss_discover.py` reads `~/.claude/settings.json` once at
+/// index-build time and behind an opt-in flag that defaults OFF, so today a
+/// toggle changes nothing until the next reindex — and by default not even then.
+///
+/// FAILS OPEN by construction. A missing, unreadable, or malformed settings file
+/// contributes no keys, so the filter degrades to a no-op instead of condemning a
+/// scope class. This is the same asymmetry `should_drop_as_foreign_project`
+/// applies to an unusable `cwd`: an unknown that destroys the BASIS must not be
+/// allowed to empty the suggestion set. A plugin key absent from every layer is
+/// ENABLED — `enabledPlugins` lists only what has been explicitly toggled.
+fn disabled_plugin_keys(cwd: &str) -> HashSet<String> {
+    let mut layers: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        layers.push(home.join(".claude").join("settings.json"));
+    }
+    // Project layers only when `cwd` is a usable comparison basis — the same
+    // guard the cross-project filter uses, for the same reason: resolving a
+    // relative or empty `cwd` would read some unrelated directory's settings
+    // and apply another project's overrides here.
+    if cwd_is_usable_basis(cwd) {
+        let root = owning_project_root(Path::new(cwd.trim()));
+        layers.push(root.join(".claude").join("settings.json"));
+        layers.push(root.join(".claude").join("settings.local.json"));
+    }
+
+    let texts: Vec<String> = layers
+        .iter()
+        .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+        .collect();
+    merge_enablement_layers(texts.iter().map(String::as_str))
+}
+
+/// The precedence resolution itself, over settings TEXTS in LOW-to-HIGH order —
+/// split out from the file reading so the layering is unit-testable without
+/// touching `$HOME` (an env-var swap that races every other test in the binary).
+///
+/// **Reads the VALUE; never tests for presence.** An explicit `true` in a higher
+/// layer must override a `false` below it, so collecting "keys that say false"
+/// per layer and unioning them would keep a plugin the project deliberately
+/// re-enabled. Confirmed against real data: `~/agents/frank/.claude/settings.local.json`
+/// carries 37 entries of BOTH polarities, not a disable-list.
+///
+/// An unparseable layer, a missing `enabledPlugins`, or an empty one contributes
+/// nothing and leaves the layers below it standing — the fail-open case, and the
+/// common one (7 agent workdirs on this machine ship an EMPTY `enabledPlugins`).
+/// Sibling keys such as `permissions` and `crossSessionInbound` are ignored.
+fn merge_enablement_layers<'a>(texts: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+    let mut effective: HashMap<String, bool> = HashMap::new();
+    for text in texts {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        // `enabledPlugins` is hand-editable: anything that is not an object of
+        // booleans is ignored key-by-key rather than aborting the layer.
+        let Some(map) = json.get("enabledPlugins").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (key, value) in map {
+            if let Some(flag) = value.as_bool() {
+                effective.insert(key.clone(), flag);
+            }
+        }
+    }
+    effective
+        .into_iter()
+        .filter_map(|(key, enabled)| (!enabled).then_some(key))
+        .collect()
+}
+
+/// The COMPLETE retain predicate — all four exclusion classes in one place,
 /// so the whole decision is unit-testable and `run()`'s closure is a single
 /// call rather than a conjunction assembled at the call site.
 ///
@@ -14292,10 +14394,16 @@ fn candidate_is_invocable_here(
     path: &str,
     id: &str,
     noninvocable: &HashSet<String>,
+    disabled_plugins: &HashSet<String>,
 ) -> bool {
     !source.starts_with("marketplace:")
         && !noninvocable.contains(id)
         && !should_drop_as_foreign_project(cwd, source, path)
+        // Fourth class: the element is real and invocable in principle, but the
+        // harness has not loaded its plugin, so naming it is unactionable — the
+        // same defect as a cross-project leak on an orthogonal axis.
+        && !plugin_enablement_key(source)
+            .is_some_and(|key| disabled_plugins.contains(&key))
 }
 
 /// Resolve `cwd` to the root of the project that OWNS it.
@@ -19445,9 +19553,24 @@ fn run(cli: &Cli) -> Result<(), SuggesterError> {
                  element rather than dropping all of them"
             );
         }
-        index
-            .skills
-            .retain(|id, e| candidate_is_invocable_here(&input.cwd, &e.source, &e.path, id, &noninvocable));
+        // Fourth class: an element whose PLUGIN the user has disabled. Resolved
+        // here, once per prompt, from the live settings files rather than from
+        // the index — that is what makes a toggle take effect with no reindex.
+        let disabled_plugins = disabled_plugin_keys(&input.cwd);
+        debug!(
+            "plugin-enablement filter: {} disabled plugin key(s) in effect",
+            disabled_plugins.len()
+        );
+        index.skills.retain(|id, e| {
+            candidate_is_invocable_here(
+                &input.cwd,
+                &e.source,
+                &e.path,
+                id,
+                &noninvocable,
+                &disabled_plugins,
+            )
+        });
         // MANDATORY after any retain: `name_to_ids` maps a name to entry IDs and
         // get_by_name() takes the FIRST id. Leaving it stale would resolve a
         // co-usage lookup to a just-removed catalog id and return None even
@@ -23719,6 +23842,98 @@ mediapipe>=0.10
         ));
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The `enabledPlugins` key is built from `source` alone, and only the
+    /// installed-plugin shape yields one.
+    #[test]
+    fn plugin_enablement_key_only_from_the_installed_shape() {
+        assert_eq!(
+            plugin_enablement_key("plugin:buildwithclaude/agents-language-specialists")
+                .as_deref(),
+            Some("agents-language-specialists@buildwithclaude"),
+        );
+        // Marketplace catalog rows are dropped by an earlier class; a bare
+        // `plugin:<name>` carries no marketplace, and a project-local plugin has
+        // none to carry. None of them can produce a settings key.
+        for source in [
+            "plugin:ponytail",
+            "project:SVG-MATRIX-d055d603/plugin:svg-matrix-tester",
+            "marketplace:buildwithclaude",
+            "user",
+            "plugin:/no-marketplace",
+            "plugin:no-plugin/",
+        ] {
+            assert_eq!(plugin_enablement_key(source), None, "source: {source}");
+        }
+    }
+
+    /// Precedence is resolved on the VALUE, low layer to high. The failure this
+    /// guards is subtle: unioning each layer's `false` keys would also pass a
+    /// naive "local disables things" test, and would still be wrong — it can
+    /// never let a higher layer RE-ENABLE what a lower one disabled.
+    #[test]
+    fn enablement_layers_resolve_by_value_not_by_presence() {
+        let user = r#"{"enabledPlugins":{"a@m":false,"b@m":true,"c@m":false}}"#;
+        let local = r#"{"enabledPlugins":{"a@m":true,"b@m":false},"permissions":{"allow":[]}}"#;
+
+        let merged = merge_enablement_layers([user, local]);
+        // `a@m` was re-ENABLED by the higher layer; `b@m` was disabled by it;
+        // `c@m` keeps the user-scope answer.
+        assert!(!merged.contains("a@m"), "higher-layer true must win");
+        assert!(merged.contains("b@m"));
+        assert!(merged.contains("c@m"));
+        // A key named nowhere is enabled — `enabledPlugins` is not a whitelist.
+        assert!(!merged.contains("never-mentioned@m"));
+    }
+
+    /// Every undecidable shape must fail OPEN. An unreadable basis means "I do
+    /// not know", and answering that with "everything is disabled" would empty
+    /// the suggestion block — the exact asymmetry the `cwd` guard exists for.
+    #[test]
+    fn unreadable_or_empty_enablement_layers_disable_the_filter() {
+        for text in [
+            "",                                     // missing file (read → "")
+            "not json at all",                      // hand-edit gone wrong
+            "[]",                                   // valid JSON, wrong shape
+            r#"{"permissions":{"allow":[]}}"#,      // no enabledPlugins at all
+            r#"{"enabledPlugins":{}}"#,             // the COMMON agent-workdir case
+            r#"{"enabledPlugins":[]}"#,             // enabledPlugins not an object
+            r#"{"enabledPlugins":{"a@m":"false"}}"#, // string, not a bool
+        ] {
+            assert!(
+                merge_enablement_layers([text]).is_empty(),
+                "must contribute no disabled keys: {text}"
+            );
+        }
+    }
+
+    /// The composition: an element of a disabled plugin is not invocable here,
+    /// and nothing else changes. Tested through the real retain predicate, not
+    /// through the sub-predicate, because the wiring is what regressed before.
+    #[test]
+    fn an_element_of_a_disabled_plugin_is_not_suggested() {
+        let none = HashSet::new();
+        let disabled: HashSet<String> =
+            ["agents-language-specialists@buildwithclaude".to_string()]
+                .into_iter()
+                .collect();
+        let cwd = "/tmp";
+        let path = "/Users/x/.claude/plugins/cache/buildwithclaude/agents-language-specialists/1.0.0/agents/rust-expert.md";
+        let src = "plugin:buildwithclaude/agents-language-specialists";
+
+        assert!(!candidate_is_invocable_here(cwd, src, path, "id", &none, &disabled));
+        // Same element, empty disabled set → kept. This is the fail-open path.
+        assert!(candidate_is_invocable_here(cwd, src, path, "id", &none, &none));
+        // A DIFFERENT plugin from the same marketplace is untouched.
+        assert!(candidate_is_invocable_here(
+            cwd,
+            "plugin:buildwithclaude/agents-data-ai",
+            path,
+            "id",
+            &none,
+            &disabled
+        ));
     }
 
     /// `$HOME/.claude` is the user scope, not a project marker.
