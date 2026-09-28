@@ -7890,12 +7890,13 @@ fn infer_domains_from_text(text: &str) -> Vec<String> {
 }
 
 /// Locate the pss-nlp binary for NLP-based negation detection.
-/// Search order (TRDD-YC51I1C0 phase 2 — in-repo bin/ still wins over the
-/// fetched store; phase 3 flips): 1. same dir as the current pss binary,
-/// 2. $PSS_BINARY_DIR, 3. CLAUDE_PLUGIN_ROOT/bin/, 4. the fetched store
-/// ~/.claude/cache/pss-bin/current (a CONSTANT — sh and Python pin the same
-/// path; mirroring get_data_dir()'s conditional here would be a 4th copy of
-/// a rule that already drifted once), 5. PATH.
+/// Search order (TRDD-YC51I1C0 phase 3 — the fetched store now WINS over the
+/// plugin/repo copy): 1. same dir as the current pss binary,
+/// 2. $PSS_BINARY_DIR, 3. the fetched store ~/.claude/cache/pss-bin/current
+/// (a CONSTANT — sh and Python pin the same path; mirroring get_data_dir()'s
+/// conditional here would be a 4th copy of a rule that already drifted once),
+/// 4. CLAUDE_PLUGIN_ROOT/bin/ (transitional — a fresh install has nothing
+/// here; deleted in phase 4), 5. PATH.
 fn find_pss_nlp_binary() -> Option<std::path::PathBuf> {
     // 1. Same directory as the current pss binary
     if let Ok(exe) = std::env::current_exe() {
@@ -7929,23 +7930,24 @@ fn find_pss_nlp_binary() -> Option<std::path::PathBuf> {
             if candidate.exists() { return Some(candidate); }
         }
     }
-    // 3. CLAUDE_PLUGIN_ROOT/bin/
-    if let Ok(root) = std::env::var("CLAUDE_PLUGIN_ROOT") {
-        let bin_dir = std::path::Path::new(&root).join("bin");
-        let candidate = bin_dir.join("pss-nlp");
-        if candidate.exists() { return Some(candidate); }
-        if let Some(name) = &platform_name {
-            let candidate = bin_dir.join(name);
-            if candidate.exists() { return Some(candidate); }
-        }
-    }
-    // 4. The fetched store — same constant the sh shim and the fetcher use.
+    // 3. The fetched store — phase 3 flip: it now beats the plugin/repo copy.
+    // Same constant the sh shim and the fetcher use.
     if let Some(home) = dirs::home_dir() {
         let current = home.join(".claude").join("cache").join("pss-bin").join("current");
         let candidate = current.join("pss-nlp");
         if candidate.exists() { return Some(candidate); }
         if let Some(name) = &platform_name {
             let candidate = current.join(name);
+            if candidate.exists() { return Some(candidate); }
+        }
+    }
+    // 4. CLAUDE_PLUGIN_ROOT/bin/ — transitional; deleted in phase 4.
+    if let Ok(root) = std::env::var("CLAUDE_PLUGIN_ROOT") {
+        let bin_dir = std::path::Path::new(&root).join("bin");
+        let candidate = bin_dir.join("pss-nlp");
+        if candidate.exists() { return Some(candidate); }
+        if let Some(name) = &platform_name {
+            let candidate = bin_dir.join(name);
             if candidate.exists() { return Some(candidate); }
         }
     }
