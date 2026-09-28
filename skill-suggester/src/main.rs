@@ -1441,6 +1441,15 @@ enum Commands {
         json: bool,
     },
 
+    /// Print the resolved pss-nlp binary path (TRDD-YC51I1C0 phase 2, P10):
+    /// mirrors `find_pss_nlp_binary()` without any side effects, so the
+    /// Python↔Rust parity test can assert both languages agree on the search
+    /// order by driving the REAL resolvers. Bare path on one line; empty
+    /// output (exit 0) when nothing is found — mirroring the "negation
+    /// detection silently skipped" miss mode.
+    #[command(name = "nlp-binary-path")]
+    NlpBinaryPath,
+
     /// Compute the scope-path slug for an absolute project path, EXACTLY as the
     /// Python discoverer (`pss_discover.py::_slugify_project_path`) does:
     /// `"<basename>-<8-char-sha256>"` over the filesystem-resolved path. Use it
@@ -7881,7 +7890,12 @@ fn infer_domains_from_text(text: &str) -> Vec<String> {
 }
 
 /// Locate the pss-nlp binary for NLP-based negation detection.
-/// Search order: same directory as pss binary, CLAUDE_PLUGIN_ROOT/bin/, PATH.
+/// Search order (TRDD-YC51I1C0 phase 2 — in-repo bin/ still wins over the
+/// fetched store; phase 3 flips): 1. same dir as the current pss binary,
+/// 2. $PSS_BINARY_DIR, 3. CLAUDE_PLUGIN_ROOT/bin/, 4. the fetched store
+/// ~/.claude/cache/pss-bin/current (a CONSTANT — sh and Python pin the same
+/// path; mirroring get_data_dir()'s conditional here would be a 4th copy of
+/// a rule that already drifted once), 5. PATH.
 fn find_pss_nlp_binary() -> Option<std::path::PathBuf> {
     // 1. Same directory as the current pss binary
     if let Ok(exe) = std::env::current_exe() {
@@ -7907,13 +7921,35 @@ fn find_pss_nlp_binary() -> Option<std::path::PathBuf> {
             }
         }
     }
-    // 2. CLAUDE_PLUGIN_ROOT/bin/
+    let platform_name = pss_platform_binary_name("pss-nlp");
+    // 2. $PSS_BINARY_DIR (operator escape hatch)
+    if let Ok(dir) = std::env::var("PSS_BINARY_DIR") {
+        if let Some(name) = &platform_name {
+            let candidate = std::path::Path::new(&dir).join(name);
+            if candidate.exists() { return Some(candidate); }
+        }
+    }
+    // 3. CLAUDE_PLUGIN_ROOT/bin/
     if let Ok(root) = std::env::var("CLAUDE_PLUGIN_ROOT") {
         let bin_dir = std::path::Path::new(&root).join("bin");
         let candidate = bin_dir.join("pss-nlp");
         if candidate.exists() { return Some(candidate); }
+        if let Some(name) = &platform_name {
+            let candidate = bin_dir.join(name);
+            if candidate.exists() { return Some(candidate); }
+        }
     }
-    // 3. Check PATH via which
+    // 4. The fetched store — same constant the sh shim and the fetcher use.
+    if let Some(home) = dirs::home_dir() {
+        let current = home.join(".claude").join("cache").join("pss-bin").join("current");
+        let candidate = current.join("pss-nlp");
+        if candidate.exists() { return Some(candidate); }
+        if let Some(name) = &platform_name {
+            let candidate = current.join(name);
+            if candidate.exists() { return Some(candidate); }
+        }
+    }
+    // 5. Check PATH via which
     if let Ok(output) = std::process::Command::new("which").arg("pss-nlp").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -7923,6 +7959,33 @@ fn find_pss_nlp_binary() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// The platform-specific binary filename ("pss-darwin-arm64" style) with
+/// `prefix` ("pss" or "pss-nlp"), mirroring scripts/pss_paths.py::
+/// detect_platform(). Returns None on an unsupported platform, where the
+/// caller falls back to the bare "pss-nlp" name it already probes.
+fn pss_platform_binary_name(prefix: &str) -> Option<String> {
+    let (system, machine) = {
+        #[cfg(target_os = "macos")]
+        { ("darwin", std::env::consts::ARCH) }
+        #[cfg(target_os = "linux")]
+        { ("linux", std::env::consts::ARCH) }
+        #[cfg(target_os = "windows")]
+        { ("windows", "x86_64") }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        { return None }
+    };
+    let arch = match machine {
+        "aarch64" => "arm64",
+        "x86_64" | "amd64" => "x86_64",
+        _ => return None,
+    };
+    if system == "windows" {
+        Some(format!("{prefix}-windows-{arch}.exe"))
+    } else {
+        Some(format!("{prefix}-{system}-{arch}"))
+    }
 }
 
 /// Deadline on the pss-nlp subprocess call (TRDD-AXZAXMDQ). The hook fires on
@@ -16357,6 +16420,9 @@ fn run_query_command(cli: &Cli, cmd: &Commands) -> Result<(), SuggesterError> {
         Commands::ProjectSlug { .. } => Err(SuggesterError::IndexParse(
             "internal error: ProjectSlug command reached run_query_command".to_string(),
         )),
+        Commands::NlpBinaryPath => Err(SuggesterError::IndexParse(
+            "internal error: NlpBinaryPath command reached run_query_command".to_string(),
+        )),
     }
 }
 
@@ -19104,6 +19170,16 @@ fn main() {
         if let Commands::ProjectSlug { abs_path, format, json } = cmd {
             let want_json = *json || !matches!(format, OutputFormat::Table);
             println!("{}", project_slug_output(abs_path, want_json));
+            return;
+        }
+        // nlp-binary-path is a pure path probe like db-path/project-slug — no
+        // CozoDB. Empty line = nothing found (negation detection would be
+        // skipped), still exit 0.
+        if let Commands::NlpBinaryPath = cmd {
+            match find_pss_nlp_binary() {
+                Some(path) => println!("{}", path.display()),
+                None => println!(),
+            }
             return;
         }
         // suggest-mode is a pure file get/set — like db-path/project-slug it
